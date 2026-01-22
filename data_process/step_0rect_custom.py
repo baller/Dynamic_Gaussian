@@ -121,8 +121,8 @@ def save_np_to_json(parm, save_name):
 
 if __name__ == '__main__':
     # python step_0rect_custom.py -t val
-    data_root = '/PATH/TO/custom_data' # TODO
-    processed_data_root = '/PATH/TO/processed_custom_data/' # TODO
+    data_root = '/home/user_3/3DGS/GPS_plus/custom_data' # TODO
+    processed_data_root = '/home/user_3/3DGS/GPS_plus/processed_custom_data/' # TODO
 
     parser = argparse.ArgumentParser()
     parser.add_argument('-t', '--trainval', type=str, required=True, help='train or val')

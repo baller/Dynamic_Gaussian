@@ -41,18 +41,16 @@ from copy import deepcopy
 
 
 def read_calib(calib):  
-    # print(calib)
-    
     R = np.array(calib['R']).reshape((3, 3))
     T = np.array(calib['T']).reshape((3, 1))
     extr = np.zeros((3, 4))
-    extr[:3, :3]  = R
+    extr[:3, :3] = R
     extr[:3, 3:] = T
     intr = np.zeros((3, 3))
     intr[:3, :3] = np.array(calib['K']).reshape((3, 3))
     H = 2048
     W = 1500
-    if W>H:
+    if W > H:
         intr[0, 2] -= (W - H) / 2
         intr[:2] *= RS / H
     else:
@@ -60,6 +58,7 @@ def read_calib(calib):
         intr[:2] *= RS / W
     calib = intr @ extr
     return extr, intr, calib
+
 
 def extr_interpolate(RS, cam_id_list, s_id):
     # interpolate novel extr 
@@ -71,7 +70,7 @@ def extr_interpolate(RS, cam_id_list, s_id):
         novel_extrs = []
         novel_intrs = []
 
-        calib_path = os.path.join(cfg.dataset.local_data_root, 'test', tar_n+'_process', 'calibration_full.json')
+        calib_path = os.path.join(cfg.dataset.local_data_root, 'test', tar_n + '_process', 'calibration_full.json')
         with open(calib_path, 'r') as f:
             calib_full = json.load(f)
 
@@ -80,7 +79,6 @@ def extr_interpolate(RS, cam_id_list, s_id):
         
         cam = cam_id_list[1]
         extr1, intr1, calib1 = read_calib(calib_full[cam])
-        
         
         pose_0 = np.eye(4)
         pose_1 = np.eye(4)
@@ -103,23 +101,32 @@ def extr_interpolate(RS, cam_id_list, s_id):
             novel_extrs.append(pose[:3])
             novel_intrs.append((1.0 - ratio) * intr0 + ratio * intr1)
 
-        
         novel_extr_list = novel_extr_list + [novel_extrs]
         novel_intr_list = novel_intr_list + [novel_intrs]
 
-
-
     return novel_extr_list, novel_intr_list
 
+
 class StereoHumanModel(nn.Module):
-    def __init__(self, cfg, ckpt_path, novel_extrs, novel_intrs, s_id = 1):
+    def __init__(self, cfg, ckpt_path, novel_extrs, novel_intrs, s_id=1):
         super().__init__()
         
-        self.model = RtStereoHumanModel(cfg, with_gs_render=True)# RtStereoHumanModel(cfg, True)
-        ckpt = torch.load(ckpt_path, map_location='cuda')
-        self.model.load_state_dict(ckpt['network'], strict=True)
+        self.cfg = cfg
+        self.depth_mode = getattr(cfg, 'depth_mode', 'raft')
+        
+        self.model = RtStereoHumanModel(cfg, with_gs_render=True)
+        ckpt = torch.load(ckpt_path, map_location='cuda', weights_only=False)
+        # 使用strict=False允许加载部分权重,忽略预训练backbone的键
+        missing_keys, unexpected_keys = self.model.load_state_dict(ckpt['network'], strict=False)
+        if len(unexpected_keys) > 0:
+            print(f"[警告] 忽略了 {len(unexpected_keys)} 个不匹配的键（通常是预训练backbone权重）")
+        if len(missing_keys) > 0:
+            print(f"[警告] 缺失 {len(missing_keys)} 个键: {missing_keys[:5]}...")
         self.model = self.model.cuda()
         self.model.eval()
+        
+        # 根据深度模式冻结BN
+        self._freeze_bn()
 
         self.novel_extrs = novel_extrs
         self.novel_intrs = novel_intrs 
@@ -128,9 +135,8 @@ class StereoHumanModel(nn.Module):
 
         depth_init0 = cfg.dataset.inverse_depth_init * np.ones((1024, 1024))
         depth_init1 = cfg.dataset.inverse_depth_init * np.ones((1024, 1024))
-        #depth_init = torch.FloatTensor(depth_init).cuda()
 
-        parm_name = os.path.join(cfg.dataset.local_data_root, 'test', tar_n+'_process', 'parameter', tar_n+'_s%d_0000' % s_id, '%s_%s.json' % (str(cfg.dataset.source_id[0]), str(cfg.dataset.source_id[1])))
+        parm_name = os.path.join(cfg.dataset.local_data_root, 'test', tar_n + '_process', 'parameter', tar_n + '_s%d_0000' % s_id, '%s_%s.json' % (str(cfg.dataset.source_id[0]), str(cfg.dataset.source_id[1])))
 
         camera = load_json_to_np(parm_name)
         self.s_id = s_id
@@ -150,6 +156,15 @@ class StereoHumanModel(nn.Module):
         
         self.intrinsics = [torch.FloatTensor(intr0), torch.FloatTensor(intr1)] 
         self.extrinsics = [torch.FloatTensor(extr0), torch.FloatTensor(extr1)] 
+
+    def _freeze_bn(self):
+        """根据深度模式冻结BatchNorm层"""
+        if self.depth_mode == 'raft':
+            if hasattr(self.model, 'raft_stereo') and self.model.raft_stereo is not None:
+                self.model.raft_stereo.freeze_bn()
+        elif self.depth_mode == 'da3':
+            if hasattr(self.model, 'depth_model') and self.model.depth_model is not None:
+                self.model.depth_model.freeze_bn()
         
     def tensor2np(self, img_tensor):
         img_np = img_tensor.permute(0, 2, 3, 1)[0].detach().cpu().numpy()
@@ -158,24 +173,21 @@ class StereoHumanModel(nn.Module):
         return img_np
 
     def get_item_free(self, frame_id, view_id):
-        img0 = np.array(Image.open(self.img_path+'/%s_s%d_%04d/%d.jpg'%(tar_n, self.s_id, frame_id, from_list[0]))).astype(np.float32)
-        img1 = np.array(Image.open(self.img_path+'/%s_s%d_%04d/%d.jpg'%(tar_n, self.s_id, frame_id, to_list[0]))).astype(np.float32)
+        img0 = np.array(Image.open(self.img_path + '/%s_s%d_%04d/%d.jpg' % (tar_n, self.s_id, frame_id, from_list[0]))).astype(np.float32)
+        img1 = np.array(Image.open(self.img_path + '/%s_s%d_%04d/%d.jpg' % (tar_n, self.s_id, frame_id, to_list[0]))).astype(np.float32)
         img0 = torch.from_numpy(img0).permute(2, 0, 1).unsqueeze(0).cuda()
         img1 = torch.from_numpy(img1).permute(2, 0, 1).unsqueeze(0).cuda()
         
-        msk0 = np.array(Image.open(self.msk_path+'/%s_s%d_%04d/%d.jpg'%(tar_n, self.s_id, frame_id, from_list[0]))).astype(np.float32)
-        msk1 = np.array(Image.open(self.msk_path+'/%s_s%d_%04d/%d.jpg'%(tar_n, self.s_id, frame_id, to_list[0]))).astype(np.float32)
+        msk0 = np.array(Image.open(self.msk_path + '/%s_s%d_%04d/%d.jpg' % (tar_n, self.s_id, frame_id, from_list[0]))).astype(np.float32)
+        msk1 = np.array(Image.open(self.msk_path + '/%s_s%d_%04d/%d.jpg' % (tar_n, self.s_id, frame_id, to_list[0]))).astype(np.float32)
         msk0 = torch.from_numpy(msk0).permute(2, 0, 1).unsqueeze(0).cuda()
         msk1 = torch.from_numpy(msk1).permute(2, 0, 1).unsqueeze(0).cuda()
         
-
         img0 = 2 * (img0 / 255.0) - 1.0
         img1 = 2 * (img1 / 255.0) - 1.0
 
         msk0 /= 255
         msk1 /= 255 
-
-
 
         intr0_ = self.intrinsics[0].unsqueeze(0).cuda()
         intr1_ = self.intrinsics[1].unsqueeze(0).cuda()
@@ -208,10 +220,8 @@ class StereoHumanModel(nn.Module):
             'flow_init': flow1.unsqueeze(0).unsqueeze(0)  
         }
 
-        novel_intr = self.novel_intrs[0][view_id]#[frame_id] # from-dependent not frame-dependent
-
+        novel_intr = self.novel_intrs[0][view_id]
         novel_extr = self.novel_extrs[0][view_id]
-
 
         width, height = 1024, 1024
         R = np.array(novel_extr[:3, :3], np.float32).reshape(3, 3).transpose(1, 0)
@@ -230,7 +240,7 @@ class StereoHumanModel(nn.Module):
             'width': [width],
             'FovX': [torch.FloatTensor(np.array(FovX)).cuda()],
             'FovY': [torch.FloatTensor(np.array(FovY)).cuda()],
-            'world_view_transform':[world_view_transform.cuda()],
+            'world_view_transform': [world_view_transform.cuda()],
             'full_proj_transform': [full_proj_transform.cuda()],
             'camera_center': [camera_center.cuda()]
         }
@@ -243,10 +253,11 @@ class StereoHumanModel(nn.Module):
 
         return dict_tensor
 
+
 if __name__ == '__main__':
     # python run_interpolation.py -i example_data
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input', type=str, required=True, help='input sequence') # 'zymlqj'
+    parser.add_argument('-i', '--input', type=str, required=True, help='input sequence')
     arg = parser.parse_args()
     
     tar_n = arg.input
@@ -260,43 +271,47 @@ if __name__ == '__main__':
 
     cfg.defrost()
     dt = datetime.today()
-    cfg.exp_name = 'gps_plus' # TODO
+    # 根据深度模式设置实验名称
+    depth_mode = getattr(cfg, 'depth_mode', 'raft')
+    cfg.exp_name = f'gps_plus_{depth_mode}'
 
     cfg.record.show_path = "experiments/%s/show_free_%s" % (cfg.exp_name, tar_n)
-    cfg.restore_ckpt = 'PATH/TO/gps_plus_latest.pth' # TODO
+    cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_da3_0121/ckpt/iter20000.pth'  # TODO: 设置检查点路径
     cfg.freeze()
     LOOP_NUM = 20
 
     Path(cfg.record.show_path).mkdir(exist_ok=True, parents=True)
-
 
     from_list = [0]
     to_list = [1]
     RS = 1024
     data_root = cfg.dataset.val_data_root
     
+    logging.info(f"深度估计模式: {depth_mode}")
+    logging.info(f"检查点路径: {cfg.restore_ckpt}")
+    
     novel_extrs, novel_intrs = extr_interpolate(RS, ['22139908', '22139909'], 1)
     print(len(novel_extrs[0]))
     
-    render = StereoHumanModel(cfg, cfg.restore_ckpt,\
+    render = StereoHumanModel(cfg, cfg.restore_ckpt,
         [novel_extrs[0]], novel_intrs, 1)
     
     novel_extrs, novel_intrs = extr_interpolate(RS, ['22139909', '22139914'], 2)
     print(len(novel_extrs[0]))
 
-    render2 = StereoHumanModel(cfg, cfg.restore_ckpt,\
+    render2 = StereoHumanModel(cfg, cfg.restore_ckpt,
         [novel_extrs[0]], novel_intrs, 2)
     
     novel_extrs, novel_intrs = extr_interpolate(RS, ['22139914', '22139906'], 3)
     print(len(novel_extrs[0]))
 
-    render3 = StereoHumanModel(cfg, cfg.restore_ckpt,\
+    render3 = StereoHumanModel(cfg, cfg.restore_ckpt,
         [novel_extrs[0]], novel_intrs, 3)
     
     cut = 100
     tar_ply = -10
     start_frame = 0
-    end_frame = 60
+    end_frame = 900
 
     for fr_i in tqdm(range(start_frame, end_frame)):
         wi_ct = fr_i // LOOP_NUM
@@ -312,13 +327,13 @@ if __name__ == '__main__':
                 data = render3.get_item_free(fr_i, fr_i % LOOP_NUM)
                 out = render3.model(data)
             elif scene_id == 3:
-                data = render3.get_item_free(fr_i, (LOOP_NUM-1) - (fr_i % LOOP_NUM))
+                data = render3.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
                 out = render3.model(data)
             elif scene_id == 4:
-                data = render2.get_item_free(fr_i, (LOOP_NUM-1) - (fr_i % LOOP_NUM))
+                data = render2.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
                 out = render2.model(data)
             elif scene_id == 5:
-                data = render.get_item_free(fr_i, (LOOP_NUM-1) - (fr_i % LOOP_NUM))
+                data = render.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
                 out = render.model(data)
             else:
                 exit()
@@ -327,4 +342,4 @@ if __name__ == '__main__':
             tmp_novel *= 255
             tmp_novel = tmp_novel.permute(1, 2, 0).cpu().numpy()
             tmp_img_name = '%s/%03d.jpg' % (cfg.record.show_path, fr_i)
-            cv2.imwrite(tmp_img_name, tmp_novel[cut:(RS-cut), cut:(RS-cut), ::-1].astype(np.uint8))
+            cv2.imwrite(tmp_img_name, tmp_novel[cut:(RS - cut), cut:(RS - cut), ::-1].astype(np.uint8))

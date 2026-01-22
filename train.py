@@ -17,7 +17,7 @@ from lib.train_recoder import Logger, file_backup
 from lib.GaussianRender import pts2render
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
-from pytorch3d.loss import chamfer_distance
+# from pytorch3d.loss import chamfer_distance
 
 import trimesh 
 import torch
@@ -29,12 +29,14 @@ import warnings
 from copy import deepcopy
 warnings.filterwarnings("ignore", category=UserWarning)
 
+
 class Trainer:
     def __init__(self, cfg_file):
         self.cfg = cfg_file
         self.bs = self.cfg.batch_size
-
-
+        self.depth_mode = getattr(self.cfg, 'depth_mode', 'raft')
+        
+        logging.info(f"深度估计模式: {self.depth_mode}")
 
         self.model = RtStereoHumanModel(self.cfg, with_gs_render=True)
         self.train_set = StereoHumanDataset(self.cfg.dataset, phase='train')
@@ -58,27 +60,44 @@ class Trainer:
             logging.info(f"Using checkpoint from stage1")
             self.load_ckpt(self.cfg.stage1_ckpt, load_optimizer=False, strict=False)
         self.model.train()
-        self.model.raft_stereo.freeze_bn()  # We keep BatchNorm frozen in Raft-Stereo
+        
+        # 根据深度模式冻结BN
+        self._freeze_bn()
+        
         self.scaler = GradScaler(enabled=self.cfg.raft.mixed_precision)
+
+    def _freeze_bn(self):
+        """根据深度模式冻结BatchNorm层"""
+        if self.depth_mode == 'raft':
+            # RAFT模式：冻结RAFT-Stereo的BN
+            if hasattr(self.model, 'raft_stereo') and self.model.raft_stereo is not None:
+                self.model.raft_stereo.freeze_bn()
+                logging.info("已冻结RAFT-Stereo的BatchNorm层")
+        elif self.depth_mode == 'da3':
+            # DA3模式：冻结DA3的BN（如果不微调的话）
+            if hasattr(self.model, 'depth_model') and self.model.depth_model is not None:
+                self.model.depth_model.freeze_bn()
+                logging.info("已冻结DA3的BatchNorm层")
 
     def train(self):
         log_l1 = 0
         log_ssim = 0
         log_chamfer = 0
         log_scale = 0
-        if_chamfer = True   
+        if_chamfer = False   
         if_scale = False  
         iter_from = -1 
         for itr_ in tqdm(range(self.total_steps, self.cfg.num_steps)):
             self.optimizer.zero_grad()
             data = self.fetch_data(phase='train')
 
-            #  Raft Stereo
+            # 深度估计（RAFT-Stereo 或 DA3）
             data, _, metrics = self.model(data, is_train=True)
-            #  Gaussian Render
+            
+            # 高斯渲染
             data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
 
-            # Loss
+            # 计算损失
             render_novel = data['novel_view']['img_pred']
             gt_novel = data['novel_view']['img'].cuda()
 
@@ -95,8 +114,8 @@ class Trainer:
                     r_xyz_i = r_xyz[b_i, :, :]
                     r_xyz_i = r_xyz_i[r_valid_i].view(1, -1, 3).contiguous()
                     
-                    sample_l = np.random.choice(l_xyz_i.shape[1], 10000, replace = False)
-                    sample_r = np.random.choice(r_xyz_i.shape[1], 10000, replace = False)
+                    sample_l = np.random.choice(l_xyz_i.shape[1], 10000, replace=False)
+                    sample_r = np.random.choice(r_xyz_i.shape[1], 10000, replace=False)
                     chamfer_loss_i, _ = chamfer_distance(l_xyz_i[:, sample_l], r_xyz_i[:, sample_r])
                     chamfer_loss += chamfer_loss_i
                 
@@ -108,7 +127,7 @@ class Trainer:
 
             log_l1 += 0.8 * Ll1.item()
             log_ssim += 0.2 * Lssim.item()
-            log_chamfer += 0.5 * chamfer_loss.item() if if_chamfer and itr_>iter_from else 0 
+            log_chamfer += 0.5 * chamfer_loss.item() if if_chamfer and itr_ > iter_from else 0 
             log_scale += 0.5 * data['novel_view']['scale_regular'].item() if if_scale else 0
 
             if self.total_steps and self.total_steps % self.cfg.record.loss_freq == 0:
@@ -117,7 +136,7 @@ class Trainer:
             metrics.update({
                 'l1': Ll1.item(),
                 'ssim': Lssim.item(),
-                'chamfer': 0.5*chamfer_loss.item() if if_chamfer and itr_>iter_from else 0
+                'chamfer': 0.5 * chamfer_loss.item() if if_chamfer and itr_ > iter_from else 0
             })
             self.logger.push(metrics)
 
@@ -133,20 +152,20 @@ class Trainer:
                 self.model.eval()
                 self.run_eval()
                 self.model.train()
-                self.model.raft_stereo.freeze_bn()
+                # 重新冻结BN
+                self._freeze_bn()
                 
-            if self.total_steps in self.cfg.record.save_iter:
+            if self.total_steps % self.cfg.record.save_iter == 0:
                 self.save_ckpt(save_path=Path('%s/iter%d.pth' % (cfg.record.ckpt_path, self.total_steps)))
-
 
             self.total_steps += 1
             if self.total_steps % 100 == 99:
                 print(
-                    'l1 ', log_l1/ 100,
-                    'ssim', log_ssim/100,
-                    'chamfer', log_chamfer/100,
-                    'scale', log_scale/100,
-                    )
+                    'l1 ', log_l1 / 100,
+                    'ssim', log_ssim / 100,
+                    'chamfer', log_chamfer / 100,
+                    'scale', log_scale / 100,
+                )
                 log_l1 = 0
                 log_ssim = 0
                 log_chamfer = 0
@@ -185,7 +204,6 @@ class Trainer:
             print('something wrong during training, please change random seed and re-train')
             exit()
 
-            
         logging.info(f"Validation Metrics ({self.total_steps}): psnr {val_psnr}")
         self.logger.write_dict({'val_psnr': val_psnr}, write_step=self.total_steps)
         torch.cuda.empty_cache()
@@ -212,7 +230,7 @@ class Trainer:
     def load_ckpt(self, load_path, load_optimizer=True, strict=True):
         assert os.path.exists(load_path)
         logging.info(f"Loading checkpoint from {load_path} ...")
-        ckpt = torch.load(load_path, map_location='cuda')
+        ckpt = torch.load(load_path, map_location='cuda', weights_only=False)
         self.model.load_state_dict(ckpt['network'], strict=strict)
         logging.info(f"Parameter loading done")
         if load_optimizer:
@@ -243,13 +261,14 @@ if __name__ == '__main__':
 
     cfg.defrost()
     dt = datetime.today()
-    cfg.exp_name = '%s_%s%s' % (cfg.name, str(dt.month).zfill(2), str(dt.day).zfill(2))
+    # 在实验名称中添加深度模式标识
+    depth_mode = getattr(cfg, 'depth_mode', 'raft')
+    cfg.exp_name = '%s_%s_%s%s' % (cfg.name, depth_mode, str(dt.month).zfill(2), str(dt.day).zfill(2))
     cfg.record.ckpt_path = "experiments/%s/ckpt" % cfg.exp_name
     cfg.record.show_path = "experiments/%s/show" % cfg.exp_name
     cfg.record.logs_path = "experiments/%s/logs" % cfg.exp_name
     cfg.record.file_path = "experiments/%s/file" % cfg.exp_name
     cfg.freeze()
-
 
     for path in [cfg.record.ckpt_path, cfg.record.show_path, cfg.record.logs_path, cfg.record.file_path]:
         Path(path).mkdir(exist_ok=True, parents=True)

@@ -1,9 +1,12 @@
 name: 'gps_plus'
 
-lr: 0.0002
+lr: 0.0001
 wdecay: 1e-5
 batch_size: 1
 num_steps: 100000
+
+# 深度估计模式: 'raft' 或 'da3'
+depth_mode: 'da3'
 
 dataset:
   source_id: [0, 1]
@@ -12,23 +15,68 @@ dataset:
   use_hr_img: False
   use_depth_init: True
   use_local_data: True
-  inverse_depth_init: 0.3
-  local_data_root: '/PATH/TO/data'       # TODO
-  train_data_root: '/PATH/TO/data/train' # TODO
-  val_data_root: '/PATH/TO/data/val'     # TODO
+  inverse_depth_init: 0.11468429026724969
+  local_data_root: '/data/GPS_plus/processed_data'       # TODO
+  train_data_root: '/data/GPS_plus/processed_data/train' # TODO
+  val_data_root: '/data/GPS_plus/processed_data/val'     # TODO
+  bg_color: [0, 0, 0]
+  znear: 0.01
+  zfar: 100.0
+  trans: [0.0, 0.0, 0.0]
+  scale: 1.0
 
+# RAFT-Stereo配置（当depth_mode='raft'时使用）
 raft:
   mixed_precision: False
   train_iters: 3
   val_iters: 3
   encoder_dims: [32, 48, 96]  
-  hidden_dims: [96, 96, 96]  
+  hidden_dims: [96, 96, 96]
+  n_downsample: 3
+  n_gru_layers: 3
+  slow_fast_gru: False
+  corr_implementation: 'reg'
+  corr_radius: 4
+  corr_levels: 4
+  context_norm: 'batch'
 
+# DA3配置（当depth_mode='da3'时使用）
+da3:
+  # DA3模型名称，支持:
+  # - "depth-anything/DA3-SMALL"
+  # - "depth-anything/DA3-BASE"
+  # - "depth-anything/DA3-LARGE"
+  # - "depth-anything/DA3-GIANT"
+  # - "depth-anything/DA3NESTED-GIANT-LARGE"
+  # - "depth-anything/DA3METRIC-LARGE"
+  model_name: 'depth-anything/DA3-LARGE'
+  
+  # DA3模式: 'single' 单目模式，'dual' 双目模式
+  mode: 'single'
+  
+  # 是否使用LoFTR进行特征匹配（用于高斯参数预测）
+  use_loftr: True
+  
+  # 是否微调DA3模型
+  finetune: False
+  
+  # 是否使用混合精度
+  mixed_precision: False
+  
+  # 深度尺度因子（用于调整DA3输出的深度范围）
+  scale_factor: 1.0
+  
+  # 是否使用metric深度模型
+  use_metric: False
+
+# 高斯网络配置
 gsnet:
   encoder_dims: [32, 48, 96]
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
 
+# 记录配置
 record:
-  loss_freq: 3000
-  eval_freq: 3000
+  loss_freq: 5
+  eval_freq: 500
+  save_iter: 500

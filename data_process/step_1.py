@@ -10,8 +10,8 @@ import argparse
 
 # python step_1.py -i s2a3 -t val
 
-data_root = '/PATH/TO/raw_data/' # TODO
-processed_data_root = '/PATH/TO/processed_data/' # TODO
+data_root = '/data/GPS_plus/' # TODO
+processed_data_root = '/data/GPS_plus/processed_data/' # TODO
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-i', '--input', type=str, required=True, help='input sequence')

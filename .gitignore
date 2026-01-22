@@ -1,0 +1,9 @@
+custom_data/
+*/__pycache__/
+*.pyc
+processed_custom_data/
+gps_plus_final.pth
+experiments/
+runs/
+*.jpg
+*.png

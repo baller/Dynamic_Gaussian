@@ -10,11 +10,11 @@ import argparse
 from step_0rect_custom import load_cam_param
 # python step_1_custom.py -t val
 
-data_root = '/PATH/TO/custom_data' # TODO
-processed_data_root = '/PATH/TO/processed_custom_data/' # TODO
+data_root = '/home/user_3/3DGS/GPS_plus/custom_data' # TODO
+processed_data_root = '/home/user_3/3DGS/GPS_plus/processed_custom_data/' # TODO
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-t', '--trainval', type=str, required=True, help='train or val')
+parser.add_argument('-t', '--trainval', type=str, default='train',required=False, help='train or val')
 parser.add_argument('-n', '--setsize', type=int, default=4, required=False, help='number of cameras for each work set')
 arg = parser.parse_args()
 
@@ -36,7 +36,7 @@ for file in tqdm(file_list):
     if file[-3:] != 'jpg' and file[-3:] != 'png' and file[-3:] != 'jpeg':
         continue
     
-    time_id = file.split('/')[-1].split('_')[0]
+    time_id = file.split('/')[-1].split('_')[1]
     if time_id not in used_time_id_list:
         drop_flag = False
 
