@@ -75,8 +75,55 @@ gsnet:
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
 
+# MoE配置（动静分离）
+moe:
+  # 是否启用MoE模式
+  enabled: true
+  
+  # 专家数量（背景+人体）
+  num_experts: 2
+  
+  # 路由器类型: 'basic', 'multiscale', 'depth_aware'
+  router_type: 'basic'
+  
+  # 路由器隐藏层通道数
+  router_channels: 64
+  
+  # 是否使用软路由
+  soft_routing: true
+  
+  # 是否共享深度编码器
+  share_depth_encoder: true
+  
+  # 高斯分配配置
+  allocation:
+    total_gaussians: 104857  # 1024*1024
+    min_ratio: 0.1
+    learnable: true
+  
+  # 背景缓存配置
+  bg_cache:
+    enabled: true
+    update_threshold: 25.0  # PSNR阈值
+    min_update_interval: 1
+    quality_metric: 'psnr'
+    momentum: 0.0
+  
+  # 损失配置
+  loss:
+    sparsity_weight: 0.1
+    temporal_weight: 0.05
+    balance_weight: 0.01
+    separation_weight: 0.01
+    target_bg_ratio: 0.3
+  
+  # 训练配置
+  training:
+    freeze_router_epochs: 1
+    progressive: true
+
 # 记录配置
 record:
-  loss_freq: 5
+  loss_freq: 50
   eval_freq: 500
-  save_iter: 500
+  save_iter: 5000

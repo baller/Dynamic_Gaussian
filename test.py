@@ -17,9 +17,10 @@ from lib.human_loader import StereoHumanDataset
 from lib.network import RtStereoHumanModel
 from config.stereo_human_config import ConfigStereoHuman as config
 from lib.train_recoder import Logger, file_backup
-from lib.GaussianRender import pts2render
+from lib.GaussianRender import pts2render, pts2render_moe, pts2render_with_cache
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
+from lib.bg_cache import create_bg_cache
 import lpips
 
 from copy import deepcopy
@@ -40,7 +41,13 @@ class Trainer:
         self.bs = self.cfg.batch_size
         self.depth_mode = getattr(self.cfg, 'depth_mode', 'raft')
         
+        # MoE配置
+        self.moe_cfg = getattr(self.cfg, 'moe', None)
+        self.use_moe = self.moe_cfg is not None and getattr(self.moe_cfg, 'enabled', False)
+        
         logging.info(f"深度估计模式: {self.depth_mode}")
+        if self.use_moe:
+            logging.info(f"MoE模式已启用")
 
         self.model = RtStereoHumanModel(self.cfg, with_gs_render=True)
 
@@ -54,12 +61,23 @@ class Trainer:
 
         self.logger = Logger(self.scheduler, cfg.record)
         self.total_steps = 0
+        
+        # MoE模式下初始化背景缓存
+        if self.use_moe:
+            bg_cache_cfg = getattr(self.moe_cfg, 'bg_cache', None)
+            if bg_cache_cfg is not None and getattr(bg_cache_cfg, 'enabled', True):
+                self.bg_cache = create_bg_cache(self.cfg)
+                logging.info("背景缓存已初始化")
+            else:
+                self.bg_cache = None
+        else:
+            self.bg_cache = None
 
         self.model.cuda()
         if self.cfg.restore_ckpt:
             print('load good ckpt')
-            # DA3模式使用strict=False，因为DA3模型会单独从预训练权重加载
-            strict = (self.depth_mode != 'da3')
+            # DA3模式或MoE模式使用strict=False
+            strict = (self.depth_mode != 'da3') and (not self.use_moe)
             self.load_ckpt(self.cfg.restore_ckpt, load_optimizer=False, strict=strict)
 
         self.model.eval()
@@ -142,6 +160,10 @@ class Trainer:
         logging.info(f"Doing validation ...")
         torch.cuda.empty_cache()
         
+        # MoE模式下重置背景缓存
+        if self.bg_cache is not None:
+            self.bg_cache.reset()
+        
         # 初始化指标列表
         psnr_list = []
         ssim_list = []
@@ -155,7 +177,16 @@ class Trainer:
            
             with torch.no_grad():
                 data, _, _ = self.model(data, is_train=False)
-                data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
+                
+                # 根据MoE模式选择渲染方式
+                if self.use_moe and 'router_weights' in data.get('lmain', {}):
+                    if self.bg_cache is not None:
+                        data = pts2render_with_cache(data, bg_color=self.cfg.dataset.bg_color, 
+                                                     bg_cache=self.bg_cache, frame_idx=idx)
+                    else:
+                        data = pts2render_moe(data, bg_color=self.cfg.dataset.bg_color)
+                else:
+                    data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
 
                 # 获取预测图像和GT图像
                 img_pred = data['novel_view']['img_pred'][0].detach()  # (C, H, W), 范围 [0, 1]
@@ -208,6 +239,44 @@ class Trainer:
                     
                     # 保存彩色深度图
                     cv2.imwrite(depth_img_name, colored_depth_map)
+                
+                # MoE模式：保存路由权重可视化
+                if self.use_moe and 'router_weights' in data['lmain']:
+                    router_weights = data['lmain']['router_weights'][0].detach().cpu().numpy()
+                    
+                    # 背景权重可视化
+                    bg_weights = (router_weights[0] * 255).astype(np.uint8)
+                    bg_colored = cv2.applyColorMap(bg_weights, cv2.COLORMAP_VIRIDIS)
+                    bg_img_name = '%s/%s_%02d_router_bg.png' % (self.cfg.record.show_path, s_name[0], view_id)
+                    cv2.imwrite(bg_img_name, bg_colored)
+                    
+                    # 人体权重可视化
+                    human_weights = (router_weights[1] * 255).astype(np.uint8)
+                    human_colored = cv2.applyColorMap(human_weights, cv2.COLORMAP_HOT)
+                    human_img_name = '%s/%s_%02d_router_human.png' % (self.cfg.record.show_path, s_name[0], view_id)
+                    cv2.imwrite(human_img_name, human_colored)
+                    
+                    # 保存背景和人体分离渲染（如果有）
+                    if 'bg_render' in data['novel_view']:
+                        bg_render = data['novel_view']['bg_render'][0].detach()
+                        bg_render *= 255
+                        bg_render = bg_render.permute(1, 2, 0).cpu().numpy()
+                        bg_render_name = '%s/%s_%02d_bg_render.jpg' % (self.cfg.record.show_path, s_name[0], view_id)
+                        cv2.imwrite(bg_render_name, bg_render[:, :, ::-1].astype(np.uint8))
+                    
+                    if 'human_render' in data['novel_view']:
+                        human_render = data['novel_view']['human_render'][0].detach()
+                        human_render *= 255
+                        human_render = human_render.permute(1, 2, 0).cpu().numpy()
+                        human_render_name = '%s/%s_%02d_human_render.jpg' % (self.cfg.record.show_path, s_name[0], view_id)
+                        cv2.imwrite(human_render_name, human_render[:, :, ::-1].astype(np.uint8))
+        
+        # 输出背景缓存统计
+        if self.bg_cache is not None:
+            cache_stats = self.bg_cache.get_stats()
+            logging.info(f"背景缓存统计: 更新次数={cache_stats['update_count']}, "
+                        f"总帧数={cache_stats['total_frames']}, "
+                        f"更新率={cache_stats['update_ratio']:.2%}")
         
         # 计算平均指标
         avg_psnr = np.mean(psnr_list)
@@ -233,11 +302,23 @@ class Trainer:
             f.write(f"检查点: {self.cfg.restore_ckpt}\n")
             f.write(f"序列名称: {self.cfg.seq_name}\n")
             f.write(f"深度模式: {self.depth_mode}\n")
+            f.write(f"MoE模式: {'启用' if self.use_moe else '禁用'}\n")
             f.write(f"测试样本数: {len(psnr_list)}\n")
             f.write("-" * 60 + "\n")
             f.write(f"PSNR↑  : {avg_psnr:.4f} (std: {np.std(psnr_list):.4f})\n")
             f.write(f"SSIM↑  : {avg_ssim:.4f} (std: {np.std(ssim_list):.4f})\n")
             f.write(f"LPIPS↓ : {avg_lpips:.4f} (std: {np.std(lpips_list):.4f})\n")
+            
+            # MoE背景缓存统计
+            if self.bg_cache is not None:
+                cache_stats = self.bg_cache.get_stats()
+                f.write("-" * 60 + "\n")
+                f.write("MoE背景缓存统计:\n")
+                f.write(f"  更新次数: {cache_stats['update_count']}\n")
+                f.write(f"  总帧数: {cache_stats['total_frames']}\n")
+                f.write(f"  更新率: {cache_stats['update_ratio']:.2%}\n")
+                f.write(f"  平均质量: {cache_stats['avg_quality']:.2f}\n")
+            
             f.write("=" * 60 + "\n")
             f.write("\n详细结果 (每帧):\n")
             f.write("-" * 60 + "\n")
@@ -735,9 +816,12 @@ if __name__ == '__main__':
 
         cfg.defrost()
         dt = datetime.today()
-        # 根据深度模式设置实验名称
+        # 根据深度模式和MoE模式设置实验名称
         depth_mode = getattr(cfg, 'depth_mode', 'raft')
-        cfg.exp_name = f'gps_plus_{depth_mode}'
+        moe_cfg = getattr(cfg, 'moe', None)
+        use_moe = moe_cfg is not None and getattr(moe_cfg, 'enabled', False)
+        moe_suffix = '_moe' if use_moe else ''
+        cfg.exp_name = f'gps_plus_{depth_mode}{moe_suffix}'
         
         # 根据测试模式设置输出路径
         if arg.dynamic:

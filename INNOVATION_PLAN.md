@@ -334,14 +334,134 @@ pip install --no-build-isolation git+https://github.com/nerfstudio-project/gspla
 
 ---
 
+## 阶段2: MoE动静分离架构 ✅ 已完成
+
+### 目标
+实现"动静分离（解耦场景）" + "按需分配不同区域的高斯数量（动态高斯）"
+
+### 核心创新
+1. **MoE路由器**: 可学习的软路由网络，动态将像素/特征分配给"背景专家"或"人体专家"
+2. **双流高斯生成器**: 分别为背景和人体预测高斯参数
+3. **自适应背景缓存**: 根据渲染质量决定是否更新背景高斯
+4. **可学习的高斯分配**: 端到端学习最优的高斯数量分配
+
+### 技术架构
+
+```
+立体图像对 → UNet特征 → DA3深度估计 → MoE路由器
+                                          ↓
+                              ┌───────────┴───────────┐
+                              ↓                       ↓
+                         背景专家                 人体专家
+                              ↓                       ↓
+                         背景高斯                 人体高斯
+                              ↓                       ↓
+                         背景缓存                 每帧更新
+                              └───────────┬───────────┘
+                                          ↓
+                                     高斯合并
+                                          ↓
+                                     3DGS渲染
+```
+
+### 实施记录
+
+#### 2026-01-24 - 阶段2代码实现
+
+##### 1. 新建文件
+
+| 文件 | 功能 |
+|------|------|
+| `lib/moe_router.py` | MoE路由器模块，支持基础、多尺度、深度感知三种路由器类型 |
+| `lib/gaussian_allocation.py` | 可学习的高斯数量分配网络，包含自适应采样器 |
+| `lib/bg_cache.py` | 自适应背景缓存，支持质量评估和时序跟踪 |
+
+##### 2. 修改文件
+
+| 文件 | 修改内容 |
+|------|---------|
+| `lib/gs_parm_network.py` | 新增 `DualStreamGSRegresser` 双流高斯参数回归器 |
+| `lib/network.py` | 集成MoE模块，新增 `_flow2gsparms_moe` 和 `_depth2gsparms_moe` 方法 |
+| `lib/GaussianRender.py` | 新增 `pts2render_moe` 和 `pts2render_with_cache` 函数 |
+| `lib/loss.py` | 新增 `MoELoss` 类，包含稀疏性、时序一致性、分配平衡损失 |
+| `config/stage.yaml` | 新增完整的 `moe` 配置块 |
+| `config/stereo_human_config.py` | 新增MoE配置定义 |
+| `train.py` | 支持MoE渐进式训练策略 |
+| `test.py` | 支持MoE推理和背景缓存，新增路由权重可视化 |
+
+### 使用说明
+
+#### 启用MoE模式
+
+在 `config/stage.yaml` 中修改:
+
+```yaml
+moe:
+  enabled: true  # 启用MoE模式
+  num_experts: 2  # 背景 + 人体
+  router_type: 'basic'  # 路由器类型
+  
+  allocation:
+    learnable: true  # 使用可学习分配
+    
+  bg_cache:
+    enabled: true  # 启用背景缓存
+    update_threshold: 25.0  # PSNR阈值
+```
+
+#### MoE配置选项
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `moe.enabled` | 是否启用MoE模式 | `false` |
+| `moe.num_experts` | 专家数量 | `2` |
+| `moe.router_type` | 路由器类型 (`basic`/`multiscale`/`depth_aware`) | `basic` |
+| `moe.router_channels` | 路由器隐藏层通道数 | `64` |
+| `moe.allocation.learnable` | 是否使用可学习分配 | `true` |
+| `moe.bg_cache.enabled` | 是否启用背景缓存 | `true` |
+| `moe.bg_cache.update_threshold` | 质量阈值（PSNR） | `25.0` |
+| `moe.training.freeze_router_epochs` | 冻结路由器的epoch数 | `5` |
+| `moe.training.progressive` | 是否使用渐进式训练 | `true` |
+
+#### 渐进式训练策略
+
+1. **阶段A** (前N个epoch): 冻结路由器，只训练双流高斯网络
+   - 让背景/人体专家先学会基本的高斯生成能力
+
+2. **阶段B** (解冻后): 端到端联合训练
+   - 让路由器学会最优的动静分离策略
+
+3. **阶段C** (推理时): 启用背景缓存
+   - 静态背景只生成一次，运动区域每帧更新
+
+### MoE损失函数
+
+| 损失项 | 权重 | 功能 |
+|--------|------|------|
+| 渲染损失 | 1.0 | L1 + SSIM |
+| 稀疏性损失 | 0.1 | 鼓励路由权重接近0或1 |
+| 时序一致性损失 | 0.05 | 背景区域路由权重稳定 |
+| 分配平衡损失 | 0.01 | 防止高斯分配退化 |
+| 分离一致性损失 | 0.01 | 鼓励专家差异化 |
+
+### 输出可视化
+
+MoE模式测试时会输出额外的可视化文件:
+- `*_router_bg.png`: 背景路由权重热力图
+- `*_router_human.png`: 人体路由权重热力图
+- `*_bg_render.jpg`: 仅背景渲染结果
+- `*_human_render.jpg`: 仅人体渲染结果
+
+---
+
 ## 后续计划
 
-### 阶段2: 特征融合优化
+### 阶段3: 特征融合优化 (计划中)
 - 提取DA3的DinoV2特征
 - 设计特征融合模块
 - 增强高斯参数预测精度
 
-### 阶段3: 单目扩展
+### 阶段4: 单目扩展 (计划中)
 - 移除双视图要求
 - 支持单图像输入
 - 借鉴SHARP的多层高斯表示

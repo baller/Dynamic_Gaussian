@@ -56,6 +56,42 @@ class ConfigStereoHuman:
         self.cfg.da3.mixed_precision = False
         self.cfg.da3.scale_factor = 1.0
         self.cfg.da3.use_metric = False
+        
+        # MoE配置（动静分离）
+        self.cfg.moe = CN()
+        self.cfg.moe.enabled = False  # 是否启用MoE模式
+        self.cfg.moe.num_experts = 2  # 专家数量（背景+人体）
+        self.cfg.moe.router_type = 'basic'  # 路由器类型: 'basic', 'multiscale', 'depth_aware'
+        self.cfg.moe.router_channels = 64  # 路由器隐藏层通道数
+        self.cfg.moe.soft_routing = True  # 是否使用软路由
+        self.cfg.moe.share_depth_encoder = True  # 是否共享深度编码器
+        
+        # MoE高斯分配配置
+        self.cfg.moe.allocation = CN()
+        self.cfg.moe.allocation.total_gaussians = 1048576  # 总高斯数量 (1024*1024)
+        self.cfg.moe.allocation.min_ratio = 0.1  # 最小分配比例
+        self.cfg.moe.allocation.learnable = True  # 是否使用可学习分配
+        
+        # MoE背景缓存配置
+        self.cfg.moe.bg_cache = CN()
+        self.cfg.moe.bg_cache.enabled = True  # 是否启用背景缓存
+        self.cfg.moe.bg_cache.update_threshold = 25.0  # PSNR阈值，低于此值更新缓存
+        self.cfg.moe.bg_cache.min_update_interval = 1  # 最小更新间隔（帧数）
+        self.cfg.moe.bg_cache.quality_metric = 'psnr'  # 质量评估指标
+        self.cfg.moe.bg_cache.momentum = 0.0  # 缓存更新动量
+        
+        # MoE损失配置
+        self.cfg.moe.loss = CN()
+        self.cfg.moe.loss.sparsity_weight = 0.1  # 稀疏性损失权重
+        self.cfg.moe.loss.temporal_weight = 0.05  # 时序一致性损失权重
+        self.cfg.moe.loss.balance_weight = 0.01  # 分配平衡损失权重
+        self.cfg.moe.loss.separation_weight = 0.01  # 分离一致性损失权重
+        self.cfg.moe.loss.target_bg_ratio = 0.3  # 目标背景比例
+        
+        # MoE训练配置
+        self.cfg.moe.training = CN()
+        self.cfg.moe.training.freeze_router_epochs = 5  # 冻结路由器的epoch数
+        self.cfg.moe.training.progressive = True  # 是否使用渐进式训练
 
         self.cfg.gsnet = CN()
         self.cfg.gsnet.use_pe = None

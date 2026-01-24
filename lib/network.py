@@ -4,6 +4,10 @@ GPS_plus 网络架构
 支持两种深度估计模式:
 1. RAFT-Stereo: 原始的立体匹配深度估计
 2. DA3: 使用Depth-Anything-3进行深度估计
+
+支持两种高斯生成模式:
+1. 单流模式: 原始的统一高斯参数回归
+2. MoE模式: 动静分离，背景和人体分别预测
 """
 
 import torch
@@ -11,7 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 from core.raft_stereo_human import RAFTStereoHuman
 from core.extractor import UnetExtractor
-from lib.gs_parm_network import GSRegresser
+from lib.gs_parm_network import GSRegresser, DualStreamGSRegresser, create_gs_regresser
 from lib.loss import sequence_loss
 from lib.utils import flow2depth, depth2pc
 from lib.embedder import get_embedder
@@ -26,6 +30,10 @@ class RtStereoHumanModel(nn.Module):
     支持两种深度估计模式:
     - 'raft': 使用RAFT-Stereo进行立体匹配深度估计
     - 'da3': 使用Depth-Anything-3进行深度估计
+    
+    支持两种高斯生成模式:
+    - 单流模式: 原始的统一高斯参数回归
+    - MoE模式: 动静分离，背景和人体分别预测
     """
     
     def __init__(self, cfg, with_gs_render=False):
@@ -39,6 +47,12 @@ class RtStereoHumanModel(nn.Module):
         # 获取深度估计模式
         self.depth_mode = getattr(self.cfg, 'depth_mode', 'raft')
         print(f"[Network] 深度估计模式: {self.depth_mode}")
+        
+        # 获取MoE模式配置
+        self.moe_cfg = getattr(self.cfg, 'moe', None)
+        self.use_moe = self.moe_cfg is not None and getattr(self.moe_cfg, 'enabled', False)
+        if self.use_moe:
+            print(f"[Network] MoE模式已启用，专家数量: {getattr(self.moe_cfg, 'num_experts', 2)}")
         
         # 图像编码器（两种模式都需要）
         self.img_encoder = UnetExtractor(in_channel=3, encoder_dim=self.cfg.raft.encoder_dims)
@@ -62,9 +76,25 @@ class RtStereoHumanModel(nn.Module):
         else:
             raise ValueError(f"未知的深度估计模式: {self.depth_mode}")
         
-        # 高斯参数回归器
+        # 高斯参数回归器（根据MoE配置选择单流或双流）
         if self.with_gs_render:
-            self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
+            self.gs_parm_regresser = create_gs_regresser(self.cfg, rgb_dim=3, depth_dim=1)
+            
+            # MoE模式下初始化额外模块
+            if self.use_moe:
+                from lib.moe_router import create_moe_router
+                from lib.gaussian_allocation import create_gaussian_allocator
+                
+                # MoE路由器
+                router_in_channels = self.cfg.raft.encoder_dims[0]  # 使用第一层特征
+                self.moe_router = create_moe_router(self.cfg, router_in_channels)
+                
+                # 高斯分配网络（如果配置为可学习）
+                alloc_cfg = getattr(self.moe_cfg, 'allocation', None)
+                if alloc_cfg is not None and getattr(alloc_cfg, 'learnable', False):
+                    self.gaussian_allocator = create_gaussian_allocator(self.cfg)
+                else:
+                    self.gaussian_allocator = None
 
     def forward(self, data, is_train=True):
         """
@@ -183,7 +213,11 @@ class RtStereoHumanModel(nn.Module):
         r_depth = data['rmain']['depth'] 
         lr_depth = torch.concat([l_depth, r_depth], dim=0)
         
-        # 回归高斯参数
+        # MoE模式处理
+        if self.use_moe:
+            return self._flow2gsparms_moe(lr_img, lr_img_feat, data, bs, lr_depth)
+        
+        # 原始单流模式
         rot_maps, scale_maps, opacity_maps, depth_maps = self.gs_parm_regresser(lr_img, lr_depth, lr_img_feat)
         l_resdepth, r_resdepth = torch.split(depth_maps, [bs, bs])
 
@@ -206,6 +240,67 @@ class RtStereoHumanModel(nn.Module):
 
         return data
     
+    def _flow2gsparms_moe(self, lr_img, lr_img_feat, data, bs, lr_depth):
+        """
+        MoE模式的高斯参数计算
+        """
+        # 计算路由权重
+        # 使用第一层特征（最高分辨率）
+        router_input = lr_img_feat[0]  # [2*bs, C, H, W]
+        router_weights = self.moe_router(router_input)  # [2*bs, 2, H, W]
+        
+        # 上采样到原始分辨率
+        target_size = lr_img.shape[2:]
+        router_weights = F.interpolate(router_weights, size=target_size, mode='bilinear', align_corners=False)
+        
+        # 双流高斯参数预测
+        bg_params, human_params, fused_params = self.gs_parm_regresser.forward_with_routing(
+            lr_img, lr_depth, lr_img_feat, router_weights
+        )
+        
+        # 使用融合后的深度残差
+        depth_maps = fused_params['depth_residual']
+        l_resdepth, r_resdepth = torch.split(depth_maps, [bs, bs])
+        
+        # 添加深度残差
+        data['lmain']['depth'] = data['lmain']['depth'] + l_resdepth
+        data['rmain']['depth'] = data['rmain']['depth'] + r_resdepth
+        
+        # 将深度转换为3D点
+        for view in ['lmain', 'rmain']:
+            data[view]['xyz'] = depth2pc(data[view]['depth'], data[view]['extr'], data[view]['intr']).view(bs, -1, 3)
+            valid = data[view]['mask'][:, :1, :, :] > 0.5
+            data[view]['pts_valid'] = valid.view(bs, -1)
+        
+        # 分配融合后的高斯参数
+        rot_maps = fused_params['rot_maps']
+        scale_maps = fused_params['scale_maps']
+        opacity_maps = fused_params['opacity_maps']
+        
+        data['novel_view']['scale_regular'] = torch.mean(scale_maps)
+        
+        data['lmain']['rot_maps'], data['rmain']['rot_maps'] = torch.split(rot_maps, [bs, bs])
+        data['lmain']['scale_maps'], data['rmain']['scale_maps'] = torch.split(scale_maps, [bs, bs])
+        data['lmain']['opacity_maps'], data['rmain']['opacity_maps'] = torch.split(opacity_maps, [bs, bs])
+        
+        # 保存MoE相关信息用于损失计算
+        l_router, r_router = torch.split(router_weights, [bs, bs])
+        data['lmain']['router_weights'] = l_router
+        data['rmain']['router_weights'] = r_router
+        
+        # 保存分离的背景和人体参数
+        data['lmain']['bg_params'] = {k: v[:bs] if v is not None else None for k, v in bg_params.items()}
+        data['rmain']['bg_params'] = {k: v[bs:] if v is not None else None for k, v in bg_params.items()}
+        data['lmain']['human_params'] = {k: v[:bs] if v is not None else None for k, v in human_params.items()}
+        data['rmain']['human_params'] = {k: v[bs:] if v is not None else None for k, v in human_params.items()}
+        
+        # 如果有高斯分配网络，计算分配比例
+        if self.gaussian_allocator is not None:
+            alloc_ratio, _, _ = self.gaussian_allocator(lr_img_feat[0], router_weights)
+            data['allocation_ratio'] = alloc_ratio
+        
+        return data
+    
     def depth2gsparms(self, lr_img, lr_img_feat, data, bs):
         """
         从深度计算高斯参数（DA3模式使用）
@@ -226,7 +321,11 @@ class RtStereoHumanModel(nn.Module):
         r_depth = data['rmain']['depth'] 
         lr_depth = torch.concat([l_depth, r_depth], dim=0)
         
-        # 回归高斯参数
+        # MoE模式处理
+        if self.use_moe:
+            return self._depth2gsparms_moe(lr_img, lr_img_feat, data, bs, lr_depth)
+        
+        # 原始单流模式
         rot_maps, scale_maps, opacity_maps, depth_maps = self.gs_parm_regresser(lr_img, lr_depth, lr_img_feat)
         l_resdepth, r_resdepth = torch.split(depth_maps, [bs, bs])
 
@@ -248,3 +347,77 @@ class RtStereoHumanModel(nn.Module):
         data['lmain']['opacity_maps'], data['rmain']['opacity_maps'] = torch.split(opacity_maps, [bs, bs])
 
         return data
+    
+    def _depth2gsparms_moe(self, lr_img, lr_img_feat, data, bs, lr_depth):
+        """
+        MoE模式的高斯参数计算（DA3模式使用）
+        """
+        # 计算路由权重
+        router_input = lr_img_feat[0]  # [2*bs, C, H, W]
+        router_weights = self.moe_router(router_input)  # [2*bs, 2, H, W]
+        
+        # 上采样到原始分辨率
+        target_size = lr_img.shape[2:]
+        router_weights = F.interpolate(router_weights, size=target_size, mode='bilinear', align_corners=False)
+        
+        # 双流高斯参数预测
+        bg_params, human_params, fused_params = self.gs_parm_regresser.forward_with_routing(
+            lr_img, lr_depth, lr_img_feat, router_weights
+        )
+        
+        # 使用融合后的深度残差
+        depth_maps = fused_params['depth_residual']
+        l_resdepth, r_resdepth = torch.split(depth_maps, [bs, bs])
+        
+        # 添加深度残差
+        data['lmain']['depth'] = data['lmain']['depth'] + l_resdepth
+        data['rmain']['depth'] = data['rmain']['depth'] + r_resdepth
+        
+        # 将深度转换为3D点
+        for view in ['lmain', 'rmain']:
+            data[view]['xyz'] = depth2pc(data[view]['depth'], data[view]['extr'], data[view]['intr']).view(bs, -1, 3)
+            valid = data[view]['mask'][:, :1, :, :] > 0.5
+            data[view]['pts_valid'] = valid.view(bs, -1)
+        
+        # 分配融合后的高斯参数
+        rot_maps = fused_params['rot_maps']
+        scale_maps = fused_params['scale_maps']
+        opacity_maps = fused_params['opacity_maps']
+        
+        data['novel_view']['scale_regular'] = torch.mean(scale_maps)
+        
+        data['lmain']['rot_maps'], data['rmain']['rot_maps'] = torch.split(rot_maps, [bs, bs])
+        data['lmain']['scale_maps'], data['rmain']['scale_maps'] = torch.split(scale_maps, [bs, bs])
+        data['lmain']['opacity_maps'], data['rmain']['opacity_maps'] = torch.split(opacity_maps, [bs, bs])
+        
+        # 保存MoE相关信息用于损失计算
+        l_router, r_router = torch.split(router_weights, [bs, bs])
+        data['lmain']['router_weights'] = l_router
+        data['rmain']['router_weights'] = r_router
+        
+        # 保存分离的背景和人体参数
+        data['lmain']['bg_params'] = {k: v[:bs] if v is not None else None for k, v in bg_params.items()}
+        data['rmain']['bg_params'] = {k: v[bs:] if v is not None else None for k, v in bg_params.items()}
+        data['lmain']['human_params'] = {k: v[:bs] if v is not None else None for k, v in human_params.items()}
+        data['rmain']['human_params'] = {k: v[bs:] if v is not None else None for k, v in human_params.items()}
+        
+        # 如果有高斯分配网络，计算分配比例
+        if self.gaussian_allocator is not None:
+            alloc_ratio, _, _ = self.gaussian_allocator(lr_img_feat[0], router_weights)
+            data['allocation_ratio'] = alloc_ratio
+        
+        return data
+    
+    def freeze_router(self):
+        """冻结MoE路由器参数（渐进式训练阶段A使用）"""
+        if self.use_moe and hasattr(self, 'moe_router'):
+            for param in self.moe_router.parameters():
+                param.requires_grad = False
+            print("[Network] MoE路由器已冻结")
+    
+    def unfreeze_router(self):
+        """解冻MoE路由器参数（渐进式训练阶段B使用）"""
+        if self.use_moe and hasattr(self, 'moe_router'):
+            for param in self.moe_router.parameters():
+                param.requires_grad = True
+            print("[Network] MoE路由器已解冻")
