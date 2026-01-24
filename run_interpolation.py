@@ -276,11 +276,13 @@ if __name__ == '__main__':
     cfg.exp_name = f'gps_plus_{depth_mode}'
 
     cfg.record.show_path = "experiments/%s/show_free_%s" % (cfg.exp_name, tar_n)
+    cfg.record.origin_path = os.path.join(cfg.record.show_path, "origin")
     cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_da3_0121/ckpt/iter20000.pth'  # TODO: 设置检查点路径
     cfg.freeze()
     LOOP_NUM = 20
 
     Path(cfg.record.show_path).mkdir(exist_ok=True, parents=True)
+    Path(cfg.record.origin_path).mkdir(exist_ok=True, parents=True)
 
     from_list = [0]
     to_list = [1]
@@ -318,25 +320,46 @@ if __name__ == '__main__':
         scene_id = (wi_ct) % 6
         with torch.no_grad():
             if scene_id == 0:
-                data = render.get_item_free(fr_i, fr_i % LOOP_NUM)
-                out = render.model(data)
+                active_render = render
+                data = active_render.get_item_free(fr_i, fr_i % LOOP_NUM)
+                out = active_render.model(data)
             elif scene_id == 1:
-                data = render2.get_item_free(fr_i, fr_i % LOOP_NUM)
-                out = render2.model(data)
+                active_render = render2
+                data = active_render.get_item_free(fr_i, fr_i % LOOP_NUM)
+                out = active_render.model(data)
             elif scene_id == 2:
-                data = render3.get_item_free(fr_i, fr_i % LOOP_NUM)
-                out = render3.model(data)
+                active_render = render3
+                data = active_render.get_item_free(fr_i, fr_i % LOOP_NUM)
+                out = active_render.model(data)
             elif scene_id == 3:
-                data = render3.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
-                out = render3.model(data)
+                active_render = render3
+                data = active_render.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
+                out = active_render.model(data)
             elif scene_id == 4:
-                data = render2.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
-                out = render2.model(data)
+                active_render = render2
+                data = active_render.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
+                out = active_render.model(data)
             elif scene_id == 5:
-                data = render.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
-                out = render.model(data)
+                active_render = render
+                data = active_render.get_item_free(fr_i, (LOOP_NUM - 1) - (fr_i % LOOP_NUM))
+                out = active_render.model(data)
             else:
                 exit()
+            # 保存原始测试帧（用于生成原视频）
+            orig_img_path = os.path.join(
+                active_render.img_path,
+                f"{tar_n}_s{active_render.s_id}_{fr_i:04d}",
+                f"{from_list[0]}.jpg"
+            )
+            if os.path.exists(orig_img_path):
+                orig_img = np.array(Image.open(orig_img_path)).astype(np.uint8)
+                if orig_img.shape[0] >= RS and orig_img.shape[1] >= RS:
+                    orig_crop = orig_img[cut:(RS - cut), cut:(RS - cut)]
+                else:
+                    orig_crop = orig_img
+                orig_img_name = os.path.join(cfg.record.origin_path, f"{fr_i:03d}.jpg")
+                cv2.imwrite(orig_img_name, orig_crop[:, :, ::-1])
+
             data = pts2render(data, bg_color=cfg.dataset.bg_color) 
             tmp_novel = data['novel_view']['img_pred'][0].detach()
             tmp_novel *= 255

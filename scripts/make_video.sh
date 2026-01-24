@@ -65,11 +65,6 @@ if ! command -v ffmpeg &> /dev/null; then
     exit 1
 fi
 
-# 生成视频
-echo -e "${GREEN}开始生成视频...${NC}"
-
-cd "$IMAGE_DIR" || exit 1
-
 # 选择可用编码器
 ENCODER="libx264"
 ENCODER_OPTS=("-crf" "18" "-preset" "medium")
@@ -86,25 +81,70 @@ if ! ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "libx264"; then
     fi
 fi
 
-ffmpeg -framerate "$FPS" \
-    -pattern_type glob -i '*.jpg' \
-    -c:v "$ENCODER" \
-    -pix_fmt yuv420p \
-    "${ENCODER_OPTS[@]}" \
-    "$OUTPUT_NAME" \
-    -y
+make_video_for_dir() {
+    local dir="$1"
+    local output="$2"
+    local pattern="*.jpg"
+    local count
+
+    count=$(find "$dir" -maxdepth 1 -name "*.jpg" -o -name "*.png" | wc -l)
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}跳过: 目录无图片 $dir${NC}"
+        return
+    fi
+
+    if ! find "$dir" -maxdepth 1 -name "*.jpg" | grep -q .; then
+        pattern="*.png"
+    fi
+
+    echo -e "${GREEN}开始生成视频: ${YELLOW}$dir/$output${NC}"
+    (
+        cd "$dir" || exit 1
+        ffmpeg -framerate "$FPS" \
+            -pattern_type glob -i "$pattern" \
+            -c:v "$ENCODER" \
+            -pix_fmt yuv420p \
+            "${ENCODER_OPTS[@]}" \
+            "$output" \
+            -y
+    )
+}
+
+# 生成主视频
+make_video_for_dir "$IMAGE_DIR" "$OUTPUT_NAME"
+MAIN_STATUS=$?
+
+# 如果存在原视频目录，则额外生成原视频
+ORIGIN_DIR="$IMAGE_DIR/origin"
+if [ -d "$ORIGIN_DIR" ]; then
+    make_video_for_dir "$ORIGIN_DIR" "origin_${OUTPUT_NAME}"
+    ORIGIN_STATUS=$?
+else
+    ORIGIN_STATUS=0
+fi
 
 # 检查是否成功
-if [ $? -eq 0 ]; then
-    VIDEO_SIZE=$(du -h "$OUTPUT_NAME" | cut -f1)
-    VIDEO_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT_NAME" 2>/dev/null | awk '{printf "%.2f", $1}')
-    
+if [ $MAIN_STATUS -eq 0 ] && [ $ORIGIN_STATUS -eq 0 ]; then
     echo ""
     echo -e "${GREEN}==================== 生成成功! ====================${NC}"
-    echo -e "视频路径: ${YELLOW}$(pwd)/$OUTPUT_NAME${NC}"
+    VIDEO_SIZE=$(du -h "$IMAGE_DIR/$OUTPUT_NAME" | cut -f1)
+    VIDEO_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$IMAGE_DIR/$OUTPUT_NAME" 2>/dev/null | awk '{printf "%.2f", $1}')
+    echo -e "视频路径: ${YELLOW}$IMAGE_DIR/$OUTPUT_NAME${NC}"
     echo -e "文件大小: ${YELLOW}$VIDEO_SIZE${NC}"
     echo -e "视频时长: ${YELLOW}${VIDEO_DURATION}秒${NC}"
-    echo -e "分辨率: ${YELLOW}$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$OUTPUT_NAME" 2>/dev/null)${NC}"
+    echo -e "分辨率: ${YELLOW}$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$IMAGE_DIR/$OUTPUT_NAME" 2>/dev/null)${NC}"
+
+    if [ -d "$ORIGIN_DIR" ]; then
+        ORIGIN_VIDEO="$ORIGIN_DIR/origin_${OUTPUT_NAME}"
+        if [ -f "$ORIGIN_VIDEO" ]; then
+            ORIGIN_SIZE=$(du -h "$ORIGIN_VIDEO" | cut -f1)
+            ORIGIN_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$ORIGIN_VIDEO" 2>/dev/null | awk '{printf "%.2f", $1}')
+            echo -e "原视频路径: ${YELLOW}$ORIGIN_VIDEO${NC}"
+            echo -e "原视频大小: ${YELLOW}$ORIGIN_SIZE${NC}"
+            echo -e "原视频时长: ${YELLOW}${ORIGIN_DURATION}秒${NC}"
+            echo -e "原视频分辨率: ${YELLOW}$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$ORIGIN_VIDEO" 2>/dev/null)${NC}"
+        fi
+    fi
     echo -e "${GREEN}====================================================${NC}"
 else
     echo -e "${RED}错误: 视频生成失败${NC}"

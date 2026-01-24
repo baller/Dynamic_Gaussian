@@ -20,6 +20,7 @@ from lib.train_recoder import Logger, file_backup
 from lib.GaussianRender import pts2render
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
+import lpips
 
 from copy import deepcopy
 import torch
@@ -62,6 +63,10 @@ class Trainer:
             self.load_ckpt(self.cfg.restore_ckpt, load_optimizer=False, strict=strict)
 
         self.model.eval()
+        
+        # 初始化LPIPS模型用于测试指标计算
+        self.lpips_fn = lpips.LPIPS(net='vgg').cuda()
+        self.lpips_fn.eval()
         
         # 根据深度模式冻结BN
         self._freeze_bn()
@@ -136,7 +141,12 @@ class Trainer:
     def val(self):
         logging.info(f"Doing validation ...")
         torch.cuda.empty_cache()
+        
+        # 初始化指标列表
         psnr_list = []
+        ssim_list = []
+        lpips_list = []
+        
         for idx in tqdm(range(self.len_val)):
             data = self.fetch_data(phase='val')
 
@@ -147,7 +157,28 @@ class Trainer:
                 data, _, _ = self.model(data, is_train=False)
                 data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
 
-                tmp_novel = data['novel_view']['img_pred'][0].detach()
+                # 获取预测图像和GT图像
+                img_pred = data['novel_view']['img_pred'][0].detach()  # (C, H, W), 范围 [0, 1]
+                img_gt = data['novel_view']['img'].cuda()  # (B, C, H, W) 或 (C, H, W)
+                if img_gt.dim() == 4:
+                    img_gt = img_gt[0]  # (C, H, W)
+                
+                # 计算 PSNR (需要扩展维度以匹配psnr函数的输入格式)
+                psnr_val = psnr(img_pred.unsqueeze(0), img_gt.unsqueeze(0)).item()
+                psnr_list.append(psnr_val)
+                
+                # 计算 SSIM
+                ssim_val = ssim(img_pred.unsqueeze(0), img_gt.unsqueeze(0)).item()
+                ssim_list.append(ssim_val)
+                
+                # 计算 LPIPS (lpips期望输入范围为 [-1, 1])
+                img_pred_lpips = img_pred.unsqueeze(0) * 2 - 1  # [0, 1] -> [-1, 1]
+                img_gt_lpips = img_gt.unsqueeze(0) * 2 - 1
+                lpips_val = self.lpips_fn(img_pred_lpips, img_gt_lpips).item()
+                lpips_list.append(lpips_val)
+
+                # 保存渲染结果
+                tmp_novel = img_pred.clone()
                 tmp_novel *= 255
                 tmp_novel = tmp_novel.permute(1, 2, 0).cpu().numpy()
                 tmp_img_name = '%s/%s_%02d.jpg' % (self.cfg.record.show_path, s_name[0], view_id)
@@ -177,6 +208,53 @@ class Trainer:
                     
                     # 保存彩色深度图
                     cv2.imwrite(depth_img_name, colored_depth_map)
+        
+        # 计算平均指标
+        avg_psnr = np.mean(psnr_list)
+        avg_ssim = np.mean(ssim_list)
+        avg_lpips = np.mean(lpips_list)
+        
+        # 打印测试结果汇总
+        logging.info("=" * 60)
+        logging.info("测试结果汇总")
+        logging.info("=" * 60)
+        logging.info(f"测试样本数: {len(psnr_list)}")
+        logging.info(f"PSNR↑  : {avg_psnr:.4f} (std: {np.std(psnr_list):.4f})")
+        logging.info(f"SSIM↑  : {avg_ssim:.4f} (std: {np.std(ssim_list):.4f})")
+        logging.info(f"LPIPS↓ : {avg_lpips:.4f} (std: {np.std(lpips_list):.4f})")
+        logging.info("=" * 60)
+        
+        # 保存结果到文件
+        results_path = os.path.join(self.cfg.record.show_path, 'metrics.txt')
+        with open(results_path, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("测试结果汇总\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"检查点: {self.cfg.restore_ckpt}\n")
+            f.write(f"序列名称: {self.cfg.seq_name}\n")
+            f.write(f"深度模式: {self.depth_mode}\n")
+            f.write(f"测试样本数: {len(psnr_list)}\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"PSNR↑  : {avg_psnr:.4f} (std: {np.std(psnr_list):.4f})\n")
+            f.write(f"SSIM↑  : {avg_ssim:.4f} (std: {np.std(ssim_list):.4f})\n")
+            f.write(f"LPIPS↓ : {avg_lpips:.4f} (std: {np.std(lpips_list):.4f})\n")
+            f.write("=" * 60 + "\n")
+            f.write("\n详细结果 (每帧):\n")
+            f.write("-" * 60 + "\n")
+            f.write(f"{'帧序号':<10}{'PSNR':<15}{'SSIM':<15}{'LPIPS':<15}\n")
+            for i, (p, s, l) in enumerate(zip(psnr_list, ssim_list, lpips_list)):
+                f.write(f"{i:<10}{p:<15.4f}{s:<15.4f}{l:<15.4f}\n")
+        
+        logging.info(f"详细结果已保存到: {results_path}")
+        
+        return {
+            'psnr': avg_psnr,
+            'ssim': avg_ssim,
+            'lpips': avg_lpips,
+            'psnr_list': psnr_list,
+            'ssim_list': ssim_list,
+            'lpips_list': lpips_list
+        }
 
     def val_dynamic(self, num_interp=30, views=None, loop=False):
         """
@@ -364,6 +442,12 @@ class Trainer:
         
         logging.info(f"总帧数: {len_val}, 视角数: {len(views)}, 总输出: {len_val * len(views)} 帧")
         
+        # 初始化指标列表 - 按视角分组
+        metrics_by_view = {v: {'psnr': [], 'ssim': [], 'lpips': []} for v in views}
+        all_psnr = []
+        all_ssim = []
+        all_lpips = []
+        
         # 按帧顺序，每帧依次渲染所有视角
         frame_idx = 0
         for data_idx in tqdm(range(len_val), desc="渲染帧"):
@@ -384,7 +468,29 @@ class Trainer:
                     data, _, _ = self.model(data, is_train=False)
                     data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
                     
-                    tmp_novel = data['novel_view']['img_pred'][0].detach()
+                    # 获取预测图像和GT图像
+                    img_pred = data['novel_view']['img_pred'][0].detach()  # (C, H, W)
+                    img_gt = data['novel_view']['img'].cuda()
+                    if img_gt.dim() == 4:
+                        img_gt = img_gt[0]
+                    
+                    # 计算指标
+                    psnr_val = psnr(img_pred.unsqueeze(0), img_gt.unsqueeze(0)).item()
+                    ssim_val = ssim(img_pred.unsqueeze(0), img_gt.unsqueeze(0)).item()
+                    img_pred_lpips = img_pred.unsqueeze(0) * 2 - 1
+                    img_gt_lpips = img_gt.unsqueeze(0) * 2 - 1
+                    lpips_val = self.lpips_fn(img_pred_lpips, img_gt_lpips).item()
+                    
+                    # 记录指标
+                    metrics_by_view[view_id]['psnr'].append(psnr_val)
+                    metrics_by_view[view_id]['ssim'].append(ssim_val)
+                    metrics_by_view[view_id]['lpips'].append(lpips_val)
+                    all_psnr.append(psnr_val)
+                    all_ssim.append(ssim_val)
+                    all_lpips.append(lpips_val)
+                    
+                    # 保存渲染结果
+                    tmp_novel = img_pred.clone()
                     tmp_novel *= 255
                     tmp_novel = tmp_novel.permute(1, 2, 0).cpu().numpy()
                     
@@ -413,7 +519,66 @@ class Trainer:
         for view_id in views:
             del view_loaders[view_id]
         
+        # 计算平均指标
+        avg_psnr = np.mean(all_psnr)
+        avg_ssim = np.mean(all_ssim)
+        avg_lpips = np.mean(all_lpips)
+        
+        # 打印测试结果汇总
+        logging.info("=" * 60)
+        logging.info("多视角测试结果汇总")
+        logging.info("=" * 60)
+        logging.info(f"总测试样本数: {len(all_psnr)}")
+        logging.info(f"帧数: {len_val}, 视角数: {len(views)}")
+        logging.info("-" * 60)
+        logging.info("总体平均指标:")
+        logging.info(f"  PSNR↑  : {avg_psnr:.4f} (std: {np.std(all_psnr):.4f})")
+        logging.info(f"  SSIM↑  : {avg_ssim:.4f} (std: {np.std(all_ssim):.4f})")
+        logging.info(f"  LPIPS↓ : {avg_lpips:.4f} (std: {np.std(all_lpips):.4f})")
+        logging.info("-" * 60)
+        logging.info("各视角平均指标:")
+        for view_id in views:
+            v_psnr = np.mean(metrics_by_view[view_id]['psnr'])
+            v_ssim = np.mean(metrics_by_view[view_id]['ssim'])
+            v_lpips = np.mean(metrics_by_view[view_id]['lpips'])
+            logging.info(f"  视角 {view_id}: PSNR={v_psnr:.4f}, SSIM={v_ssim:.4f}, LPIPS={v_lpips:.4f}")
+        logging.info("=" * 60)
+        
+        # 保存结果到文件
+        results_path = os.path.join(self.cfg.record.show_path, 'metrics_all_views.txt')
+        with open(results_path, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("多视角测试结果汇总\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"检查点: {self.cfg.restore_ckpt}\n")
+            f.write(f"序列名称: {self.cfg.seq_name}\n")
+            f.write(f"深度模式: {self.depth_mode}\n")
+            f.write(f"测试视角: {views}\n")
+            f.write(f"总测试样本数: {len(all_psnr)}\n")
+            f.write(f"帧数: {len_val}, 视角数: {len(views)}\n")
+            f.write("-" * 60 + "\n")
+            f.write("总体平均指标:\n")
+            f.write(f"  PSNR↑  : {avg_psnr:.4f} (std: {np.std(all_psnr):.4f})\n")
+            f.write(f"  SSIM↑  : {avg_ssim:.4f} (std: {np.std(all_ssim):.4f})\n")
+            f.write(f"  LPIPS↓ : {avg_lpips:.4f} (std: {np.std(all_lpips):.4f})\n")
+            f.write("-" * 60 + "\n")
+            f.write("各视角平均指标:\n")
+            for view_id in views:
+                v_psnr = np.mean(metrics_by_view[view_id]['psnr'])
+                v_ssim = np.mean(metrics_by_view[view_id]['ssim'])
+                v_lpips = np.mean(metrics_by_view[view_id]['lpips'])
+                f.write(f"  视角 {view_id}: PSNR={v_psnr:.4f}, SSIM={v_ssim:.4f}, LPIPS={v_lpips:.4f}\n")
+            f.write("=" * 60 + "\n")
+        
+        logging.info(f"详细结果已保存到: {results_path}")
         logging.info(f"所有视角渲染完成，共生成 {frame_idx} 帧")
+        
+        return {
+            'psnr': avg_psnr,
+            'ssim': avg_ssim,
+            'lpips': avg_lpips,
+            'metrics_by_view': metrics_by_view
+        }
 
     def _interpolate_transform(self, transform_start, transform_end, t):
         """
