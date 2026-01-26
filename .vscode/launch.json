@@ -4,14 +4,82 @@
     // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-        
-        
         {
             "name": "GPS+ debug",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal"
+            "program": "train.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        },
+        {
+            "name": "Accelerate Python调试 (单GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "args": [
+                "--config_file", "accelerate_config.yaml",
+                "--num_processes", "1",
+                "train_accelerate.py",
+                "--config", "config/stage.yaml",
+                "--gradient_accumulation_steps", "1",
+                "--seed", "1314"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Accelerate Python调试 (直接运行train_accelerate)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_accelerate.py",
+            "args": [
+                "--config", "config/stage.yaml",
+                "--gradient_accumulation_steps", "1",
+                "--seed", "1314"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "justMyCode": false
+        },
+        {
+            "name": "Accelerate多卡训练 (Bash Debug)",
+            "type": "bashdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/run_accelerate_config.sh",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "terminalKind": "integrated",
+            "pathBash": "/bin/bash",
+            "pathBashdb": "bashdb",
+            "pathBashdbLib": "/usr/share/bashdb",
+            "pathCat": "cat",
+            "pathMkfifo": "mkfifo",
+            "pathPkill": "pkill",
+            "showDebugOutput": true,
+            "trace": true
+        },
+        {
+            "name": "Accelerate训练 (终端运行)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "bash -x ${workspaceFolder}/scripts/run_accelerate_config.sh",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            }
         }
     ]
 }

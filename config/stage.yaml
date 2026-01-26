@@ -1,9 +1,10 @@
-name: 'gps_plus'
+# 实验名称前缀（最终名称格式: {name}_{depth_mode}_{moe}_{gpu数}_{时间戳}）
+name: 'depth-anything3-moe'
 
-lr: 0.0001
+lr: 0.00005
 wdecay: 1e-5
 batch_size: 1
-num_steps: 100000
+num_steps: 500000
 
 # 深度估计模式: 'raft' 或 'da3'
 depth_mode: 'da3'
@@ -61,7 +62,7 @@ da3:
   finetune: False
   
   # 是否使用混合精度
-  mixed_precision: False
+  mixed_precision: True
   
   # 深度尺度因子（用于调整DA3输出的深度范围）
   scale_factor: 1.0
@@ -75,13 +76,22 @@ gsnet:
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
 
-# MoE配置（动静分离）
+# MoE配置（动静分离 + 共享专家）
 moe:
   # 是否启用MoE模式
   enabled: true
   
-  # 专家数量（背景+人体）
+  # 路由专家数量（不包括共享专家）
+  # 例如: num_experts=2 表示2个路由专家（如背景+人体）
+  # 注意: 每增加一个专家会显著增加显存占用
   num_experts: 2
+  
+  # 是否使用共享专家
+  # 共享专家的输出会与所有路由专家的输出融合
+  use_shared_expert: true
+  
+  # 共享专家权重（0-1之间，表示共享专家在最终输出中的占比）
+  shared_expert_weight: 0.3
   
   # 路由器类型: 'basic', 'multiscale', 'depth_aware'
   router_type: 'basic'
@@ -92,7 +102,7 @@ moe:
   # 是否使用软路由
   soft_routing: true
   
-  # 是否共享深度编码器
+  # 是否共享深度编码器（所有专家共享）
   share_depth_encoder: true
   
   # 高斯分配配置
@@ -104,7 +114,7 @@ moe:
   # 背景缓存配置
   bg_cache:
     enabled: true
-    update_threshold: 25.0  # PSNR阈值
+    update_threshold: 22.0  # PSNR阈值
     min_update_interval: 1
     quality_metric: 'psnr'
     momentum: 0.0
@@ -119,7 +129,7 @@ moe:
   
   # 训练配置
   training:
-    freeze_router_epochs: 1
+    freeze_router_epochs: 0.2
     progressive: true
 
 # 记录配置

@@ -57,14 +57,16 @@ class ConfigStereoHuman:
         self.cfg.da3.scale_factor = 1.0
         self.cfg.da3.use_metric = False
         
-        # MoE配置（动静分离）
+        # MoE配置（动静分离 + 共享专家）
         self.cfg.moe = CN()
         self.cfg.moe.enabled = False  # 是否启用MoE模式
-        self.cfg.moe.num_experts = 2  # 专家数量（背景+人体）
+        self.cfg.moe.num_experts = 2  # 路由专家数量（不包括共享专家）
+        self.cfg.moe.use_shared_expert = True  # 是否使用共享专家
+        self.cfg.moe.shared_expert_weight = 0.3  # 共享专家权重（0-1）
         self.cfg.moe.router_type = 'basic'  # 路由器类型: 'basic', 'multiscale', 'depth_aware'
         self.cfg.moe.router_channels = 64  # 路由器隐藏层通道数
         self.cfg.moe.soft_routing = True  # 是否使用软路由
-        self.cfg.moe.share_depth_encoder = True  # 是否共享深度编码器
+        self.cfg.moe.share_depth_encoder = True  # 是否共享深度编码器（所有专家共享）
         
         # MoE高斯分配配置
         self.cfg.moe.allocation = CN()
@@ -75,7 +77,7 @@ class ConfigStereoHuman:
         # MoE背景缓存配置
         self.cfg.moe.bg_cache = CN()
         self.cfg.moe.bg_cache.enabled = True  # 是否启用背景缓存
-        self.cfg.moe.bg_cache.update_threshold = 25.0  # PSNR阈值，低于此值更新缓存
+        self.cfg.moe.bg_cache.update_threshold = 22.0  # PSNR阈值，低于此值更新缓存
         self.cfg.moe.bg_cache.min_update_interval = 1  # 最小更新间隔（帧数）
         self.cfg.moe.bg_cache.quality_metric = 'psnr'  # 质量评估指标
         self.cfg.moe.bg_cache.momentum = 0.0  # 缓存更新动量
@@ -90,7 +92,7 @@ class ConfigStereoHuman:
         
         # MoE训练配置
         self.cfg.moe.training = CN()
-        self.cfg.moe.training.freeze_router_epochs = 5  # 冻结路由器的epoch数
+        self.cfg.moe.training.freeze_router_epochs = 0.2  # 冻结路由器的epoch数（支持小数）
         self.cfg.moe.training.progressive = True  # 是否使用渐进式训练
 
         self.cfg.gsnet = CN()

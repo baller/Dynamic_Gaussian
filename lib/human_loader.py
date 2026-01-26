@@ -351,7 +351,7 @@ class StereoHumanDataset(Dataset):
             return self.get_item(index, novel_id=self.opt.val_novel_id)
 
     def __len__(self):
-        self.train_boost = 50
+        self.train_boost = 5
         self.val_boost = 200
         if self.phase == 'train':
             return len(self.sample_list) * self.train_boost

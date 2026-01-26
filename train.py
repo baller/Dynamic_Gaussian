@@ -337,7 +337,9 @@ if __name__ == '__main__':
     moe_cfg = getattr(cfg, 'moe', None)
     use_moe = moe_cfg is not None and getattr(moe_cfg, 'enabled', False)
     moe_suffix = '_moe' if use_moe else ''
-    cfg.exp_name = '%s_%s%s_%s%s' % (cfg.name, depth_mode, moe_suffix, str(dt.month).zfill(2), str(dt.day).zfill(2))
+    # 实验名称格式: {name}_{depth_mode}{moe_suffix}_{月日_时分秒}
+    timestamp = dt.strftime('%m%d_%H%M%S')
+    cfg.exp_name = '%s_%s%s_%s' % (cfg.name, depth_mode, moe_suffix, timestamp)
     cfg.record.ckpt_path = "experiments/%s/ckpt" % cfg.exp_name
     cfg.record.show_path = "experiments/%s/show" % cfg.exp_name
     cfg.record.logs_path = "experiments/%s/logs" % cfg.exp_name

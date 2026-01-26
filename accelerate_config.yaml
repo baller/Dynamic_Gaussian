@@ -1,0 +1,46 @@
+# Accelerate配置文件
+# 使用方法: accelerate launch --config_file accelerate_config.yaml train_accelerate.py
+
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+
+# 机器配置
+machine_rank: 0
+main_process_ip: null
+main_process_port: null
+main_training_function: main
+num_machines: 1
+
+# GPU配置 - 根据实际GPU数量修改
+num_processes: 1  # 使用的GPU数量
+
+# 混合精度配置
+# 可选: 'no', 'fp16', 'bf16'
+mixed_precision: 'fp16'
+
+# 其他配置
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+
+# DeepSpeed配置（如需使用DeepSpeed，取消注释以下配置）
+# deepspeed_config:
+#   gradient_accumulation_steps: 1
+#   offload_optimizer_device: none
+#   offload_param_device: true
+#   zero_stage: 2
+#   zero3_init_flag: false
+
+# FSDP配置（如需使用FSDP，取消注释以下配置）
+# fsdp_config:
+#   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+#   fsdp_backward_prefetch_policy: BACKWARD_PRE
+#   fsdp_forward_prefetch: false
+#   fsdp_offload_params: false
+#   fsdp_sharding_strategy: FULL_SHARD
+#   fsdp_state_dict_type: FULL_STATE_DICT

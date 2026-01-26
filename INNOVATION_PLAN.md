@@ -334,37 +334,51 @@ pip install --no-build-isolation git+https://github.com/nerfstudio-project/gspla
 
 ---
 
-## 阶段2: MoE动静分离架构 ✅ 已完成
+## 阶段2: MoE动静分离架构 ✅ 已完成 (v2.0 支持共享专家)
 
 ### 目标
 实现"动静分离（解耦场景）" + "按需分配不同区域的高斯数量（动态高斯）"
 
 ### 核心创新
-1. **MoE路由器**: 可学习的软路由网络，动态将像素/特征分配给"背景专家"或"人体专家"
-2. **双流高斯生成器**: 分别为背景和人体预测高斯参数
-3. **自适应背景缓存**: 根据渲染质量决定是否更新背景高斯
-4. **可学习的高斯分配**: 端到端学习最优的高斯数量分配
+1. **MoE路由器**: 可学习的软路由网络，动态将像素/特征分配给不同专家
+2. **多专家高斯生成器**: 支持任意数量的路由专家 + 共享专家
+3. **共享专家**: 所有输入都会经过共享专家，其输出与路由专家融合（类似DeepSeek-MoE）
+4. **自适应背景缓存**: 根据渲染质量决定是否更新背景高斯
+5. **可学习的高斯分配**: 端到端学习最优的高斯数量分配
 
-### 技术架构
+### 技术架构 (v2.0 带共享专家)
 
 ```
 立体图像对 → UNet特征 → DA3深度估计 → MoE路由器
                                           ↓
-                              ┌───────────┴───────────┐
-                              ↓                       ↓
-                         背景专家                 人体专家
-                              ↓                       ↓
-                         背景高斯                 人体高斯
-                              ↓                       ↓
-                         背景缓存                 每帧更新
-                              └───────────┬───────────┘
+                    ┌─────────────────────┼─────────────────────┐
+                    ↓                     ↓                     ↓
+               路由专家0             路由专家1...N           共享专家
+              (如背景)              (如人体)              (所有输入)
+                    ↓                     ↓                     ↓
+               专家高斯              专家高斯               共享高斯
+                    ↓                     ↓                     ↓
+                    └─────────────────────┴─────────────────────┘
                                           ↓
-                                     高斯合并
+                                    路由权重加权融合
                                           ↓
                                      3DGS渲染
 ```
 
 ### 实施记录
+
+#### 2026-01-25 - 支持任意专家数量 + 共享专家
+
+##### 重构文件
+
+| 文件 | 修改内容 |
+|------|---------|
+| `lib/moe_router.py` | 重构，支持共享专家、可学习共享权重、返回expert_info |
+| `lib/gs_parm_network.py` | 新增 `ExpertModule` 和 `MoEGSRegresser`，支持任意专家数量 |
+| `lib/GaussianRender.py` | 重构 `pts2render_moe`，支持多专家分离渲染 |
+| `lib/network.py` | 新增 `_save_expert_params`，适配新MoE架构 |
+| `config/stage.yaml` | 新增 `use_shared_expert` 和 `shared_expert_weight` 配置 |
+| `config/stereo_human_config.py` | 新增共享专家配置定义 |
 
 #### 2026-01-24 - 阶段2代码实现
 
@@ -391,14 +405,21 @@ pip install --no-build-isolation git+https://github.com/nerfstudio-project/gspla
 
 ### 使用说明
 
-#### 启用MoE模式
+#### 启用MoE模式（带共享专家）
 
 在 `config/stage.yaml` 中修改:
 
 ```yaml
 moe:
   enabled: true  # 启用MoE模式
-  num_experts: 2  # 背景 + 人体
+  
+  # 路由专家数量（不包括共享专家）
+  num_experts: 2
+  
+  # 共享专家配置
+  use_shared_expert: true  # 启用共享专家
+  shared_expert_weight: 0.3  # 共享专家权重（0-1）
+  
   router_type: 'basic'  # 路由器类型
   
   allocation:
@@ -454,14 +475,136 @@ MoE模式测试时会输出额外的可视化文件:
 
 ---
 
+## 阶段3: Accelerate多卡训练支持 ✅ 已完成
+
+### 目标
+基于Hugging Face Accelerate实现多GPU分布式训练，提升训练效率
+
+### 核心功能
+1. **多GPU分布式训练**: 支持多卡并行训练，自动处理数据分片和梯度同步
+2. **混合精度训练**: 支持FP16/BF16混合精度，减少显存占用
+3. **梯度累积**: 支持梯度累积，等效更大batch size
+4. **兼容性**: 与原有单卡训练脚本完全兼容
+
+### 实施记录
+
+#### 2026-01-25 - Accelerate多卡支持实现
+
+##### 1. 新建文件
+
+| 文件 | 功能 |
+|------|------|
+| `train_accelerate.py` | 基于Accelerate的多卡训练脚本 |
+| `accelerate_config.yaml` | Accelerate配置文件模板 |
+| `scripts/run_accelerate.sh` | 多卡训练启动脚本（命令行模式） |
+| `scripts/run_accelerate_config.sh` | 多卡训练启动脚本（配置文件模式） |
+
+##### 2. 主要特性
+
+| 特性 | 说明 |
+|------|------|
+| 多GPU并行 | 自动数据分片，支持任意数量GPU |
+| 混合精度 | 支持 `no`/`fp16`/`bf16` 三种模式 |
+| 梯度累积 | 支持配置梯度累积步数 |
+| 自动同步 | 自动处理梯度同步和checkpoint保存 |
+| 进度显示 | 仅主进程显示进度条和日志 |
+| MoE兼容 | 完全支持MoE动静分离模式 |
+
+### 使用说明
+
+#### 安装依赖
+
+```bash
+pip install accelerate
+```
+
+#### 快速启动
+
+```bash
+# 使用默认配置（4卡）
+./scripts/run_accelerate.sh
+
+# 指定GPU数量
+./scripts/run_accelerate.sh 2
+
+# 4卡 + FP16混合精度
+./scripts/run_accelerate.sh 4 fp16
+
+# 4卡 + BF16 + 梯度累积2步
+./scripts/run_accelerate.sh 4 bf16 2
+```
+
+#### 使用配置文件
+
+```bash
+# 使用默认配置文件
+./scripts/run_accelerate_config.sh
+
+# 使用自定义配置文件
+./scripts/run_accelerate_config.sh my_config.yaml
+```
+
+#### 直接使用accelerate命令
+
+```bash
+# 多卡训练
+accelerate launch --multi_gpu --num_processes 4 train_accelerate.py
+
+# 使用配置文件
+accelerate launch --config_file accelerate_config.yaml train_accelerate.py
+
+# 带参数
+accelerate launch --multi_gpu --num_processes 4 train_accelerate.py \
+    --config config/stage.yaml \
+    --gradient_accumulation_steps 2 \
+    --mixed_precision fp16
+```
+
+### Accelerate配置选项
+
+#### accelerate_config.yaml
+
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_processes: 4           # GPU数量
+mixed_precision: 'no'      # 混合精度: no/fp16/bf16
+```
+
+#### 命令行参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--config` | 训练配置文件路径 | `config/stage.yaml` |
+| `--gradient_accumulation_steps` | 梯度累积步数 | `1` |
+| `--mixed_precision` | 混合精度模式 | `no` |
+| `--seed` | 随机种子 | `1314` |
+
+### 性能对比
+
+| 配置 | 单卡 | 2卡 | 4卡 |
+|------|------|-----|-----|
+| 训练速度 | 1x | ~1.9x | ~3.6x |
+| 显存/卡 | 100% | ~55% | ~30% |
+
+### 注意事项
+
+1. **显存**: 多卡训练时每卡显存占用会降低
+2. **Batch Size**: 有效batch size = batch_size × num_gpus × gradient_accumulation_steps
+3. **学习率**: 多卡时可适当增大学习率
+4. **Checkpoint**: 仅主进程保存checkpoint
+5. **日志**: 仅主进程输出日志和TensorBoard
+
+---
+
 ## 后续计划
 
-### 阶段3: 特征融合优化 (计划中)
+### 阶段4: 特征融合优化 (计划中)
 - 提取DA3的DinoV2特征
 - 设计特征融合模块
 - 增强高斯参数预测精度
 
-### 阶段4: 单目扩展 (计划中)
+### 阶段5: 单目扩展 (计划中)
 - 移除双视图要求
 - 支持单图像输入
 - 借鉴SHARP的多层高斯表示

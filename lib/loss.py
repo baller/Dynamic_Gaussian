@@ -154,19 +154,24 @@ class MoELoss(nn.Module):
         Args:
             bg_params: 背景高斯参数字典
             human_params: 人体高斯参数字典
-            router_weights: 路由权重 [B, 2, H, W]
+            router_weights: 路由权重 [B, num_experts, H, W]
             
         Returns:
-            loss: 分离一致性损失
+            loss: 分离一致性损失（Tensor）
         """
+        device = router_weights.device
+        
         if bg_params is None or human_params is None:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=device)
+        
+        # 获取专家数量，使用前两个通道（背景和人体）
+        num_experts = router_weights.shape[1]
         
         # 在高置信度区域计算参数差异
         bg_mask = (router_weights[:, 0:1] > 0.7).float()
-        human_mask = (router_weights[:, 1:2] > 0.7).float()
+        human_mask = (router_weights[:, 1:2] > 0.7).float() if num_experts > 1 else torch.zeros_like(bg_mask)
         
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=device)
         count = 0
         
         # 比较尺度参数
@@ -178,7 +183,7 @@ class MoELoss(nn.Module):
             if bg_mask.sum() > 0:
                 bg_scale_var = (bg_scale * bg_mask).var()
                 # 鼓励背景尺度方差小
-                total_loss += bg_scale_var
+                total_loss = total_loss + bg_scale_var
                 count += 1
         
         # 比较不透明度
@@ -190,12 +195,12 @@ class MoELoss(nn.Module):
             if bg_mask.sum() > 0:
                 bg_conf = (bg_opacity * bg_mask).sum() / (bg_mask.sum() + 1e-8)
                 # 鼓励背景专家在背景区域给出高不透明度
-                total_loss += (1 - bg_conf)
+                total_loss = total_loss + (1 - bg_conf)
                 count += 1
             
             if human_mask.sum() > 0:
                 human_conf = (human_opacity * human_mask).sum() / (human_mask.sum() + 1e-8)
-                total_loss += (1 - human_conf)
+                total_loss = total_loss + (1 - human_conf)
                 count += 1
         
         if count > 0:
@@ -266,7 +271,7 @@ class MoELoss(nn.Module):
                 bg_params, human_params, data['lmain']['router_weights']
             )
             total_loss += self.separation_weight * separation
-            loss_dict['separation'] = separation.item()
+            loss_dict['separation'] = separation.item() if isinstance(separation, torch.Tensor) else separation
         
         loss_dict['moe_total'] = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
         

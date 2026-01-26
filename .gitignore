@@ -7,3 +7,4 @@ experiments/
 runs/
 *.jpg
 *.png
+gaussian-splatting

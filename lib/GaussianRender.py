@@ -1,9 +1,9 @@
 """
 高斯渲染模块
 
-支持两种渲染模式:
+支持多种渲染模式:
 1. 单流模式: 原始的统一高斯渲染
-2. MoE模式: 背景和人体分离渲染后合并
+2. MoE模式: 多专家分离渲染后合并（支持任意数量专家+共享专家）
 """
 
 import torch
@@ -30,17 +30,16 @@ def pts2render(data, bg_color):
         for view in ['lmain', 'rmain']:
             valid_i = data[view]['pts_valid'][i, :]
             xyz_i = data[view]['xyz'][i, :, :]  # [S*S, 3]
-            rgb_i = data[view]['img'][i, :, :, :].permute(1, 2, 0).view(-1, 3)  # [S*S, 3]
-            # rgb_i = data[view]['color_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 3)  # [S*S, 3]
-            rot_i = data[view]['rot_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 4)  # [S*S, 4]
-            scale_i = data[view]['scale_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 3)  # [S*S, 3]
-            opacity_i = data[view]['opacity_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 1)  # [S*S, 1]
+            rgb_i = data[view]['img'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 3)  # [S*S, 3]
+            rot_i = data[view]['rot_maps'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 4)  # [S*S, 4]
+            scale_i = data[view]['scale_maps'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 3)  # [S*S, 3]
+            opacity_i = data[view]['opacity_maps'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 1)  # [S*S, 1]
 
-            xyz_i_valid.append(xyz_i[valid_i].view(-1, 3)) #[valid_i]
-            rgb_i_valid.append(rgb_i[valid_i].view(-1, 3))
-            rot_i_valid.append(rot_i[valid_i].view(-1, 4))
-            scale_i_valid.append(scale_i[valid_i].view(-1, 3))
-            opacity_i_valid.append(opacity_i[valid_i].view(-1, 1))
+            xyz_i_valid.append(xyz_i[valid_i].reshape(-1, 3))
+            rgb_i_valid.append(rgb_i[valid_i].reshape(-1, 3))
+            rot_i_valid.append(rot_i[valid_i].reshape(-1, 4))
+            scale_i_valid.append(scale_i[valid_i].reshape(-1, 3))
+            opacity_i_valid.append(opacity_i[valid_i].reshape(-1, 1))
 
         pts_xyz_i = torch.concat(xyz_i_valid, dim=0)
         pts_rgb_i = torch.concat(rgb_i_valid, dim=0)
@@ -56,22 +55,26 @@ def pts2render(data, bg_color):
     return data
 
 
-def pts2render_moe(data, bg_color, bg_cache=None):
+def pts2render_moe(data, bg_color, bg_cache=None, expert_info=None, render_experts=False):
     """
     MoE模式的高斯渲染
     
-    支持背景/人体分离渲染和背景缓存。
+    支持任意数量专家+共享专家的分离渲染和融合。
     
     Args:
-        data: 数据字典，包含融合后的高斯参数和分离的bg_params/human_params
+        data: 数据字典，包含:
+            - router_weights: 路由权重 [B, num_experts, H, W]
+            - expert_params_list: 各专家参数列表（可选，用于分离渲染）
+            - 融合后的高斯参数
         bg_color: 背景颜色
         bg_cache: 背景缓存对象（可选）
+        expert_info: 专家信息字典
+        render_experts: 是否渲染各专家（用于可视化，训练时设为False节省显存）
         
     Returns:
         data: 更新后的数据字典，包含:
             - novel_view['img_pred']: 融合渲染结果
-            - novel_view['bg_render']: 背景渲染结果（可选）
-            - novel_view['human_render']: 人体渲染结果（可选）
+            - novel_view['expert_renders']: 各专家渲染结果（仅当render_experts=True）
     """
     bs = data['lmain']['img'].shape[0]
     
@@ -83,8 +86,7 @@ def pts2render_moe(data, bg_color, bg_cache=None):
         return pts2render(data, bg_color)
     
     render_novel_list = []
-    bg_render_list = []
-    human_render_list = []
+    expert_renders = {}  # 各专家的渲染结果
     
     for i in range(bs):
         # 收集融合后的高斯参数（用于主渲染）
@@ -94,69 +96,21 @@ def pts2render_moe(data, bg_color, bg_cache=None):
         scale_i_valid = []
         opacity_i_valid = []
         
-        # 收集背景高斯参数
-        bg_xyz_valid = []
-        bg_rgb_valid = []
-        bg_rot_valid = []
-        bg_scale_valid = []
-        bg_opacity_valid = []
-        
-        # 收集人体高斯参数
-        human_xyz_valid = []
-        human_rgb_valid = []
-        human_rot_valid = []
-        human_scale_valid = []
-        human_opacity_valid = []
-        
         for view in ['lmain', 'rmain']:
             valid_i = data[view]['pts_valid'][i, :]
             xyz_i = data[view]['xyz'][i, :, :]  # [S*S, 3]
-            rgb_i = data[view]['img'][i, :, :, :].permute(1, 2, 0).view(-1, 3)  # [S*S, 3]
+            rgb_i = data[view]['img'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 3)
             
             # 融合后的参数
-            rot_i = data[view]['rot_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 4)
-            scale_i = data[view]['scale_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 3)
-            opacity_i = data[view]['opacity_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 1)
+            rot_i = data[view]['rot_maps'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 4)
+            scale_i = data[view]['scale_maps'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 3)
+            opacity_i = data[view]['opacity_maps'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 1)
             
-            xyz_i_valid.append(xyz_i[valid_i].view(-1, 3))
-            rgb_i_valid.append(rgb_i[valid_i].view(-1, 3))
-            rot_i_valid.append(rot_i[valid_i].view(-1, 4))
-            scale_i_valid.append(scale_i[valid_i].view(-1, 3))
-            opacity_i_valid.append(opacity_i[valid_i].view(-1, 1))
-            
-            # 获取路由权重用于分离
-            router_weights = data[view]['router_weights'][i]  # [2, H, W]
-            router_flat = router_weights.permute(1, 2, 0).view(-1, 2)  # [S*S, 2]
-            
-            # 背景高斯（路由权重作为额外的不透明度调制）
-            if 'bg_params' in data[view]:
-                bg_rot_i = data[view]['bg_params']['rot_maps'][i].permute(1, 2, 0).view(-1, 4)
-                bg_scale_i = data[view]['bg_params']['scale_maps'][i].permute(1, 2, 0).view(-1, 3)
-                bg_opacity_i = data[view]['bg_params']['opacity_maps'][i].permute(1, 2, 0).view(-1, 1)
-                
-                # 先用 valid_i 索引，再用路由权重调制不透明度
-                bg_opacity_i_valid = bg_opacity_i[valid_i] * router_flat[valid_i, 0:1]
-                
-                bg_xyz_valid.append(xyz_i[valid_i].view(-1, 3))
-                bg_rgb_valid.append(rgb_i[valid_i].view(-1, 3))
-                bg_rot_valid.append(bg_rot_i[valid_i].view(-1, 4))
-                bg_scale_valid.append(bg_scale_i[valid_i].view(-1, 3))
-                bg_opacity_valid.append(bg_opacity_i_valid.view(-1, 1))
-            
-            # 人体高斯
-            if 'human_params' in data[view]:
-                human_rot_i = data[view]['human_params']['rot_maps'][i].permute(1, 2, 0).view(-1, 4)
-                human_scale_i = data[view]['human_params']['scale_maps'][i].permute(1, 2, 0).view(-1, 3)
-                human_opacity_i = data[view]['human_params']['opacity_maps'][i].permute(1, 2, 0).view(-1, 1)
-                
-                # 先用 valid_i 索引，再用路由权重调制不透明度
-                human_opacity_i_valid = human_opacity_i[valid_i] * router_flat[valid_i, 1:2]
-                
-                human_xyz_valid.append(xyz_i[valid_i].view(-1, 3))
-                human_rgb_valid.append(rgb_i[valid_i].view(-1, 3))
-                human_rot_valid.append(human_rot_i[valid_i].view(-1, 4))
-                human_scale_valid.append(human_scale_i[valid_i].view(-1, 3))
-                human_opacity_valid.append(human_opacity_i_valid.view(-1, 1))
+            xyz_i_valid.append(xyz_i[valid_i].reshape(-1, 3))
+            rgb_i_valid.append(rgb_i[valid_i].reshape(-1, 3))
+            rot_i_valid.append(rot_i[valid_i].reshape(-1, 4))
+            scale_i_valid.append(scale_i[valid_i].reshape(-1, 3))
+            opacity_i_valid.append(opacity_i[valid_i].reshape(-1, 1))
         
         # 融合渲染
         pts_xyz_i = torch.concat(xyz_i_valid, dim=0)
@@ -168,35 +122,77 @@ def pts2render_moe(data, bg_color, bg_cache=None):
         render_novel_i = render(data, i, pts_xyz_i, pts_rgb_i, rot_i, scale_i, opacity_i, bg_color=bg_color)
         render_novel_list.append(render_novel_i.unsqueeze(0))
         
-        # 背景单独渲染（用于质量评估和可视化）
-        if len(bg_xyz_valid) > 0:
-            bg_xyz = torch.concat(bg_xyz_valid, dim=0)
-            bg_rgb = torch.concat(bg_rgb_valid, dim=0) * 0.5 + 0.5
-            bg_rot = torch.concat(bg_rot_valid, dim=0)
-            bg_scale = torch.concat(bg_scale_valid, dim=0)
-            bg_opacity = torch.concat(bg_opacity_valid, dim=0)
+        # 各专家单独渲染（仅用于可视化，训练时跳过以节省显存）
+        if render_experts and 'expert_params_list' in data['lmain']:
+            expert_params_list = data['lmain']['expert_params_list']
+            router_weights = data['lmain']['router_weights'][i]  # [num_experts, H, W]
+            num_experts = router_weights.shape[0]
+            router_flat = router_weights.permute(1, 2, 0).contiguous().view(-1, num_experts)
             
-            bg_render_i = render(data, i, bg_xyz, bg_rgb, bg_rot, bg_scale, bg_opacity, bg_color=bg_color)
-            bg_render_list.append(bg_render_i.unsqueeze(0))
-        
-        # 人体单独渲染
-        if len(human_xyz_valid) > 0:
-            human_xyz = torch.concat(human_xyz_valid, dim=0)
-            human_rgb = torch.concat(human_rgb_valid, dim=0) * 0.5 + 0.5
-            human_rot = torch.concat(human_rot_valid, dim=0)
-            human_scale = torch.concat(human_scale_valid, dim=0)
-            human_opacity = torch.concat(human_opacity_valid, dim=0)
-            
-            human_render_i = render(data, i, human_xyz, human_rgb, human_rot, human_scale, human_opacity, bg_color=bg_color)
-            human_render_list.append(human_render_i.unsqueeze(0))
+            for exp_idx, exp_params in enumerate(expert_params_list):
+                exp_name = exp_params.get('name', f'expert_{exp_idx}')
+                if exp_name not in expert_renders:
+                    expert_renders[exp_name] = []
+                
+                exp_xyz_valid = []
+                exp_rgb_valid = []
+                exp_rot_valid = []
+                exp_scale_valid = []
+                exp_opacity_valid = []
+                
+                for view in ['lmain', 'rmain']:
+                    valid_i = data[view]['pts_valid'][i, :]
+                    xyz_i = data[view]['xyz'][i, :, :]
+                    rgb_i = data[view]['img'][i, :, :, :].permute(1, 2, 0).contiguous().view(-1, 3)
+                    
+                    # 获取该视图的专家参数
+                    view_exp_params = data[view]['expert_params_list'][exp_idx] if 'expert_params_list' in data[view] else exp_params
+                    
+                    exp_rot_i = view_exp_params['rot_maps'][i].permute(1, 2, 0).contiguous().view(-1, 4)
+                    exp_scale_i = view_exp_params['scale_maps'][i].permute(1, 2, 0).contiguous().view(-1, 3)
+                    exp_opacity_i = view_exp_params['opacity_maps'][i].permute(1, 2, 0).contiguous().view(-1, 1)
+                    
+                    # 使用路由权重调制不透明度
+                    view_router = data[view]['router_weights'][i]
+                    view_router_flat = view_router.permute(1, 2, 0).contiguous().view(-1, num_experts)
+                    exp_opacity_i_modulated = exp_opacity_i[valid_i] * view_router_flat[valid_i, exp_idx:exp_idx+1]
+                    
+                    exp_xyz_valid.append(xyz_i[valid_i].reshape(-1, 3))
+                    exp_rgb_valid.append(rgb_i[valid_i].reshape(-1, 3))
+                    exp_rot_valid.append(exp_rot_i[valid_i].reshape(-1, 4))
+                    exp_scale_valid.append(exp_scale_i[valid_i].reshape(-1, 3))
+                    exp_opacity_valid.append(exp_opacity_i_modulated.reshape(-1, 1))
+                
+                if len(exp_xyz_valid) > 0:
+                    exp_xyz = torch.concat(exp_xyz_valid, dim=0)
+                    exp_rgb = torch.concat(exp_rgb_valid, dim=0) * 0.5 + 0.5
+                    exp_rot = torch.concat(exp_rot_valid, dim=0)
+                    exp_scale = torch.concat(exp_scale_valid, dim=0)
+                    exp_opacity = torch.concat(exp_opacity_valid, dim=0)
+                    
+                    exp_render = render(data, i, exp_xyz, exp_rgb, exp_rot, exp_scale, exp_opacity, bg_color=bg_color)
+                    expert_renders[exp_name].append(exp_render.unsqueeze(0))
     
     data['novel_view']['img_pred'] = torch.concat(render_novel_list, dim=0)
     
-    if len(bg_render_list) > 0:
-        data['novel_view']['bg_render'] = torch.concat(bg_render_list, dim=0)
-    
-    if len(human_render_list) > 0:
-        data['novel_view']['human_render'] = torch.concat(human_render_list, dim=0)
+    # 合并各专家渲染结果（仅当render_experts=True时）
+    if render_experts and expert_renders:
+        data['novel_view']['expert_renders'] = {}
+        for exp_name, renders in expert_renders.items():
+            if renders:
+                data['novel_view']['expert_renders'][exp_name] = torch.concat(renders, dim=0)
+        
+        # 向后兼容：创建bg_render和human_render别名
+        exp_renders = data['novel_view']['expert_renders']
+        if 'bg' in exp_renders:
+            data['novel_view']['bg_render'] = exp_renders['bg']
+        elif 'expert_0' in exp_renders:
+            data['novel_view']['bg_render'] = exp_renders['expert_0']
+        
+        if 'human' in exp_renders:
+            data['novel_view']['human_render'] = exp_renders['human']
+        elif 'expert_1' in exp_renders:
+            data['novel_view']['human_render'] = exp_renders['expert_1']
     
     return data
 

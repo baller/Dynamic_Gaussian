@@ -240,22 +240,49 @@ class RtStereoHumanModel(nn.Module):
 
         return data
     
+    def _compute_router_weights(self, router_input, depth):
+        """
+        计算路由权重，支持不同类型的路由器
+        
+        Args:
+            router_input: 路由器输入特征 [2*bs, C, H, W]
+            depth: 深度图 [2*bs, 1, H, W]（用于depth_aware路由器）
+            
+        Returns:
+            router_weights: 路由权重 [2*bs, num_experts(+1), H, W]
+            expert_info: 专家信息字典
+        """
+        from lib.moe_router import DepthAwareMoERouter
+        
+        if isinstance(self.moe_router, DepthAwareMoERouter):
+            # depth_aware路由器需要深度信息
+            # 下采样深度到与特征相同的尺寸
+            depth_downsampled = F.interpolate(
+                depth, size=router_input.shape[2:], 
+                mode='bilinear', align_corners=False
+            )
+            router_weights, expert_info = self.moe_router(router_input, depth_downsampled)
+        else:
+            # basic或multiscale路由器
+            router_weights, expert_info = self.moe_router(router_input)
+        
+        return router_weights, expert_info
+    
     def _flow2gsparms_moe(self, lr_img, lr_img_feat, data, bs, lr_depth):
         """
-        MoE模式的高斯参数计算
+        MoE模式的高斯参数计算（支持任意专家数量+共享专家）
         """
         # 计算路由权重
-        # 使用第一层特征（最高分辨率）
         router_input = lr_img_feat[0]  # [2*bs, C, H, W]
-        router_weights = self.moe_router(router_input)  # [2*bs, 2, H, W]
+        router_weights, expert_info = self._compute_router_weights(router_input, lr_depth)
         
         # 上采样到原始分辨率
         target_size = lr_img.shape[2:]
         router_weights = F.interpolate(router_weights, size=target_size, mode='bilinear', align_corners=False)
         
-        # 双流高斯参数预测
-        bg_params, human_params, fused_params = self.gs_parm_regresser.forward_with_routing(
-            lr_img, lr_depth, lr_img_feat, router_weights
+        # 多专家高斯参数预测
+        expert_params_list, fused_params = self.gs_parm_regresser.forward_with_routing(
+            lr_img, lr_depth, lr_img_feat, router_weights, expert_info
         )
         
         # 使用融合后的深度残差
@@ -283,16 +310,14 @@ class RtStereoHumanModel(nn.Module):
         data['lmain']['scale_maps'], data['rmain']['scale_maps'] = torch.split(scale_maps, [bs, bs])
         data['lmain']['opacity_maps'], data['rmain']['opacity_maps'] = torch.split(opacity_maps, [bs, bs])
         
-        # 保存MoE相关信息用于损失计算
+        # 保存MoE相关信息
         l_router, r_router = torch.split(router_weights, [bs, bs])
         data['lmain']['router_weights'] = l_router
         data['rmain']['router_weights'] = r_router
+        data['expert_info'] = expert_info
         
-        # 保存分离的背景和人体参数
-        data['lmain']['bg_params'] = {k: v[:bs] if v is not None else None for k, v in bg_params.items()}
-        data['rmain']['bg_params'] = {k: v[bs:] if v is not None else None for k, v in bg_params.items()}
-        data['lmain']['human_params'] = {k: v[:bs] if v is not None else None for k, v in human_params.items()}
-        data['rmain']['human_params'] = {k: v[bs:] if v is not None else None for k, v in human_params.items()}
+        # 保存各专家参数（用于可视化和分析）
+        self._save_expert_params(data, expert_params_list, bs)
         
         # 如果有高斯分配网络，计算分配比例
         if self.gaussian_allocator is not None:
@@ -300,6 +325,43 @@ class RtStereoHumanModel(nn.Module):
             data['allocation_ratio'] = alloc_ratio
         
         return data
+    
+    def _save_expert_params(self, data, expert_params_list, bs):
+        """
+        保存各专家参数到data字典
+        
+        向后兼容：同时保存bg_params和human_params（如果存在）
+        """
+        # 保存专家参数列表
+        l_expert_params = []
+        r_expert_params = []
+        
+        for exp_params in expert_params_list:
+            l_params = {}
+            r_params = {}
+            for key, val in exp_params.items():
+                if isinstance(val, torch.Tensor):
+                    l_params[key] = val[:bs]
+                    r_params[key] = val[bs:]
+                else:
+                    l_params[key] = val
+                    r_params[key] = val
+            l_expert_params.append(l_params)
+            r_expert_params.append(r_params)
+        
+        data['lmain']['expert_params_list'] = l_expert_params
+        data['rmain']['expert_params_list'] = r_expert_params
+        
+        # 向后兼容：保存bg_params和human_params
+        if len(expert_params_list) >= 1:
+            bg_params = expert_params_list[0]
+            data['lmain']['bg_params'] = {k: v[:bs] if isinstance(v, torch.Tensor) else v for k, v in bg_params.items()}
+            data['rmain']['bg_params'] = {k: v[bs:] if isinstance(v, torch.Tensor) else v for k, v in bg_params.items()}
+        
+        if len(expert_params_list) >= 2:
+            human_params = expert_params_list[1]
+            data['lmain']['human_params'] = {k: v[:bs] if isinstance(v, torch.Tensor) else v for k, v in human_params.items()}
+            data['rmain']['human_params'] = {k: v[bs:] if isinstance(v, torch.Tensor) else v for k, v in human_params.items()}
     
     def depth2gsparms(self, lr_img, lr_img_feat, data, bs):
         """
@@ -350,19 +412,19 @@ class RtStereoHumanModel(nn.Module):
     
     def _depth2gsparms_moe(self, lr_img, lr_img_feat, data, bs, lr_depth):
         """
-        MoE模式的高斯参数计算（DA3模式使用）
+        MoE模式的高斯参数计算（DA3模式使用，支持任意专家数量+共享专家）
         """
         # 计算路由权重
         router_input = lr_img_feat[0]  # [2*bs, C, H, W]
-        router_weights = self.moe_router(router_input)  # [2*bs, 2, H, W]
+        router_weights, expert_info = self._compute_router_weights(router_input, lr_depth)
         
         # 上采样到原始分辨率
         target_size = lr_img.shape[2:]
         router_weights = F.interpolate(router_weights, size=target_size, mode='bilinear', align_corners=False)
         
-        # 双流高斯参数预测
-        bg_params, human_params, fused_params = self.gs_parm_regresser.forward_with_routing(
-            lr_img, lr_depth, lr_img_feat, router_weights
+        # 多专家高斯参数预测
+        expert_params_list, fused_params = self.gs_parm_regresser.forward_with_routing(
+            lr_img, lr_depth, lr_img_feat, router_weights, expert_info
         )
         
         # 使用融合后的深度残差
@@ -390,16 +452,14 @@ class RtStereoHumanModel(nn.Module):
         data['lmain']['scale_maps'], data['rmain']['scale_maps'] = torch.split(scale_maps, [bs, bs])
         data['lmain']['opacity_maps'], data['rmain']['opacity_maps'] = torch.split(opacity_maps, [bs, bs])
         
-        # 保存MoE相关信息用于损失计算
+        # 保存MoE相关信息
         l_router, r_router = torch.split(router_weights, [bs, bs])
         data['lmain']['router_weights'] = l_router
         data['rmain']['router_weights'] = r_router
+        data['expert_info'] = expert_info
         
-        # 保存分离的背景和人体参数
-        data['lmain']['bg_params'] = {k: v[:bs] if v is not None else None for k, v in bg_params.items()}
-        data['rmain']['bg_params'] = {k: v[bs:] if v is not None else None for k, v in bg_params.items()}
-        data['lmain']['human_params'] = {k: v[:bs] if v is not None else None for k, v in human_params.items()}
-        data['rmain']['human_params'] = {k: v[bs:] if v is not None else None for k, v in human_params.items()}
+        # 保存各专家参数
+        self._save_expert_params(data, expert_params_list, bs)
         
         # 如果有高斯分配网络，计算分配比例
         if self.gaussian_allocator is not None:
