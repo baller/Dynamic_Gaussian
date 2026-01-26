@@ -1,0 +1,41 @@
+---
+alwaysApply: true
+---
+
+---
+description: 避免在代码中使用硬编码值，使用配置文件或常量
+alwaysApply: true
+---
+
+# 禁止硬编码
+
+在编写代码时，避免使用硬编码的魔法数字和阈值。
+
+## 原则
+
+1. **阈值和参数应可配置**：将阈值、超参数放入配置文件（如 `config/stage.yaml`）
+2. **使用命名常量**：如必须在代码中定义，使用清晰命名的常量
+3. **提供默认值时考虑可覆盖性**：默认值应通过配置或参数可覆盖
+
+## 示例
+
+```python
+# ❌ BAD - 硬编码阈值
+if router_weights[:, 0:1] > 0.7:
+    ...
+scale_diff = torch.exp(-scale_diff * 500)
+
+# ✅ GOOD - 使用配置或常量
+ROUTER_THRESHOLD = 0.7  # 或从 cfg.moe.router_threshold 读取
+if router_weights[:, 0:1] > ROUTER_THRESHOLD:
+    ...
+
+# ✅ GOOD - 从配置文件读取
+threshold = getattr(cfg.moe, 'router_threshold', 0.7)
+```
+
+## 检查清单
+
+- [ ] 阈值是否可以通过配置文件修改？
+- [ ] 魔法数字是否有清晰的命名常量？
+- [ ] 用户是否能在不修改代码的情况下调整参数？

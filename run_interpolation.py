@@ -273,11 +273,25 @@ if __name__ == '__main__':
     dt = datetime.today()
     # 根据深度模式设置实验名称
     depth_mode = getattr(cfg, 'depth_mode', 'raft')
-    cfg.exp_name = f'gps_plus_{depth_mode}'
-
-    cfg.record.show_path = "experiments/%s/show_free_%s" % (cfg.exp_name, tar_n)
+    
+    # TODO: 设置检查点路径
+    cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/depth-anything3-moe_da3_moe_0126_144813/ckpt/iter20000.pth'
+    
+    # 从 restore_ckpt 路径提取实验名和 iter 步数
+    ckpt_path = cfg.restore_ckpt
+    # 提取实验名: experiments/{exp_name}/ckpt/iter{step}.pth
+    path_parts = ckpt_path.split('/')
+    ckpt_filename = path_parts[-1]  # iter20000.pth
+    exp_name = path_parts[-3] if len(path_parts) >= 3 else f'gps_plus_{depth_mode}'
+    
+    # 提取 iter 步数
+    import re
+    iter_match = re.search(r'iter(\d+)', ckpt_filename)
+    iter_step = iter_match.group(1) if iter_match else 'latest'
+    
+    cfg.exp_name = exp_name
+    cfg.record.show_path = f"experiments/{exp_name}/show_free_{tar_n}_iter{iter_step}"
     cfg.record.origin_path = os.path.join(cfg.record.show_path, "origin")
-    cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_da3_0121/ckpt/iter20000.pth'  # TODO: 设置检查点路径
     cfg.freeze()
     LOOP_NUM = 20
 

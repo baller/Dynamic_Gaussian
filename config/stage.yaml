@@ -107,7 +107,7 @@ moe:
   
   # 高斯分配配置
   allocation:
-    total_gaussians: 104857  # 1024*1024
+    total_gaussians: 1048576  # 1024*1024 = 约100万高斯点
     min_ratio: 0.1
     learnable: true
   

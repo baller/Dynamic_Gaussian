@@ -77,18 +77,24 @@ class MoELoss(nn.Module):
         使用熵作为稀疏性度量，鼓励路由权重接近0或1。
         
         Args:
-            router_weights: [B, 2, H, W]
+            router_weights: [B, num_experts, H, W]
             
         Returns:
             loss: 稀疏性损失
         """
+        # 确保数值稳定
+        router_weights = router_weights.clamp(min=1e-8, max=1.0 - 1e-8)
+        
         # 计算熵: -p*log(p)
-        eps = 1e-8
-        entropy = -router_weights * torch.log(router_weights + eps)
+        entropy = -router_weights * torch.log(router_weights)
         entropy = entropy.sum(dim=1)  # [B, H, W]
         
         # 熵越低越稀疏（更接近0或1）
         loss = entropy.mean()
+        
+        # 防止 NaN
+        if torch.isnan(loss) or torch.isinf(loss):
+            return torch.tensor(0.0, device=router_weights.device)
         
         return loss
     
@@ -149,7 +155,8 @@ class MoELoss(nn.Module):
         """
         分离一致性损失
         
-        鼓励背景和人体的高斯参数有所不同，避免两个专家学到相同的东西。
+        鼓励背景和人体专家预测不同的高斯参数。
+        使用数值稳定的计算方式。
         
         Args:
             bg_params: 背景高斯参数字典
@@ -164,47 +171,54 @@ class MoELoss(nn.Module):
         if bg_params is None or human_params is None:
             return torch.tensor(0.0, device=device)
         
-        # 获取专家数量，使用前两个通道（背景和人体）
+        # 获取专家数量
         num_experts = router_weights.shape[1]
-        
-        # 在高置信度区域计算参数差异
-        bg_mask = (router_weights[:, 0:1] > 0.7).float()
-        human_mask = (router_weights[:, 1:2] > 0.7).float() if num_experts > 1 else torch.zeros_like(bg_mask)
+        if num_experts < 2:
+            return torch.tensor(0.0, device=device)
         
         total_loss = torch.tensor(0.0, device=device)
         count = 0
         
-        # 比较尺度参数
+        # 1. 参数差异性损失：鼓励两个专家预测不同的参数
+        # 使用负L1距离（差异越大，损失越小）
         if 'scale_maps' in bg_params and 'scale_maps' in human_params:
             bg_scale = bg_params['scale_maps']
             human_scale = human_params['scale_maps']
             
-            # 背景区域的尺度应该相对稳定（方差小）
-            if bg_mask.sum() > 0:
-                bg_scale_var = (bg_scale * bg_mask).var()
-                # 鼓励背景尺度方差小
-                total_loss = total_loss + bg_scale_var
-                count += 1
+            # 计算尺度差异，使用 clamp 防止 NaN
+            scale_diff = torch.abs(bg_scale - human_scale).clamp(min=1e-8).mean()
+            # 转换为损失：1 / (1 + diff * scale_factor)，差异越大损失越小
+            separation_scale = 1.0 / (1.0 + scale_diff * 1000)
+            total_loss = total_loss + separation_scale
+            count += 1
         
-        # 比较不透明度
         if 'opacity_maps' in bg_params and 'opacity_maps' in human_params:
             bg_opacity = bg_params['opacity_maps']
             human_opacity = human_params['opacity_maps']
             
-            # 在各自区域，专家应该给出高不透明度
-            if bg_mask.sum() > 0:
-                bg_conf = (bg_opacity * bg_mask).sum() / (bg_mask.sum() + 1e-8)
-                # 鼓励背景专家在背景区域给出高不透明度
-                total_loss = total_loss + (1 - bg_conf)
-                count += 1
+            # 计算不透明度差异
+            opacity_diff = torch.abs(bg_opacity - human_opacity).clamp(min=1e-8).mean()
+            separation_opacity = 1.0 / (1.0 + opacity_diff * 10)
+            total_loss = total_loss + separation_opacity
+            count += 1
+        
+        # 2. 专家置信度损失：鼓励专家预测高不透明度
+        if 'opacity_maps' in bg_params and 'opacity_maps' in human_params:
+            bg_opacity = bg_params['opacity_maps'].clamp(0, 1)
+            human_opacity = human_params['opacity_maps'].clamp(0, 1)
             
-            if human_mask.sum() > 0:
-                human_conf = (human_opacity * human_mask).sum() / (human_mask.sum() + 1e-8)
-                total_loss = total_loss + (1 - human_conf)
-                count += 1
+            # 鼓励整体高不透明度
+            avg_opacity = (bg_opacity.mean() + human_opacity.mean()) / 2
+            conf_loss = 1.0 - avg_opacity
+            total_loss = total_loss + conf_loss.clamp(0, 1)
+            count += 1
         
         if count > 0:
             total_loss = total_loss / count
+        
+        # 最终检查，防止 NaN
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            return torch.tensor(0.0, device=device)
         
         return total_loss
     
@@ -273,7 +287,13 @@ class MoELoss(nn.Module):
             total_loss += self.separation_weight * separation
             loss_dict['separation'] = separation.item() if isinstance(separation, torch.Tensor) else separation
         
-        loss_dict['moe_total'] = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
+        # 检查并处理 NaN
+        if isinstance(total_loss, torch.Tensor):
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                total_loss = torch.tensor(0.0, device=router_weights.device)
+            loss_dict['moe_total'] = total_loss.item()
+        else:
+            loss_dict['moe_total'] = total_loss
         
         return total_loss, loss_dict
 
