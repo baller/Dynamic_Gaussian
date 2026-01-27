@@ -56,6 +56,9 @@ class ConfigStereoHuman:
         self.cfg.da3.mixed_precision = False
         self.cfg.da3.scale_factor = 1.0
         self.cfg.da3.use_metric = False
+        # DINO特征导出配置（用于Transformer MoE模式）
+        self.cfg.da3.export_features = False  # 是否导出DINO中间层特征
+        self.cfg.da3.feature_layer = 11  # 导出的DINO层索引（0-23）
         
         # MoE配置（动静分离 + 共享专家）
         self.cfg.moe = CN()
@@ -67,6 +70,14 @@ class ConfigStereoHuman:
         self.cfg.moe.router_channels = 64  # 路由器隐藏层通道数
         self.cfg.moe.soft_routing = True  # 是否使用软路由
         self.cfg.moe.share_depth_encoder = True  # 是否共享深度编码器（所有专家共享）
+        self.cfg.moe.expert_type = 'cnn'  # 专家类型: 'cnn' 或 'transformer'
+        
+        # Transformer专家配置（当expert_type='transformer'时使用）
+        self.cfg.moe.transformer = CN()
+        self.cfg.moe.transformer.dim_hidden = 512  # Transformer隐藏层维度
+        self.cfg.moe.transformer.num_heads = 8  # 注意力头数
+        self.cfg.moe.transformer.num_layers = 4  # Transformer层数
+        self.cfg.moe.transformer.dropout = 0.1  # Dropout率
         
         # MoE高斯分配配置
         self.cfg.moe.allocation = CN()
@@ -94,6 +105,12 @@ class ConfigStereoHuman:
         self.cfg.moe.training = CN()
         self.cfg.moe.training.freeze_router_epochs = 0.2  # 冻结路由器的epoch数（支持小数）
         self.cfg.moe.training.progressive = True  # 是否使用渐进式训练
+        
+        # 课程学习配置（Transformer MoE模式使用）
+        self.cfg.moe.training.curriculum = CN()
+        self.cfg.moe.training.curriculum.warmup_steps = 10000  # 预热步数（100%有背景信号）
+        self.cfg.moe.training.curriculum.decay_steps = 40000  # 衰减步数（信号概率线性衰减）
+        self.cfg.moe.training.curriculum.min_bg_prob = 0.3  # 最小背景更新概率
 
         self.cfg.gsnet = CN()
         self.cfg.gsnet.use_pe = None

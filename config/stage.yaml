@@ -1,5 +1,5 @@
 # 实验名称前缀（最终名称格式: {name}_{depth_mode}_{moe}_{gpu数}_{时间戳}）
-name: 'depth-anything3-moe'
+name: 'dino-based-moe'
 
 lr: 0.00005
 wdecay: 1e-5
@@ -16,7 +16,7 @@ dataset:
   use_hr_img: False
   use_depth_init: True
   use_local_data: True
-  inverse_depth_init: 0.11468429026724969
+  inverse_depth_init: 0.3
   local_data_root: '/data/GPS_plus/processed_data'       # TODO
   train_data_root: '/data/GPS_plus/processed_data/train' # TODO
   val_data_root: '/data/GPS_plus/processed_data/val'     # TODO
@@ -56,7 +56,8 @@ da3:
   mode: 'single'
   
   # 是否使用LoFTR进行特征匹配（用于高斯参数预测）
-  use_loftr: True
+  # 注意: 当moe.expert_type='transformer'时，此项自动忽略
+  use_loftr: False
   
   # 是否微调DA3模型
   finetune: False
@@ -69,6 +70,11 @@ da3:
   
   # 是否使用metric深度模型
   use_metric: False
+  
+  # DINO特征导出配置（用于Transformer MoE模式）
+  # 当moe.expert_type='transformer'时自动启用
+  export_features: True
+  feature_layer: 11  # 导出的DINO层索引（0-23，11为中层语义特征）
 
 # 高斯网络配置
 gsnet:
@@ -93,7 +99,13 @@ moe:
   # 共享专家权重（0-1之间，表示共享专家在最终输出中的占比）
   shared_expert_weight: 0.3
   
+  # 专家类型: 'cnn' 或 'transformer'
+  # - 'cnn': 使用CNN专家（传统模式，需要UNet编码器）
+  # - 'transformer': 使用Transformer专家（使用DA3 DINO特征）
+  expert_type: 'transformer'
+  
   # 路由器类型: 'basic', 'multiscale', 'depth_aware'
+  # 注意: 当expert_type='transformer'时，使用内置的DINO特征路由器
   router_type: 'basic'
   
   # 路由器隐藏层通道数
@@ -104,6 +116,13 @@ moe:
   
   # 是否共享深度编码器（所有专家共享）
   share_depth_encoder: true
+  
+  # Transformer专家配置（当expert_type='transformer'时使用）
+  transformer:
+    dim_hidden: 512  # Transformer隐藏层维度
+    num_heads: 8     # 注意力头数
+    num_layers: 4    # Transformer层数
+    dropout: 0.1     # Dropout率
   
   # 高斯分配配置
   allocation:
@@ -131,6 +150,13 @@ moe:
   training:
     freeze_router_epochs: 0.2
     progressive: true
+    
+    # 课程学习配置（Transformer MoE模式使用）
+    # 控制训练过程中bg_update_signal的采样概率
+    curriculum:
+      warmup_steps: 10000   # 预热步数：100%有背景更新信号
+      decay_steps: 40000    # 衰减步数：信号概率从100%线性衰减到min_bg_prob
+      min_bg_prob: 0.3      # 最终维持的背景更新信号概率
 
 # 记录配置
 record:

@@ -3,6 +3,7 @@ DA3 (Depth-Anything-3) 深度估计模块
 用于替换GPS_plus中的RAFT-Stereo深度估计
 
 该模块封装DA3模型，提供与GPS_plus兼容的深度估计接口。
+支持同时输出深度图和DINO特征（用于MoE Transformer高斯参数预测）。
 """
 
 import os
@@ -11,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast as autocast
+from typing import Optional, List, Dict, Tuple
 
 # 添加DA3路径 - DA3模块位于 src 子目录下
 DA3_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'Depth-Anything-3')
@@ -27,12 +29,13 @@ class DA3DepthEstimator(nn.Module):
     支持单目和双目深度估计模式。
     """
     
-    def __init__(self, cfg):
+    def __init__(self, cfg, export_features: bool = False):
         """
         初始化DA3深度估计器
         
         Args:
             cfg: 配置对象，包含DA3相关配置
+            export_features: 是否导出DINO中间层特征（用于MoE Transformer）
         """
         super().__init__()
         self.cfg = cfg
@@ -45,6 +48,15 @@ class DA3DepthEstimator(nn.Module):
         self.model_name = self.da3_cfg.model_name  # 例如 "depth-anything/DA3-LARGE"
         self.use_metric = self.da3_cfg.get('use_metric', False)
         self.scale_factor = self.da3_cfg.get('scale_factor', 1.0)
+        
+        # DINO特征导出配置
+        self.export_features = export_features or self.da3_cfg.get('export_features', False)
+        # 默认提取第11层特征（中层语义特征）
+        self.feature_layer = self.da3_cfg.get('feature_layer', 11)
+        
+        # DINO-Large 配置
+        self.dino_embed_dim = 1024  # DA3-LARGE 使用 1024 维
+        self.patch_size = 14
         
     def _lazy_init(self, device):
         """延迟初始化DA3模型（首次forward时调用）"""
@@ -109,7 +121,7 @@ class DA3DepthEstimator(nn.Module):
     
     def forward(self, data, is_train=True):
         """
-        前向传播，估计深度
+        前向传播，估计深度并可选导出DINO特征
         
         Args:
             data: 包含 'lmain' 和 'rmain' 的数据字典
@@ -117,7 +129,9 @@ class DA3DepthEstimator(nn.Module):
             is_train: 是否训练模式
             
         Returns:
-            data: 更新后的数据字典，添加 'depth' 键
+            data: 更新后的数据字典，添加:
+                - 'depth': 深度图
+                - 'dino_features': DINO特征 (如果export_features=True)
             depth_loss: 深度损失（如果有GT）
             metrics: 指标字典
         """
@@ -134,8 +148,8 @@ class DA3DepthEstimator(nn.Module):
         
         # 分别对左右视图进行深度估计
         with torch.set_grad_enabled(is_train and self.da3_cfg.get('finetune', False)):
-            depth_l = self._estimate_depth_single(img_l)
-            depth_r = self._estimate_depth_single(img_r)
+            depth_l, dino_feat_l = self._estimate_depth_single(img_l, return_features=self.export_features)
+            depth_r, dino_feat_r = self._estimate_depth_single(img_r, return_features=self.export_features)
         
         # 深度尺度对齐
         # DA3输出的是相对深度，需要根据场景尺度进行调整
@@ -150,6 +164,13 @@ class DA3DepthEstimator(nn.Module):
         # 存储深度结果
         data['lmain']['depth'] = depth_l
         data['rmain']['depth'] = depth_r
+        
+        # 存储DINO特征（如果启用）
+        if self.export_features:
+            if dino_feat_l is not None:
+                data['lmain']['dino_features'] = dino_feat_l
+            if dino_feat_r is not None:
+                data['rmain']['dino_features'] = dino_feat_r
         
         # 为了兼容原有流程，也生成伪flow_pred
         # 注意：这里的flow_pred仅用于兼容性，不参与实际计算
@@ -187,15 +208,17 @@ class DA3DepthEstimator(nn.Module):
         
         return padded_img, (H, W)
     
-    def _estimate_depth_single(self, img):
+    def _estimate_depth_single(self, img, return_features: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        对单张图像进行深度估计
+        对单张图像进行深度估计，可选返回DINO特征
         
         Args:
             img: [B, C, H, W] 范围 [-1, 1]
+            return_features: 是否返回DINO特征
             
         Returns:
             depth: [B, 1, H, W] 深度图
+            dino_features: [B, N_patches, embed_dim] DINO特征 (如果return_features=True)
         """
         B, C, H, W = img.shape
         original_size = (H, W)
@@ -210,9 +233,13 @@ class DA3DepthEstimator(nn.Module):
         
         # DA3使用patch_size=14，需要输入尺寸是14的倍数
         img_padded, _ = self._pad_to_patch_size(img_normalized, patch_size=14)
+        padded_H, padded_W = img_padded.shape[-2:]
         
         # DA3期望输入 [B, N, C, H, W]
         img_input = img_padded.unsqueeze(1)  # [B, 1, C, H_padded, W_padded]
+        
+        # 决定是否导出特征层
+        export_layers = [self.feature_layer] if (return_features and self.export_features) else []
         
         # 调用DA3模型 - 使用self.model.model访问底层网络
         with autocast(enabled=self.da3_cfg.get('mixed_precision', False)):
@@ -221,7 +248,7 @@ class DA3DepthEstimator(nn.Module):
                 img_input,
                 extrinsics=None,
                 intrinsics=None,
-                export_feat_layers=[],
+                export_feat_layers=export_layers,
                 infer_gs=False,
                 use_ray_pose=False,
             )
@@ -251,8 +278,27 @@ class DA3DepthEstimator(nn.Module):
                     mode='bilinear',
                     align_corners=False
                 )
-            
-        return depth
+        
+        # 提取DINO特征
+        dino_features = None
+        if return_features and self.export_features and hasattr(prediction, 'aux'):
+            feat_key = f"feat_layer_{self.feature_layer}"
+            if feat_key in prediction.aux:
+                # 特征形状: [B, S, H_patch, W_patch, embed_dim]
+                feat = prediction.aux[feat_key]
+                # S=1 for single view, reshape to [B, N_patches, embed_dim]
+                if feat.dim() == 5:
+                    B_feat, S, H_patch, W_patch, D = feat.shape
+                    dino_features = feat[:, 0].reshape(B_feat, H_patch * W_patch, D)
+                elif feat.dim() == 4:
+                    # [B, H_patch, W_patch, embed_dim]
+                    B_feat, H_patch, W_patch, D = feat.shape
+                    dino_features = feat.reshape(B_feat, H_patch * W_patch, D)
+                else:
+                    # 直接使用
+                    dino_features = feat
+                    
+        return depth, dino_features
     
     def _align_depth_scale(self, depth, inverse_depth_init):
         """
@@ -348,18 +394,21 @@ class DA3DepthEstimatorDual(DA3DepthEstimator):
     
     利用双目信息进行更准确的深度估计。
     将左右视图一起输入DA3，利用多视图一致性。
+    支持同时导出DINO特征。
     """
     
     def forward(self, data, is_train=True):
         """
-        双目深度估计
+        双目深度估计，可选导出DINO特征
         
         Args:
             data: 包含 'lmain' 和 'rmain' 的数据字典
             is_train: 是否训练模式
             
         Returns:
-            data: 更新后的数据字典
+            data: 更新后的数据字典，添加:
+                - 'depth': 深度图
+                - 'dino_features': DINO特征 (如果export_features=True)
             depth_loss: 深度损失
             metrics: 指标字典
         """
@@ -396,6 +445,9 @@ class DA3DepthEstimatorDual(DA3DepthEstimator):
         # 组合为双视图输入
         img_stereo = torch.stack([img_padded_l, img_padded_r], dim=1)  # [B, 2, C, H_padded, W_padded]
         
+        # 决定是否导出特征层
+        export_layers = [self.feature_layer] if self.export_features else []
+        
         with torch.set_grad_enabled(is_train and self.da3_cfg.get('finetune', False)):
             with autocast(enabled=self.da3_cfg.get('mixed_precision', False)):
                 # DepthAnything3.model 是底层的 DepthAnything3Net
@@ -403,7 +455,7 @@ class DA3DepthEstimatorDual(DA3DepthEstimator):
                     img_stereo,
                     extrinsics=None,
                     intrinsics=None,
-                    export_feat_layers=[],
+                    export_feat_layers=export_layers,
                     infer_gs=False,
                     use_ray_pose=False,
                 )
@@ -438,6 +490,20 @@ class DA3DepthEstimatorDual(DA3DepthEstimator):
         data['lmain']['depth'] = depth_l
         data['rmain']['depth'] = depth_r
         
+        # 提取并存储DINO特征（如果启用）
+        if self.export_features and hasattr(prediction, 'aux'):
+            feat_key = f"feat_layer_{self.feature_layer}"
+            if feat_key in prediction.aux:
+                # 特征形状: [B, S, H_patch, W_patch, embed_dim] where S=2
+                feat = prediction.aux[feat_key]
+                if feat.dim() == 5:
+                    B_feat, S, H_patch, W_patch, D = feat.shape
+                    # 分离左右视图特征
+                    dino_feat_l = feat[:, 0].reshape(B_feat, H_patch * W_patch, D)
+                    dino_feat_r = feat[:, 1].reshape(B_feat, H_patch * W_patch, D)
+                    data['lmain']['dino_features'] = dino_feat_l
+                    data['rmain']['dino_features'] = dino_feat_r
+        
         # 生成伪flow_pred用于兼容性
         data['lmain']['flow_pred'] = self._depth_to_pseudo_flow(depth_l, data['lmain'])
         data['rmain']['flow_pred'] = self._depth_to_pseudo_flow(depth_r, data['rmain'])
@@ -445,20 +511,21 @@ class DA3DepthEstimatorDual(DA3DepthEstimator):
         return data, depth_loss, metrics
 
 
-def create_da3_depth_estimator(cfg, mode='single'):
+def create_da3_depth_estimator(cfg, mode='single', export_features: bool = False):
     """
     创建DA3深度估计器
     
     Args:
         cfg: 配置对象
         mode: 'single' 单目模式，'dual' 双目模式
+        export_features: 是否导出DINO特征（用于MoE Transformer）
         
     Returns:
         DA3深度估计器实例
     """
     if mode == 'single':
-        return DA3DepthEstimator(cfg)
+        return DA3DepthEstimator(cfg, export_features=export_features)
     elif mode == 'dual':
-        return DA3DepthEstimatorDual(cfg)
+        return DA3DepthEstimatorDual(cfg, export_features=export_features)
     else:
         raise ValueError(f"未知的DA3模式: {mode}")

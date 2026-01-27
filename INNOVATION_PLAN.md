@@ -346,6 +346,9 @@ pip install --no-build-isolation git+https://github.com/nerfstudio-project/gspla
 4. **自适应背景缓存**: 根据渲染质量决定是否更新背景高斯
 5. **可学习的高斯分配**: 端到端学习最优的高斯数量分配
 
+### 人体/背景如何区分（无显式 Mask）
+**不使用**人体 mask 或背景 mask。人体与背景的区分由**可学习路由器**从图像特征中隐式学出：路由器根据 UNet/DINO 特征（及可选的深度）为每个位置输出「专家 0 / 专家 1」的软权重；重建损失 + 稀疏性/时序/分离/平衡等 MoE 损失一起，驱使路由器把静态、大范围区域分给一个专家（背景）、运动、小目标分给另一个（人体）。详见 `docs/MOE_HUMAN_BG_SEPARATION.md`。
+
 ### 技术架构 (v2.0 带共享专家)
 
 ```
@@ -597,14 +600,211 @@ mixed_precision: 'no'      # 混合精度: no/fp16/bf16
 
 ---
 
-## 后续计划
+## 阶段4: DA3-DINO 统一编码器 + 动态高斯分配 ✅ 已完成
 
-### 阶段4: 特征融合优化 (计划中)
-- 提取DA3的DinoV2特征
-- 设计特征融合模块
-- 增强高斯参数预测精度
+### 目标
+使用DA3作为统一编码器，直接提取DINO特征和深度图，结合Transformer MoE预测高斯参数，实现动态高斯分配和背景缓存机制。
+
+### 核心创新
+
+1. **统一编码器**: 移除UNet和LoFTR，使用DA3同时输出DINO特征和深度图
+2. **Transformer专家**: 使用Transformer替代CNN作为MoE专家，处理patch级DINO特征
+3. **动态高斯分配**: 根据`bg_update_signal`动态将高斯分配给背景/人体
+4. **背景缓存机制**: 无背景更新信号时，使用缓存的背景高斯
+5. **课程学习策略**: 训练时逐渐降低背景更新信号的比例
+
+### 技术架构
+
+```
+输入图像 [B, 3, H, W]
+        │
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│              DA3 (Depth-Anything-3)                     │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │         DINO Vision Transformer                 │   │
+│  │    (冻结参数，提取中间层特征)                     │   │
+│  └──────────────────┬──────────────────────────────┘   │
+│                     │                                   │
+│          ┌─────────┴─────────┐                         │
+│          ▼                   ▼                         │
+│  ┌─────────────────┐  ┌─────────────────┐             │
+│  │  DINO Features  │  │    DPT Head     │             │
+│  │ [B, N, 1024]    │  │   → Depth Map   │             │
+│  └────────┬────────┘  └────────┬────────┘             │
+└───────────┼────────────────────┼───────────────────────┘
+            │                    │
+            ▼                    ▼
+┌─────────────────────────────────────────────────────────┐
+│           MoE Transformer 高斯参数预测器                  │
+│                                                         │
+│  DINO + Depth嵌入 → 特征融合 [B, N, 1088]               │
+│           │                                             │
+│           ▼                                             │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │              Routing Network                     │   │
+│  │      Linear → GELU → Linear → Softmax           │   │
+│  │         → router_weights [B, N, 2]              │   │
+│  └──────────────────┬──────────────────────────────┘   │
+│                     │                                   │
+│    ┌────────────────┼────────────────┐                 │
+│    ▼                ▼                ▼                 │
+│ ┌──────────┐  ┌──────────┐  ┌──────────┐              │
+│ │ Shared   │  │   BG     │  │  Human   │              │
+│ │ Expert   │  │ Expert   │  │  Expert  │              │
+│ │(4 layers)│  │(4 layers)│  │(4 layers)│              │
+│ └────┬─────┘  └────┬─────┘  └────┬─────┘              │
+│      └─────────────┴─────────────┘                     │
+│                     │                                   │
+│                     ▼                                   │
+│           加权融合 → 高斯参数                            │
+│      (rotation, scale, opacity, depth_residual)        │
+└──────────────────────┬──────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────┐
+│              动态高斯分配模块                             │
+│                                                         │
+│  if bg_update_signal == True:                          │
+│      按路由权重分配高斯 (背景 + 人体)                    │
+│      更新背景缓存                                        │
+│  else:                                                 │
+│      全部高斯分配给人体                                  │
+│      背景使用缓存                                        │
+│                                                         │
+└──────────────────────┬──────────────────────────────────┘
+                       │
+                       ▼
+              3D Gaussian Splatting 渲染
+```
+
+### 实施记录
+
+#### 2026-01-26 - DA3-DINO 统一编码器架构实现
+
+##### 1. 新建文件
+
+| 文件 | 功能 |
+|------|------|
+| `lib/moe_transformer.py` | MoE Transformer 高斯参数预测器 |
+| `lib/dynamic_gaussian_allocator.py` | 动态高斯分配模块 + 课程学习调度器 |
+
+##### 2. 修改文件
+
+| 文件 | 修改内容 |
+|------|---------|
+| `lib/da3_depth.py` | 添加DINO特征导出功能 (`export_features`, `feature_layer`) |
+| `lib/network.py` | 新增 `_forward_transformer_moe()` 和 `_patch_to_pixel()` 方法 |
+| `train_accelerate.py` | 支持课程学习策略，传递 `step` 参数 |
+| `config/stereo_human_config.py` | 新增 Transformer 专家和课程学习配置 |
+| `config/stage.yaml` | 新增 `moe.expert_type` 和 `moe.transformer.*` 配置 |
+
+##### 3. 核心模块
+
+**MoE Transformer (`lib/moe_transformer.py`)**:
+- `TransformerExpert`: 基于 Transformer Encoder 的专家模块
+- `DepthEmbedding`: 将深度图转换为与DINO patch对齐的嵌入
+- `MoERouter`: 基于融合特征的软路由器
+- `MoETransformerRegresser`: 完整的MoE Transformer回归器
+
+**动态高斯分配 (`lib/dynamic_gaussian_allocator.py`)**:
+- `DynamicGaussianAllocator`: 根据信号动态分配高斯
+- `BackgroundCache`: 背景高斯参数缓存
+- `CurriculumScheduler`: 课程学习调度器
+- `GaussianParams`: 高斯参数数据类
+
+### 使用说明
+
+#### 启用 Transformer MoE 模式
+
+在 `config/stage.yaml` 中修改:
+
+```yaml
+depth_mode: 'da3'
+
+da3:
+  export_features: true  # 启用DINO特征导出（自动设置）
+  feature_layer: 11      # 导出的DINO层（中层语义特征）
+
+moe:
+  enabled: true
+  expert_type: 'transformer'  # 使用Transformer专家
+  
+  # Transformer专家配置
+  transformer:
+    dim_hidden: 512    # 隐藏层维度
+    num_heads: 8       # 注意力头数
+    num_layers: 4      # Transformer层数
+    dropout: 0.1
+  
+  # 课程学习配置
+  training:
+    curriculum:
+      warmup_steps: 10000   # 预热：100%有背景信号
+      decay_steps: 40000    # 衰减：线性降到min_bg_prob
+      min_bg_prob: 0.3      # 最终维持的背景信号概率
+```
+
+#### 配置选项
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `moe.expert_type` | 专家类型 (`cnn`/`transformer`) | `cnn` |
+| `moe.transformer.dim_hidden` | Transformer隐藏层维度 | `512` |
+| `moe.transformer.num_heads` | 注意力头数 | `8` |
+| `moe.transformer.num_layers` | Transformer层数 | `4` |
+| `moe.training.curriculum.warmup_steps` | 预热步数 | `10000` |
+| `moe.training.curriculum.decay_steps` | 衰减步数 | `40000` |
+| `moe.training.curriculum.min_bg_prob` | 最小背景信号概率 | `0.3` |
+
+#### 课程学习策略
+
+训练过程中 `bg_update_signal=True` 的概率变化:
+
+| 阶段 | 步数范围 | 概率 | 目标 |
+|------|----------|------|------|
+| Warmup | 0 - 10k | 100% | 学习基础特征 |
+| Decay | 10k - 50k | 100% → 30% | 逐渐引入无信号模式 |
+| Final | 50k+ | 30% | 维持双模式平衡 |
+
+#### 推理模式
+
+```python
+# 正常模式：完整计算
+output = model(data, bg_update_signal=True)
+
+# 人体专注模式：背景使用缓存，所有高斯给人体
+output = model(data, bg_update_signal=False)
+```
+
+### 架构优势
+
+| 方面 | 原CNN MoE | 新Transformer MoE |
+|------|-----------|------------------|
+| 编码器 | UNet + LoFTR | DA3 DINO (统一) |
+| 特征类型 | CNN特征 | 全局语义特征 |
+| 专家结构 | CNN专家 | Transformer专家 |
+| 高斯分配 | 固定比例 | 动态分配 |
+| 推理模式 | 单一 | 正常/人体专注 |
+| 训练策略 | 渐进式 | 课程学习 |
+
+### 注意事项
+
+1. **显存需求**: Transformer MoE 模式显存需求较高，建议24GB+
+2. **特征层选择**: `feature_layer=11` 提取中层语义特征，可调整
+3. **背景缓存**: 首次推理需 `bg_update_signal=True` 初始化缓存
+4. **课程学习**: 建议完整训练50k+步以充分学习双模式
+
+---
+
+## 后续计划
 
 ### 阶段5: 单目扩展 (计划中)
 - 移除双视图要求
 - 支持单图像输入
 - 借鉴SHARP的多层高斯表示
+
+### 阶段6: 人体mask弱监督 (计划中)
+- 在人体专注模式使用人体mask监督
+- 提升人体区域渲染质量
+- 探索分离损失优化

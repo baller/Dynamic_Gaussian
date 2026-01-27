@@ -40,7 +40,7 @@ echo ""
 echo "开始训练..."
 echo ""
 
-CUDA_VISIBLE_DEVICES=1 accelerate launch \
+CUDA_VISIBLE_DEVICES=3 accelerate launch \
     --config_file $ACCELERATE_CONFIG \
     train_accelerate.py \
     --config $TRAIN_CONFIG \

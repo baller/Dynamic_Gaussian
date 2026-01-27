@@ -135,6 +135,27 @@ class AccelerateTrainer:
         else:
             self.moe_loss_fn = None
             self.prev_data = None
+        
+        # 检查是否使用 Transformer MoE (DINO-based)
+        model_unwrapped = self.model  # 在 prepare 之前
+        self.use_transformer_moe = (
+            hasattr(model_unwrapped, 'use_transformer_moe') and 
+            model_unwrapped.use_transformer_moe
+        )
+        
+        if self.use_transformer_moe:
+            if self.accelerator.is_main_process:
+                logging.info("[Curriculum] Transformer MoE 模式: 启用课程学习策略")
+                # 打印课程学习配置
+                curriculum_cfg = getattr(
+                    getattr(self.moe_cfg, 'training', None), 
+                    'curriculum', 
+                    None
+                )
+                if curriculum_cfg is not None:
+                    logging.info(f"  - Warmup: {getattr(curriculum_cfg, 'warmup_steps', 10000)} 步")
+                    logging.info(f"  - Decay: {getattr(curriculum_cfg, 'decay_steps', 40000)} 步")
+                    logging.info(f"  - Min BG Prob: {getattr(curriculum_cfg, 'min_bg_prob', 0.3)}")
 
         # 使用accelerate准备所有组件
         self.model, self.optimizer, self.train_loader, self.val_loader, self.scheduler = \
@@ -231,8 +252,18 @@ class AccelerateTrainer:
             with self.accelerator.accumulate(self.model):
                 data = self.fetch_data(phase='train')
 
-                # 深度估计
-                data, _, metrics = self.model(data, is_train=True)
+                # 深度估计和高斯参数预测
+                # Transformer MoE 模式: 传递 step 用于课程学习
+                if self.use_transformer_moe:
+                    # bg_update_signal=None 表示由模型内部的课程调度器决定
+                    data, _, metrics = self.model(
+                        data, 
+                        is_train=True, 
+                        bg_update_signal=None,
+                        step=self.total_steps
+                    )
+                else:
+                    data, _, metrics = self.model(data, is_train=True)
                 
                 # 高斯渲染
                 if self.use_moe and 'router_weights' in data.get('lmain', {}):
@@ -287,6 +318,21 @@ class AccelerateTrainer:
                     if self.use_moe and moe_loss_dict:
                         for key, value in moe_loss_dict.items():
                             self.logger.writer.add_scalar(f'moe/{key}', value, self.total_steps)
+                    
+                    # 记录课程学习指标
+                    if self.use_transformer_moe:
+                        if 'curriculum_bg_prob' in metrics:
+                            self.logger.writer.add_scalar(
+                                'curriculum/bg_signal_prob', 
+                                metrics['curriculum_bg_prob'], 
+                                self.total_steps
+                            )
+                        if 'bg_update_signal' in data:
+                            self.logger.writer.add_scalar(
+                                'curriculum/bg_update_signal',
+                                float(data['bg_update_signal']),
+                                self.total_steps
+                            )
                             
                 metrics.update({
                     'l1': Ll1.item(),
