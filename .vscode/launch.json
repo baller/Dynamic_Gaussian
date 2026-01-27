@@ -1,0 +1,107 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train GPS+ (GPU 0)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train GPS+ (GPU 1)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train GPS+ (GPU 2)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train GPS+ (Multi-GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "args": [
+                "--num_processes=2",
+                "--gpu_ids=0,1",
+                "train.py"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Test Modules",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/test_modules.py",
+                "-v",
+                "-s"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Test Integration",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/test_integration.py",
+                "-v",
+                "-s"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Debug Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

@@ -1,6 +1,6 @@
 name: 'gps_plus'
 
-lr: 0.0002
+lr: 0.00001
 wdecay: 1e-5
 batch_size: 1
 num_steps: 100000
@@ -13,9 +13,9 @@ dataset:
   use_depth_init: True
   use_local_data: True
   inverse_depth_init: 0.3
-  local_data_root: '/PATH/TO/data'       # TODO
-  train_data_root: '/PATH/TO/data/train' # TODO
-  val_data_root: '/PATH/TO/data/val'     # TODO
+  local_data_root: '/data/GPS_plus/processed_data'       # TODO
+  train_data_root: '/data/GPS_plus/processed_data/train' # TODO
+  val_data_root: '/data/GPS_plus/processed_data/val'     # TODO
 
 raft:
   mixed_precision: False
@@ -29,6 +29,76 @@ gsnet:
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
 
+# 深度估计模式: 'raft' 或 'da3'
+depth_mode: 'da3'
+
+# DA3 深度估计配置 (当 depth_mode='da3' 时生效)
+da3:
+  model_name: 'depth-anything/DA3-BASE'  # 使用 BASE 版本节省显存 (LARGE 需要 >30GB)
+  export_feat_layers: [5, 8, 11]  # BASE 版本的层索引更小
+  freeze_backbone: true
+  mixed_precision: true  # 启用混合精度
+  use_feature_adapter: true
+
+# 深度融合配置 (当 depth_mode='da3' 时生效)
+depth_fusion:
+  enabled: false
+  feat_dim: 32  # 减小以节省内存
+  num_heads: 4
+  dropout: 0.1
+  num_sparse_points: 64
+
+# 高斯预测网络类型: 'gsregresser' 或 'transformer_moe'
+gs_predictor: 'transformer_moe'
+
+# Transformer+MoE 高斯预测网络配置 (当 gs_predictor='transformer_moe' 时生效)
+gs_transformer:
+  hidden_dim: 128  # 减小以节省内存
+  num_layers: 2    # 减少层数
+  num_heads: 4
+  window_size: 8
+  num_gaussian_layers: 3
+  max_scale: 0.002
+  max_depth_offset: 0.5
+  downsample_factor: 4  # 下采样因子，4 表示 H/4 x W/4 分辨率进行 Transformer
+
+# MoE 配置
+moe:
+  num_experts: 4   # 减少专家数量
+  top_k: 2
+  load_balance_weight: 0.01
+
+# 动态高斯分配配置
+dynamic_gs:
+  enabled: true  # 启用动态高斯分配
+  num_layers: 3
+  opacity_threshold: 0.01
+  complexity_threshold: 0.3
+  use_complexity_guidance: true
+  soft_pruning: true
+
+# 损失函数配置
+loss:
+  l1_weight: 0.8
+  ssim_weight: 0.2
+  chamfer_weight: 0.5
+  depth_consistency_weight: 0.1
+  moe_balance_weight: 0.01
+  allocation_entropy_weight: 0.001
+
 record:
-  loss_freq: 3000
-  eval_freq: 3000
+  loss_freq: 50
+  eval_freq: 500
+  save_iter: 5000
+
+# 可视化配置
+visualization:
+  enabled: true
+  vis_freq: 500           # 可视化输出频率 (每 N 步输出一次)
+  save_depth: true        # 保存深度图可视化
+  save_gaussian: true     # 保存高斯分布可视化 (多层 + 裁剪后)
+  save_novel_view: true   # 保存 novel view 预测 vs GT 对比
+  save_opacity: true      # 保存不透明度图
+  save_features: false    # 保存特征图 (较大，默认关闭)
+  colormap: 'turbo'       # 深度图颜色映射: turbo, viridis, plasma, magma
+  max_images: 4           # 每次最多保存的批次图像数

@@ -52,14 +52,83 @@ class ConfigStereoHuman:
         self.cfg.gsnet.decoder_dims = None
         self.cfg.gsnet.parm_head_dim = None
 
+        # 深度估计模式配置
+        self.cfg.depth_mode = 'raft'  # 'raft' 或 'da3'
+        
+        # DA3 深度估计配置
+        self.cfg.da3 = CN()
+        self.cfg.da3.model_name = 'depth-anything/DA3-LARGE'
+        self.cfg.da3.export_feat_layers = [11, 15, 19, 23]
+        self.cfg.da3.freeze_backbone = True
+        self.cfg.da3.mixed_precision = False
+        self.cfg.da3.use_feature_adapter = True  # 是否使用特征适配器
+
+        # 深度融合配置
+        self.cfg.depth_fusion = CN()
+        self.cfg.depth_fusion.enabled = True
+        self.cfg.depth_fusion.feat_dim = 256
+        self.cfg.depth_fusion.num_heads = 8
+        self.cfg.depth_fusion.dropout = 0.1
+        self.cfg.depth_fusion.num_sparse_points = 128
+
+        # 高斯预测网络类型
+        self.cfg.gs_predictor = 'gsregresser'  # 'gsregresser' or 'transformer_moe'
+        
+        # Transformer+MoE 高斯预测网络配置
+        self.cfg.gs_transformer = CN()
+        self.cfg.gs_transformer.hidden_dim = 256
+        self.cfg.gs_transformer.num_layers = 4
+        self.cfg.gs_transformer.num_heads = 8
+        self.cfg.gs_transformer.window_size = 8
+        self.cfg.gs_transformer.num_gaussian_layers = 3
+        self.cfg.gs_transformer.max_scale = 0.002
+        self.cfg.gs_transformer.max_depth_offset = 0.5
+        self.cfg.gs_transformer.downsample_factor = 4  # 下采样因子，节省显存
+        
+        # MoE 配置
+        self.cfg.moe = CN()
+        self.cfg.moe.num_experts = 8
+        self.cfg.moe.top_k = 2
+        self.cfg.moe.load_balance_weight = 0.01
+
+        # 动态高斯分配配置
+        self.cfg.dynamic_gs = CN()
+        self.cfg.dynamic_gs.enabled = False
+        self.cfg.dynamic_gs.num_layers = 3
+        self.cfg.dynamic_gs.opacity_threshold = 0.01
+        self.cfg.dynamic_gs.complexity_threshold = 0.3
+        self.cfg.dynamic_gs.use_complexity_guidance = True
+        self.cfg.dynamic_gs.soft_pruning = True
+
+        # 损失函数配置
+        self.cfg.loss = CN()
+        self.cfg.loss.l1_weight = 0.8
+        self.cfg.loss.ssim_weight = 0.2
+        self.cfg.loss.chamfer_weight = 0.5
+        self.cfg.loss.depth_consistency_weight = 0.1
+        self.cfg.loss.moe_balance_weight = 0.01
+        self.cfg.loss.allocation_entropy_weight = 0.001
+
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
         self.cfg.record.show_path = None
         self.cfg.record.logs_path = None
         self.cfg.record.file_path = None
-        self.cfg.record.save_iter = [20000, 30000, 40000]
+        self.cfg.record.save_iter = 5000
         self.cfg.record.loss_freq = 0
         self.cfg.record.eval_freq = 0
+
+        # 可视化配置
+        self.cfg.visualization = CN()
+        self.cfg.visualization.enabled = True
+        self.cfg.visualization.vis_freq = 100
+        self.cfg.visualization.save_depth = True
+        self.cfg.visualization.save_gaussian = True
+        self.cfg.visualization.save_novel_view = True
+        self.cfg.visualization.save_opacity = True
+        self.cfg.visualization.save_features = False
+        self.cfg.visualization.colormap = 'turbo'
+        self.cfg.visualization.max_images = 4
 
     def get_cfg(self):
         return self.cfg.clone()

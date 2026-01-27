@@ -1,0 +1,8 @@
+__pycache__
+*.pt
+/experiments
+/runs
+/debug_images
+*.pth
+/custom_data
+/processed_custom_data
