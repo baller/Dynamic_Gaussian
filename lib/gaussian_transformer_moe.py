@@ -28,10 +28,6 @@ import math
 
 logger = logging.getLogger(__name__)
 
-# 是否使用梯度检查点 (全局开关)
-USE_GRADIENT_CHECKPOINT = True
-
-
 class GaussianTransformerMoE(nn.Module):
     """
     Transformer + MoE 高斯参数预测网络
@@ -56,6 +52,7 @@ class GaussianTransformerMoE(nn.Module):
             self.num_gaussian_layers = getattr(gs_cfg, 'num_gaussian_layers', 3)
             self.max_scale = getattr(gs_cfg, 'max_scale', 0.002)
             self.max_depth_offset = getattr(gs_cfg, 'max_depth_offset', 0.5)
+            self.use_gradient_checkpoint = getattr(gs_cfg, 'use_gradient_checkpoint', True)
         else:
             self.hidden_dim = 512
             self.num_layers = 6
@@ -64,6 +61,7 @@ class GaussianTransformerMoE(nn.Module):
             self.num_gaussian_layers = 3
             self.max_scale = 0.002
             self.max_depth_offset = 0.5
+            self.use_gradient_checkpoint = True
         
         if moe_cfg is not None:
             self.num_experts = getattr(moe_cfg, 'num_experts', 8)
@@ -99,6 +97,7 @@ class GaussianTransformerMoE(nn.Module):
                 top_k=self.top_k,
                 use_cross_view=(i % 2 == 1),  # 交替使用跨视图注意力
                 dropout=0.1,
+                load_balance_coef=self.load_balance_weight,
             )
             for i in range(self.num_layers)
         ])
@@ -126,6 +125,14 @@ class GaussianTransformerMoE(nn.Module):
                 nn.init.zeros_(head.weight)
                 if head.bias is not None:
                     nn.init.zeros_(head.bias)
+
+    def _transformer_block_forward(self, block, x, x_other=None):
+        """可被checkpoint包装的transformer block前向"""
+        if getattr(block, 'use_cross_view', False) and x_other is not None:
+            out, router_weights, lb_loss = block(x, x_other)
+        else:
+            out, router_weights, lb_loss = block(x)
+        return out, lb_loss if lb_loss is not None else torch.tensor(0.0, device=x.device)
     
     def forward(
         self, 
@@ -175,10 +182,17 @@ class GaussianTransformerMoE(nn.Module):
         all_load_balance_loss = []
         
         for block in self.transformer_blocks:
-            if block.use_cross_view and x_other is not None:
-                x, router_weights, lb_loss = block(x, x_other)
+            if self.use_gradient_checkpoint and self.training:
+                x, lb_loss = checkpoint(
+                    self._transformer_block_forward, block, x, x_other,
+                    use_reentrant=False
+                )
+                router_weights = None
             else:
-                x, router_weights, lb_loss = block(x)
+                if block.use_cross_view and x_other is not None:
+                    x, router_weights, lb_loss = block(x, x_other)
+                else:
+                    x, router_weights, lb_loss = block(x)
             
             if router_weights is not None:
                 all_router_weights.append(router_weights)
@@ -238,7 +252,8 @@ class TransformerBlockMoE(nn.Module):
         num_experts: int = 8, 
         top_k: int = 2, 
         use_cross_view: bool = False,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        load_balance_coef: float = 0.01
     ):
         super().__init__()
         self.use_cross_view = use_cross_view
@@ -260,7 +275,8 @@ class TransformerBlockMoE(nn.Module):
             dim=dim,
             hidden_dim=dim * 4,
             num_experts=num_experts,
-            top_k=top_k
+            top_k=top_k,
+            load_balance_coef=load_balance_coef
         )
         
         self.dropout = nn.Dropout(dropout)
@@ -431,7 +447,14 @@ class MoEMLP(nn.Module):
         top_k: 每个 token 激活的专家数量
     """
     
-    def __init__(self, dim: int, hidden_dim: int, num_experts: int = 8, top_k: int = 2):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        num_experts: int = 8,
+        top_k: int = 2,
+        load_balance_coef: float = 0.01
+    ):
         super().__init__()
         self.dim = dim
         self.hidden_dim = hidden_dim
@@ -452,7 +475,7 @@ class MoEMLP(nn.Module):
         nn.init.kaiming_uniform_(self.expert_w2, a=math.sqrt(5))
         
         # 负载均衡损失系数
-        self.load_balance_coef = 0.01
+        self.load_balance_coef = load_balance_coef
         
     def forward(
         self, 
@@ -576,19 +599,23 @@ class GaussianTransformerMoESimple(nn.Module):
             self.num_heads = getattr(gs_cfg, 'num_heads', 8)
             self.num_gaussian_layers = getattr(gs_cfg, 'num_gaussian_layers', 3)
             self.max_scale = getattr(gs_cfg, 'max_scale', 0.002)
+            self.use_gradient_checkpoint = getattr(gs_cfg, 'use_gradient_checkpoint', True)
         else:
             self.hidden_dim = 256
             self.num_layers = 4
             self.num_heads = 8
             self.num_gaussian_layers = 3
             self.max_scale = 0.002
+            self.use_gradient_checkpoint = True
         
         if moe_cfg is not None:
             self.num_experts = getattr(moe_cfg, 'num_experts', 8)
             self.top_k = getattr(moe_cfg, 'top_k', 2)
+            self.load_balance_weight = getattr(moe_cfg, 'load_balance_weight', 0.01)
         else:
             self.num_experts = 8
             self.top_k = 2
+            self.load_balance_weight = 0.01
         
         # 获取 RAFT encoder 维度
         encoder_dims = cfg.raft.encoder_dims  # [32, 48, 96]
@@ -626,43 +653,61 @@ class GaussianTransformerMoESimple(nn.Module):
                 top_k=self.top_k,
                 use_cross_view=False,  # 简化版不使用跨视图
                 dropout=0.1,
+                load_balance_coef=self.load_balance_weight,
             )
             for _ in range(self.num_layers)
         ])
         
-        # 输出头 (与原 GSRegresser 兼容)
+        # 输出头 - 多层高斯参数
+        # L = num_gaussian_layers，从配置读取
+        L = self.num_gaussian_layers
         self.head_dim = cfg.gsnet.parm_head_dim
         
+        logger.info(f"[GaussianTransformerMoESimple] 初始化多层输出头: "
+                   f"num_gaussian_layers={L}, head_dim={self.head_dim}")
+        
+        # 旋转: [B, 4*L, H, W] -> [B, 4, L, H, W]
         self.rot_head = nn.Sequential(
             nn.Conv2d(self.hidden_dim, self.head_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(self.head_dim, 4, kernel_size=1),
+            nn.Conv2d(self.head_dim, 4 * L, kernel_size=1),
         )
         
+        # 缩放: [B, 3*L, H, W] -> [B, 3, L, H, W]
         self.scale_head = nn.Sequential(
             nn.Conv2d(self.hidden_dim, self.head_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(self.head_dim, 3, kernel_size=1),
-            nn.Softplus(beta=1)
+            nn.Conv2d(self.head_dim, 3 * L, kernel_size=1),
         )
         
+        # 不透明度: [B, L, H, W] -> [B, 1, L, H, W]
         self.opacity_head = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, self.head_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.head_dim, L, kernel_size=1),
+        )
+        
+        # 深度偏移: [B, L, H, W] -> [B, 1, L, H, W]
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, self.head_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.head_dim, L, kernel_size=1),
+        )
+        
+        # 纹理复杂度: [B, 1, H, W] - 用于动态分配
+        self.texture_head = nn.Sequential(
             nn.Conv2d(self.hidden_dim, self.head_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(self.head_dim, 1, kernel_size=1),
             nn.Sigmoid()
         )
-        
-        self.depth_head = nn.Sequential(
-            nn.Conv2d(self.hidden_dim, self.head_dim, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(self.head_dim, 1, kernel_size=1),
-            nn.Tanh()
-        )
     
-    def _transformer_block_forward(self, block, x):
+    def _transformer_block_forward(self, block, x, x_other=None):
         """可被checkpoint包装的transformer block前向"""
-        out, router_weights, lb_loss = block(x)
+        if getattr(block, 'use_cross_view', False) and x_other is not None:
+            out, router_weights, lb_loss = block(x, x_other)
+        else:
+            out, router_weights, lb_loss = block(x)
         return out, lb_loss if lb_loss is not None else torch.tensor(0.0, device=x.device)
     
     def forward(
@@ -670,9 +715,9 @@ class GaussianTransformerMoESimple(nn.Module):
         img: torch.Tensor, 
         depth: torch.Tensor, 
         img_feat: Tuple[torch.Tensor, ...]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         """
-        前向传播 (与 GSRegresser 接口兼容)
+        前向传播 - 输出多层高斯参数
         
         Args:
             img: [B, 3, H, W] - 输入图像
@@ -680,12 +725,16 @@ class GaussianTransformerMoESimple(nn.Module):
             img_feat: tuple of [B, C, H', W'] - 多尺度图像特征
             
         Returns:
-            rot_maps: [B, 4, H, W] - 旋转四元数
-            scale_maps: [B, 3, H, W] - 缩放
-            opacity_maps: [B, 1, H, W] - 不透明度
-            depth_maps: [B, 1, H, W] - 深度残差
+            dict containing:
+                - rotation: [B, 4, L, H, W] - 旋转四元数
+                - scale: [B, 3, L, H, W] - 缩放
+                - opacity: [B, 1, L, H, W] - 不透明度
+                - depth_offset: [B, 1, L, H, W] - 深度偏移
+                - texture_complexity: [B, 1, H, W] - 纹理复杂度
+                - load_balance_loss: scalar - MoE 负载均衡损失
         """
         B, _, H, W = img.shape
+        L = self.num_gaussian_layers
         
         # 上采样所有特征到输入分辨率
         feats = []
@@ -704,7 +753,7 @@ class GaussianTransformerMoESimple(nn.Module):
         # Transformer 处理 (使用梯度检查点)
         total_lb_loss = 0.0
         for block in self.transformer_blocks:
-            if USE_GRADIENT_CHECKPOINT and self.training:
+            if self.use_gradient_checkpoint and self.training:
                 x, lb_loss = checkpoint(
                     self._transformer_block_forward, block, x,
                     use_reentrant=False
@@ -722,17 +771,45 @@ class GaussianTransformerMoESimple(nn.Module):
         if self.downsample_factor > 1:
             x = F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False)
         
-        # 输出头
-        rot_out = self.rot_head(x)
-        rot_out = F.normalize(rot_out, dim=1)
+        # 输出头 - 多层高斯参数
+        rot_out = self.rot_head(x)  # [B, 4*L, H, W]
+        scale_out = self.scale_head(x)  # [B, 3*L, H, W]
+        opacity_out = self.opacity_head(x)  # [B, L, H, W]
+        depth_out = self.depth_head(x)  # [B, L, H, W]
+        texture_out = self.texture_head(x)  # [B, 1, H, W]
         
-        scale_out = self.scale_head(x)
-        scale_out = torch.clamp_max(scale_out, self.max_scale)
+        # 重塑为多层格式: [B, C, L, H, W]
+        rotation = rot_out.view(B, 4, L, H, W)
+        scale = scale_out.view(B, 3, L, H, W)
+        opacity = opacity_out.view(B, L, H, W).unsqueeze(1)  # [B, 1, L, H, W]
+        depth_offset = depth_out.view(B, L, H, W).unsqueeze(1)  # [B, 1, L, H, W]
         
-        opacity_out = self.opacity_head(x)
-        depth_out = self.depth_head(x) * 0.5
+        # 应用激活函数
+        # 四元数归一化 - 对每层分别处理
+        rotation = F.normalize(rotation, dim=1)
         
-        return rot_out, scale_out, opacity_out, depth_out
+        # 缩放 - 确保正值，从配置读取最大值
+        scale = F.softplus(scale)
+        scale = torch.clamp(scale, max=self.max_scale)
+        
+        # 不透明度 - [0, 1]
+        opacity = torch.sigmoid(opacity)
+        
+        # 深度偏移 - 从配置读取范围
+        max_depth_offset = getattr(
+            getattr(self.cfg, 'gs_transformer', None), 
+            'max_depth_offset', 0.5
+        )
+        depth_offset = torch.tanh(depth_offset) * max_depth_offset
+        
+        return {
+            'rotation': rotation,           # [B, 4, L, H, W]
+            'scale': scale,                 # [B, 3, L, H, W]
+            'opacity': opacity,             # [B, 1, L, H, W]
+            'depth_offset': depth_offset,   # [B, 1, L, H, W]
+            'texture_complexity': texture_out,  # [B, 1, H, W]
+            'load_balance_loss': total_lb_loss,
+        }
 
 
 def create_gaussian_transformer_moe(cfg) -> GaussianTransformerMoE:

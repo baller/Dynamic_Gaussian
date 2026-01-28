@@ -1,6 +1,7 @@
-name: 'gps_plus'
+name: 'gps_plus_v2'
 
-lr: 0.00001
+# 训练参数
+lr: 0.0001              # 学习率 (新架构需要更高的学习率)
 wdecay: 1e-5
 batch_size: 1
 num_steps: 100000
@@ -13,92 +14,161 @@ dataset:
   use_depth_init: True
   use_local_data: True
   inverse_depth_init: 0.3
-  local_data_root: '/data/GPS_plus/processed_data'       # TODO
-  train_data_root: '/data/GPS_plus/processed_data/train' # TODO
-  val_data_root: '/data/GPS_plus/processed_data/val'     # TODO
+  img_range: [-1.0, 1.0]
+  local_data_root: '/data/GPS_plus/processed_data'
+  train_data_root: '/data/GPS_plus/processed_data/train'
+  val_data_root: '/data/GPS_plus/processed_data/val'
 
+# RAFT 配置 (用于特征编码器尺寸定义)
 raft:
   mixed_precision: False
   train_iters: 3
   val_iters: 3
-  encoder_dims: [32, 48, 96]  
-  hidden_dims: [96, 96, 96]  
+  encoder_dims: [32, 48, 96]
+  hidden_dims: [96, 96, 96]
 
+# GS 网络配置 (基础参数)
 gsnet:
   encoder_dims: [32, 48, 96]
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
 
+# ============================================
 # 深度估计模式: 'raft' 或 'da3'
+# ============================================
 depth_mode: 'da3'
 
-# DA3 深度估计配置 (当 depth_mode='da3' 时生效)
+# DA3 深度估计配置
 da3:
-  model_name: 'depth-anything/DA3-BASE'  # 使用 BASE 版本节省显存 (LARGE 需要 >30GB)
-  export_feat_layers: [5, 8, 11]  # BASE 版本的层索引更小
-  freeze_backbone: true
-  mixed_precision: true  # 启用混合精度
-  use_feature_adapter: true
+  model_name: '/home/user_3/.cache/huggingface/hub/models--depth-anything--DA3-BASE/snapshots/f4a6c9b3c95e41c82048423d3493a81ec3fa810e/'  # BASE 版本 (~5GB VRAM)
+  export_feat_layers: [5, 8, 11]         # BASE 版本的 DINOv2 层索引
+  freeze_backbone: true                   # 冻结 backbone 节省显存
+  mixed_precision: true                   # FP16 混合精度
+  use_feature_adapter: true               # 使用特征适配器
 
-# 深度融合配置 (当 depth_mode='da3' 时生效)
+# ============================================
+# 深度融合模块 (立体几何约束)
+# ============================================
 depth_fusion:
-  enabled: false
-  feat_dim: 32  # 减小以节省内存
-  num_heads: 4
-  dropout: 0.1
-  num_sparse_points: 64
+  enabled: true          # 启用深度融合 (解决左右深度尺度不一致)
+  feat_dim: 64           # 特征维度 (减小以节省显存)
+  num_heads: 4           # 注意力头数
+  dropout: 0.1           # Dropout
+  num_sparse_points: 64  # 稀疏相关点数量
+  attention_downsample: 16  # 注意力下采样因子 (16=显存友好, 8=更高质量)
+  residual_weight: 0.1   # 融合残差权重
+  use_gradient_checkpoint: true
+  blend_warmup_iters: 200
+  wide_fov_enable: true
+  wide_fov_mode: 'concat'
 
-# 高斯预测网络类型: 'gsregresser' 或 'transformer_moe'
-gs_predictor: 'transformer_moe'
+# ============================================
+# 高斯预测网络
+# ============================================
+gs_predictor: 'transformer_moe'  # 使用 Transformer+MoE
 
-# Transformer+MoE 高斯预测网络配置 (当 gs_predictor='transformer_moe' 时生效)
+# Transformer+MoE 配置
 gs_transformer:
-  hidden_dim: 128  # 减小以节省内存
-  num_layers: 2    # 减少层数
-  num_heads: 4
-  window_size: 8
-  num_gaussian_layers: 3
-  max_scale: 0.002
-  max_depth_offset: 0.5
-  downsample_factor: 4  # 下采样因子，4 表示 H/4 x W/4 分辨率进行 Transformer
+  hidden_dim: 96           # 隐藏层维度 (减小以节省显存)
+  num_layers: 2            # Transformer 层数 (减少以节省显存)
+  num_heads: 4             # 注意力头数
+  window_size: 8           # 窗口注意力大小
+  num_gaussian_layers: 3   # 多层高斯层数 (关键参数)
+  max_scale: 0.003         # 高斯最大缩放
+  max_depth_offset: 0.3    # 深度偏移最大值 (米)
+  downsample_factor: 8     # Transformer 输入下采样 (增加以节省显存)
+  use_gradient_checkpoint: true
 
-# MoE 配置
+# MoE (专家混合) 配置
 moe:
-  num_experts: 4   # 减少专家数量
-  top_k: 2
-  load_balance_weight: 0.01
+  num_experts: 4           # 专家数量
+  top_k: 2                 # 每次激活的专家数
+  load_balance_weight: 0.01 # 负载均衡损失权重
 
-# 动态高斯分配配置
+# ============================================
+# 动态高斯分配
+# ============================================
 dynamic_gs:
-  enabled: true  # 启用动态高斯分配
-  num_layers: 3
-  opacity_threshold: 0.01
-  complexity_threshold: 0.3
-  use_complexity_guidance: true
-  soft_pruning: true
+  enabled: true                   # 启用动态分配
+  num_layers: 3                   # 与 gs_transformer.num_gaussian_layers 一致
+  opacity_threshold: 0.1         # 不透明度裁剪阈值
+  complexity_threshold: 0.2       # 纹理复杂度阈值
+  use_complexity_guidance: true   # 使用纹理复杂度指导分配
+  soft_pruning: true              # 软裁剪 (可微)
+  gumbel_temperature: 1.0
+  gumbel_opacity_scale: 10.0
+  soft_pruning_alpha: 10.0
+  complexity_weight_min: 0.5
+  complexity_weight_max: 1.0
+  warmup_iters: 200
 
-# 损失函数配置
+# ============================================
+# 损失函数权重
+# ============================================
 loss:
-  l1_weight: 0.8
-  ssim_weight: 0.2
-  chamfer_weight: 0.5
-  depth_consistency_weight: 0.1
-  moe_balance_weight: 0.01
-  allocation_entropy_weight: 0.001
+  l1_weight: 0.8                    # L1 渲染损失
+  ssim_weight: 0.2                  # SSIM 损失
+  chamfer_weight: 0.5               # Chamfer 距离 (点云几何)
+  depth_consistency_weight: 0.2     # 深度一致性 (增加权重)
+  moe_balance_weight: 0.01          # MoE 负载均衡
+  allocation_entropy_weight: 0.001  # 分配熵正则
+  allocation_correlation_weight: 0.5
 
+# ============================================
+# 记录与保存
+# ============================================
 record:
-  loss_freq: 50
-  eval_freq: 500
-  save_iter: 5000
+  loss_freq: 50      # 损失记录频率
+  eval_freq: 500     # 验证频率
+  save_iter: 5000    # 模型保存频率
+  print_freq: 100
 
+# ============================================
 # 可视化配置
+# ============================================
 visualization:
   enabled: true
-  vis_freq: 500           # 可视化输出频率 (每 N 步输出一次)
-  save_depth: true        # 保存深度图可视化
-  save_gaussian: true     # 保存高斯分布可视化 (多层 + 裁剪后)
-  save_novel_view: true   # 保存 novel view 预测 vs GT 对比
-  save_opacity: true      # 保存不透明度图
-  save_features: false    # 保存特征图 (较大，默认关闭)
-  colormap: 'turbo'       # 深度图颜色映射: turbo, viridis, plasma, magma
-  max_images: 4           # 每次最多保存的批次图像数
+  vis_freq: 200              # 可视化输出频率
+  save_depth: true           # 保存深度图
+  save_gaussian: true        # 保存高斯分布 (多层)
+  save_novel_view: true      # 保存 Novel View 对比
+  save_opacity: true         # 保存不透明度图
+  save_features: true       # 保存特征图 (可选)
+  colormap: 'turbo'          # 深度图颜色
+  max_images: 4              # 最大保存数量
+  layer_patch_size: 16       # 层数统计的补丁尺寸
+
+# ============================================
+# 训练控制参数
+# ============================================
+training:
+  chamfer_enabled: false
+  chamfer_start_iter: 0
+  chamfer_sample_size: 10000
+  scale_reg_enabled: false
+  scale_reg_log_weight: 0.5
+  depth_consistency_start_iter: 200
+  depth_consistency_ramp_iters: 300
+
+# ============================================
+# 评估控制参数
+# ============================================
+eval:
+  min_psnr: null
+  stop_on_low_psnr: false
+
+# ============================================
+# 深度对齐参数 (仅在 depth_fusion.enabled=false 时生效)
+# ============================================
+depth_align:
+  typical_disp_min_ratio: 0.01
+  typical_disp_max_ratio: 0.15
+  target_range_scale: 0.5
+  scale_clamp_min: 0.8
+  scale_clamp_max: 1.2
+  min_depth: 0.1
+
+# ============================================
+# 训练随机种子
+# ============================================
+seed: 1314

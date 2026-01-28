@@ -58,6 +58,24 @@
             "cwd": "${workspaceFolder}"
         },
         {
+            "name": "Train GPS+ (Accelarate GPU 0,2)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "accelerate.commands.launch",
+            "args": [
+                "--config_file",
+                "accelerate_config.yaml",
+                "train.py"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,2",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
             "name": "Test Modules",
             "type": "debugpy",
             "request": "launch",

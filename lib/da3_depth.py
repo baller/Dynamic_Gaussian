@@ -55,6 +55,15 @@ class DA3DepthEstimator(nn.Module):
                 'mixed_precision': getattr(self.da3_cfg, 'mixed_precision', False),
             }
         
+        # 根据模型名推断特征维度
+        model_name = self.da3_cfg.get('model_name', 'depth-anything/DA3-LARGE')
+        if 'LARGE' in model_name.upper() or 'GIANT' in model_name.upper():
+            self.da3_feat_dim = 1024
+        elif 'BASE' in model_name.upper():
+            self.da3_feat_dim = 768
+        else:
+            self.da3_feat_dim = 384
+        
         self.model = None
         self.is_loaded = False
         
@@ -167,7 +176,7 @@ class DA3DepthEstimator(nn.Module):
                     if feat.dim() == 5:
                         feat = feat[:, 0]
                     # DA3 输出可能是 [B, H', W', C] 格式，需要转换为 [B, C, H', W']
-                    if feat.dim() == 4 and feat.shape[-1] == 1024:  # C 在最后一维
+                    if feat.dim() == 4 and feat.shape[-1] == self.da3_feat_dim:
                         feat = feat.permute(0, 3, 1, 2).contiguous()  # [B, H', W', C] -> [B, C, H', W']
                     features.append(feat)
             result['features'] = features

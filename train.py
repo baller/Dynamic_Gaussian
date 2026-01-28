@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 try:
     from accelerate import Accelerator
     from accelerate.utils import set_seed
+    from accelerate.utils import DistributedDataParallelKwargs
     ACCELERATE_AVAILABLE = True
 except ImportError:
     ACCELERATE_AVAILABLE = False
@@ -48,9 +49,11 @@ class Trainer:
         
         # 初始化 Accelerator
         if self.use_accelerate:
+            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
             self.accelerator = Accelerator(
                 mixed_precision='fp16' if self.cfg.raft.mixed_precision else 'no',
                 gradient_accumulation_steps=1,
+                kwargs_handlers=[ddp_kwargs],
             )
             self.is_main_process = self.accelerator.is_main_process
             self.device = self.accelerator.device
@@ -157,16 +160,23 @@ class Trainer:
         log_scale = 0
         log_depth_cons = 0
         log_moe_balance = 0
-        if_chamfer = True   
-        if_scale = False  
-        iter_from = -1 
+        train_cfg = getattr(self.cfg, 'training', None)
+        if_chamfer = getattr(train_cfg, 'chamfer_enabled', True)
+        iter_from = getattr(train_cfg, 'chamfer_start_iter', 0)
+        chamfer_sample_size = getattr(train_cfg, 'chamfer_sample_size', 10000)
+        if_scale = getattr(train_cfg, 'scale_reg_enabled', False)
+        scale_log_weight = getattr(train_cfg, 'scale_reg_log_weight', 0.5)
+        print_freq = getattr(self.cfg.record, 'print_freq', 100)
         for itr_ in tqdm(range(self.total_steps, self.cfg.num_steps)):
             self.optimizer.zero_grad()
             data = self.fetch_data(phase='train')
+            data['global_step'] = self.total_steps
 
             #  Raft Stereo / DA3 前向传播
             data, _, metrics = self.model(data, is_train=True)
             #  Gaussian Render
+            if hasattr(self.cfg.dataset, 'img_range'):
+                data['img_range'] = self.cfg.dataset.img_range
             data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
 
             # Loss
@@ -189,7 +199,7 @@ class Trainer:
                     # 处理点数不足的情况
                     n_l = l_xyz_i.shape[1]
                     n_r = r_xyz_i.shape[1]
-                    sample_size = min(10000, n_l, n_r)
+                    sample_size = min(chamfer_sample_size, n_l, n_r)
                     
                     if sample_size > 0:
                         sample_l = np.random.choice(n_l, sample_size, replace=(n_l < sample_size))
@@ -208,49 +218,99 @@ class Trainer:
             # DA3 模式的额外损失
             depth_cons_loss = torch.tensor(0.0, device=loss.device)
             moe_balance_loss = torch.tensor(0.0, device=loss.device)
+            allocation_loss = torch.tensor(0.0, device=loss.device)
             
             if self.depth_mode == 'da3':
-                # 深度一致性损失
+                # 1. 深度一致性损失
                 if self.depth_consistency_loss is not None:
+                    depth_cons_start = getattr(train_cfg, 'depth_consistency_start_iter', 0)
+                    depth_cons_ramp = getattr(train_cfg, 'depth_consistency_ramp_iters', 0)
+                    if self.total_steps < depth_cons_start:
+                        depth_cons_weight = 0.0
+                    elif depth_cons_ramp > 0:
+                        depth_cons_weight = min(
+                            1.0,
+                            float(self.total_steps - depth_cons_start) / float(depth_cons_ramp)
+                        )
+                    else:
+                        depth_cons_weight = 1.0
+
                     # 优先使用融合后的深度，否则使用原始深度
                     if 'fusion_aux' in data:
                         aux = data['fusion_aux']
                         depth_l = aux.get('depth_l_metric')
                         depth_r = aux.get('depth_r_metric')
                     else:
-                        # 使用原始 DA3 深度
+                        # 使用原始 DA3 深度 (基础深度，不含多层偏移)
                         depth_l = data['lmain'].get('depth')
                         depth_r = data['rmain'].get('depth')
                     
                     if depth_l is not None and depth_r is not None:
+                        # 确保深度是 4D: [B, 1, H, W]
+                        if depth_l.dim() == 5:  # [B, 1, L, H, W] 多层格式
+                            depth_l = depth_l[:, :, 0, :, :]  # 取第一层
+                            depth_r = depth_r[:, :, 0, :, :]
+                        
                         baseline = self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
                         depth_cons_loss = self.depth_consistency_loss(
                             depth_l, depth_r, data['lmain']['intr'], baseline
                         )
-                        loss = loss + self.depth_consistency_weight * depth_cons_loss
+                        loss = loss + (self.depth_consistency_weight * depth_cons_weight) * depth_cons_loss
                 
-                # MoE 负载均衡损失 (如果使用 Transformer+MoE)
-                # 获取模型 (处理 accelerate 包装)
-                model = self.accelerator.unwrap_model(self.model) if self.use_accelerate else self.model
-                if hasattr(model, 'gs_parm_regresser'):
-                    regresser = model.gs_parm_regresser
-                    # 检查是否有存储的 MoE 损失
-                    if hasattr(regresser, 'last_moe_balance_loss'):
-                        lb_loss = regresser.last_moe_balance_loss
-                        if lb_loss is not None and isinstance(lb_loss, torch.Tensor):
-                            moe_balance_loss = lb_loss
-                        elif lb_loss is not None and lb_loss > 0:
-                            moe_balance_loss = torch.tensor(lb_loss, device=loss.device)
+                # 2. MoE 负载均衡损失
+                # 首先检查 data 中是否直接存储了损失
+                if 'moe_load_balance_loss' in data:
+                    lb_loss = data['moe_load_balance_loss']
+                    if isinstance(lb_loss, torch.Tensor) and lb_loss.numel() > 0:
+                        moe_balance_loss = lb_loss if lb_loss.dim() == 0 else lb_loss.mean()
                         loss = loss + self.moe_balance_weight * moe_balance_loss
+                else:
+                    # 备选：从模型中获取
+                    model = self.accelerator.unwrap_model(self.model) if self.use_accelerate else self.model
+                    if hasattr(model, 'gs_parm_regresser'):
+                        regresser = model.gs_parm_regresser
+                        if hasattr(regresser, 'last_moe_balance_loss'):
+                            lb_loss = regresser.last_moe_balance_loss
+                            if lb_loss is not None and isinstance(lb_loss, torch.Tensor):
+                                moe_balance_loss = lb_loss if lb_loss.dim() == 0 else lb_loss.mean()
+                            elif lb_loss is not None and lb_loss > 0:
+                                moe_balance_loss = torch.tensor(lb_loss, device=loss.device)
+                            loss = loss + self.moe_balance_weight * moe_balance_loss
+                
+                # 3. 动态分配熵损失 (可选)
+                allocation_entropy_weight = getattr(
+                    getattr(self.cfg, 'loss', None), 
+                    'allocation_entropy_weight', 0.001
+                )
+                allocation_corr_weight = getattr(
+                    getattr(self.cfg, 'loss', None),
+                    'allocation_correlation_weight',
+                    0.5
+                )
+                if allocation_entropy_weight > 0:
+                    for view in ['lmain', 'rmain']:
+                        if 'valid_mask' in data[view] and 'texture_complexity' in data[view]:
+                            valid_mask = data[view]['valid_mask']
+                            texture = data[view]['texture_complexity']
+                            if valid_mask is not None and texture is not None:
+                                # 计算分配与纹理的相关性损失
+                                L = valid_mask.shape[1] if valid_mask.dim() == 4 else 1
+                                layers_per_pixel = valid_mask.float().sum(dim=1)  # [B, H, W]
+                                target_layers = texture.squeeze(1) * L
+                                alloc_loss = torch.nn.functional.mse_loss(layers_per_pixel, target_layers)
+                                allocation_loss = allocation_loss + alloc_loss * allocation_corr_weight
+                    
+                    if allocation_loss > 0:
+                        loss = loss + allocation_entropy_weight * allocation_loss
 
             log_l1 += self.l1_weight * Ll1.item()
             log_ssim += self.ssim_weight * Lssim.item()
             log_chamfer += self.chamfer_weight * chamfer_loss.item() if if_chamfer and itr_>iter_from else 0 
-            log_scale += 0.5 * data['novel_view']['scale_regular'].item() if if_scale else 0
-            log_depth_cons += depth_cons_loss.item() if self.depth_mode == 'da3' else 0
-            log_moe_balance += moe_balance_loss.item() if self.depth_mode == 'da3' else 0
+            log_scale += scale_log_weight * data['novel_view']['scale_regular'].item() if if_scale else 0
+            log_depth_cons += depth_cons_loss.item() if isinstance(depth_cons_loss, torch.Tensor) else depth_cons_loss
+            log_moe_balance += moe_balance_loss.item() if isinstance(moe_balance_loss, torch.Tensor) else moe_balance_loss
 
-            if self.is_main_process and self.total_steps and self.total_steps % self.cfg.record.loss_freq == 0:
+            if self.is_main_process and self.total_steps and self.cfg.record.loss_freq > 0 and self.total_steps % self.cfg.record.loss_freq == 0:
                 self.logger.writer.add_scalar(f'lr', self.optimizer.param_groups[0]['lr'], self.total_steps)
                 self.save_ckpt(save_path=Path('%s/%s_latest.pth' % (cfg.record.ckpt_path, cfg.name)), show_log=False)
             
@@ -263,8 +323,16 @@ class Trainer:
             
             # DA3 模式的额外指标
             if self.depth_mode == 'da3':
-                metrics['depth_consistency'] = depth_cons_loss.item()
-                metrics['moe_balance'] = moe_balance_loss.item()
+                metrics['depth_consistency'] = depth_cons_loss.item() if isinstance(depth_cons_loss, torch.Tensor) else depth_cons_loss
+                metrics['moe_balance'] = moe_balance_loss.item() if isinstance(moe_balance_loss, torch.Tensor) else moe_balance_loss
+                metrics['allocation_entropy'] = allocation_loss.item() if isinstance(allocation_loss, torch.Tensor) else allocation_loss
+                
+                # 记录动态分配统计
+                for view in ['lmain', 'rmain']:
+                    if 'alloc_stats' in data[view]:
+                        stats = data[view]['alloc_stats']
+                        metrics[f'{view}_pruning_ratio'] = stats.get('pruning_ratio', 0)
+                        metrics[f'{view}_avg_layers'] = stats.get('avg_layers_per_pixel', 0)
                 
                 # 记录融合模块的 scale 和 shift
                 if 'fusion_aux' in data:
@@ -296,28 +364,28 @@ class Trainer:
                 self.scheduler.step()
                 self.scaler.update()
 
-            if self.total_steps and self.total_steps % self.cfg.record.eval_freq == 0:
+            if self.total_steps and self.cfg.record.eval_freq > 0 and self.total_steps % self.cfg.record.eval_freq == 0:
                 self.model.eval()
                 self.run_eval()
                 self.model.train()
                 self._freeze_bn()  # 冻结 BatchNorm
                 
-            if self.is_main_process and self.total_steps % self.cfg.record.save_iter == 0 and self.total_steps != 0:
+            if self.is_main_process and self.cfg.record.save_iter > 0 and self.total_steps % self.cfg.record.save_iter == 0 and self.total_steps != 0:
                 self.save_ckpt(save_path=Path('%s/iter%d.pth' % (cfg.record.ckpt_path, self.total_steps)))
 
 
             self.total_steps += 1
-            if self.is_main_process and self.total_steps % 100 == 99:
+            if self.is_main_process and print_freq > 0 and self.total_steps % print_freq == (print_freq - 1):
                 print_items = [
-                    f'l1: {log_l1/100:.4f}',
-                    f'ssim: {log_ssim/100:.4f}',
-                    f'chamfer: {log_chamfer/100:.4f}',
-                    f'scale: {log_scale/100:.4f}',
+                    f'l1: {log_l1/print_freq:.4f}',
+                    f'ssim: {log_ssim/print_freq:.4f}',
+                    f'chamfer: {log_chamfer/print_freq:.4f}',
+                    f'scale: {log_scale/print_freq:.4f}',
                 ]
                 if self.depth_mode == 'da3':
                     print_items.extend([
-                        f'depth_cons: {log_depth_cons/100:.6f}',
-                        f'moe_bal: {log_moe_balance/100:.6f}',
+                        f'depth_cons: {log_depth_cons/print_freq:.6f}',
+                        f'moe_bal: {log_moe_balance/print_freq:.6f}',
                     ])
                 print(' | '.join(print_items))
                 
@@ -356,8 +424,11 @@ class Trainer:
  
         for idx in range(self.len_val):
             data = self.fetch_data(phase='val')
+            data['global_step'] = self.total_steps
             with torch.no_grad():
                 data, _, _ = self.model(data, is_train=False)
+                if hasattr(self.cfg.dataset, 'img_range'):
+                    data['img_range'] = self.cfg.dataset.img_range
                 data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
 
                 render_novel = data['novel_view']['img_pred']
@@ -367,7 +438,11 @@ class Trainer:
 
                 if idx == show_idx:
                     tmp_novel = data['novel_view']['img_pred'][0].detach()
-                    tmp_novel *= 255
+                    img_range = getattr(self.cfg.dataset, 'img_range', None)
+                    if img_range is not None and len(img_range) == 2:
+                        img_min, img_max = img_range
+                        tmp_novel = (tmp_novel - img_min) / (img_max - img_min)
+                    tmp_novel = tmp_novel.clamp(0, 1) * 255
                     tmp_novel = tmp_novel.permute(1, 2, 0).cpu().numpy()
                     tmp_img_name = '%s/%s.jpg' % (cfg.record.show_path, self.total_steps)
                     cv2.imwrite(tmp_img_name, tmp_novel[:, :, ::-1].astype(np.uint8))
@@ -377,9 +452,13 @@ class Trainer:
                         self.visualizer.visualize(data, self.total_steps, phase='val')
 
         val_psnr = np.round(np.mean(np.array(psnr_list)), 4)
-        if val_psnr < 10:
-            print('something wrong during training, please change random seed and re-train')
-            exit()
+        eval_cfg = getattr(self.cfg, 'eval', None)
+        min_psnr = getattr(eval_cfg, 'min_psnr', None)
+        stop_on_low_psnr = getattr(eval_cfg, 'stop_on_low_psnr', False)
+        if min_psnr is not None and val_psnr < min_psnr:
+            print('validation psnr below threshold, please check training config')
+            if stop_on_low_psnr:
+                exit()
 
             
         logging.info(f"Validation Metrics ({self.total_steps}): psnr {val_psnr}")
@@ -471,8 +550,12 @@ if __name__ == '__main__':
     if not ACCELERATE_AVAILABLE or int(os.environ.get('LOCAL_RANK', 0)) == 0:
         file_backup(cfg.record.file_path, cfg, train_script=os.path.basename(__file__))
 
-    torch.manual_seed(1314)
-    np.random.seed(1314)
+    seed = getattr(cfg, 'seed', None)
+    if seed is not None:
+        if ACCELERATE_AVAILABLE:
+            set_seed(seed)
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     trainer = Trainer(cfg)
     trainer.train()

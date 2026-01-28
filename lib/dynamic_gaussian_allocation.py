@@ -45,11 +45,17 @@ class DynamicGaussianAllocation(nn.Module):
             self.opacity_threshold = getattr(dgs_cfg, 'opacity_threshold', 0.01)
             self.complexity_threshold = getattr(dgs_cfg, 'complexity_threshold', 0.3)
             self.use_complexity_guidance = getattr(dgs_cfg, 'use_complexity_guidance', True)
+            self.gumbel_temperature = getattr(dgs_cfg, 'gumbel_temperature', 1.0)
+            self.gumbel_opacity_scale = getattr(dgs_cfg, 'gumbel_opacity_scale', 10.0)
+            self.soft_pruning_alpha = getattr(dgs_cfg, 'soft_pruning_alpha', 10.0)
         else:
             self.num_layers = 3
             self.opacity_threshold = 0.01
             self.complexity_threshold = 0.3
             self.use_complexity_guidance = True
+            self.gumbel_temperature = 1.0
+            self.gumbel_opacity_scale = 10.0
+            self.soft_pruning_alpha = 10.0
         
         # 复杂度到保留层数的映射
         if self.use_complexity_guidance:
@@ -67,7 +73,8 @@ class DynamicGaussianAllocation(nn.Module):
     def forward(
         self, 
         gaussian_params: Dict[str, torch.Tensor], 
-        texture_complexity: Optional[torch.Tensor] = None
+        texture_complexity: Optional[torch.Tensor] = None,
+        step: Optional[int] = None
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, Dict]:
         """
         前向传播
@@ -90,7 +97,13 @@ class DynamicGaussianAllocation(nn.Module):
         opacity_squeezed = opacity.squeeze(1)  # [B, L, H, W]
         
         # 方法1: 基于 Opacity 阈值裁剪
-        valid_mask = opacity_squeezed > self.opacity_threshold  # [B, L, H, W]
+        warmup_iters = getattr(self.cfg.dynamic_gs, 'warmup_iters', 0) if hasattr(self.cfg, 'dynamic_gs') else 0
+        if step is not None and warmup_iters > 0:
+            warmup_ratio = min(1.0, float(step) / float(warmup_iters))
+            opacity_threshold = self.opacity_threshold * warmup_ratio
+        else:
+            opacity_threshold = self.opacity_threshold
+        valid_mask = opacity_squeezed > opacity_threshold  # [B, L, H, W]
         
         # 方法2: 结合纹理复杂度指导
         if self.use_complexity_guidance and texture_complexity is not None:
@@ -99,7 +112,11 @@ class DynamicGaussianAllocation(nn.Module):
             
             if self.training:
                 # 训练时：使用 Gumbel-Softmax 实现可微采样
-                keep_decision = self._gumbel_softmax_sample(layer_probs, opacity_squeezed)
+                keep_decision = self._gumbel_softmax_sample(
+                    layer_probs,
+                    opacity_squeezed,
+                    temperature=self.gumbel_temperature
+                )
                 valid_mask = valid_mask & (keep_decision > 0.5)
             else:
                 # 推理时：根据复杂度决定保留层数
@@ -142,6 +159,7 @@ class DynamicGaussianAllocation(nn.Module):
             'valid_gaussians': valid_count,
             'pruning_ratio': 1.0 - valid_count / total_gaussians,
             'avg_layers_per_pixel': valid_mask.float().sum(dim=1).mean().item(),
+            'opacity_threshold': float(opacity_threshold),
         }
         
         return filtered_params, valid_mask, stats
@@ -164,7 +182,7 @@ class DynamicGaussianAllocation(nn.Module):
             keep_decision: [B, L, H, W] - 保留决策 (软掩码)
         """
         # 结合 opacity 和 layer_probs
-        combined = layer_probs * torch.sigmoid(opacity * 10)  # 放大 opacity 的影响
+        combined = layer_probs * torch.sigmoid(opacity * self.gumbel_opacity_scale)
         
         # Gumbel noise
         gumbel_noise = -torch.log(-torch.log(torch.rand_like(combined) + 1e-8) + 1e-8)
@@ -376,9 +394,15 @@ class DynamicGaussianAllocationSimple(nn.Module):
         if dgs_cfg is not None:
             self.opacity_threshold = getattr(dgs_cfg, 'opacity_threshold', 0.01)
             self.soft_pruning = getattr(dgs_cfg, 'soft_pruning', True)
+            self.soft_pruning_alpha = getattr(dgs_cfg, 'soft_pruning_alpha', 10.0)
+            self.complexity_weight_min = getattr(dgs_cfg, 'complexity_weight_min', 0.5)
+            self.complexity_weight_max = getattr(dgs_cfg, 'complexity_weight_max', 1.0)
         else:
             self.opacity_threshold = 0.01
             self.soft_pruning = True
+            self.soft_pruning_alpha = 10.0
+            self.complexity_weight_min = 0.5
+            self.complexity_weight_max = 1.0
     
     def forward(
         self, 
@@ -400,8 +424,7 @@ class DynamicGaussianAllocationSimple(nn.Module):
             # 软裁剪: 使用 sigmoid 平滑过渡
             # opacity < threshold 时接近 0
             # opacity > threshold 时接近原值
-            alpha = 10.0  # 控制平滑度
-            mask = torch.sigmoid(alpha * (opacity - self.opacity_threshold))
+            mask = torch.sigmoid(self.soft_pruning_alpha * (opacity - self.opacity_threshold))
             adjusted_opacity = opacity * mask
         else:
             # 硬裁剪
@@ -412,14 +435,16 @@ class DynamicGaussianAllocationSimple(nn.Module):
         if texture_complexity is not None:
             # 复杂区域: 保持或增强 opacity
             # 简单区域: 降低 opacity (更激进的裁剪)
-            complexity_weight = 0.5 + 0.5 * texture_complexity  # [0.5, 1.0]
+            complexity_weight = self.complexity_weight_min + (
+                self.complexity_weight_max - self.complexity_weight_min
+            ) * texture_complexity
             adjusted_opacity = adjusted_opacity * complexity_weight
         
         # 统计
         stats = {
             'mean_opacity_before': opacity.mean().item(),
             'mean_opacity_after': adjusted_opacity.mean().item(),
-            'pruning_ratio': (adjusted_opacity < 0.01).float().mean().item(),
+            'pruning_ratio': (adjusted_opacity < self.opacity_threshold).float().mean().item(),
         }
         
         return adjusted_opacity, stats

@@ -11,6 +11,7 @@ class ConfigStereoHuman:
         self.cfg.wdecay = 0.0
         self.cfg.batch_size = 0
         self.cfg.num_steps = 0
+        self.cfg.seed = None
 
         self.cfg.dataset = CN()
         self.cfg.dataset.source_id = None
@@ -29,6 +30,7 @@ class ConfigStereoHuman:
         self.cfg.dataset.trans = [0.0, 0.0, 0.0]
         self.cfg.dataset.scale = 1.0
         self.cfg.dataset.inverse_depth_init = 1.0
+        self.cfg.dataset.img_range = [-1.0, 1.0]
 
         self.cfg.raft = CN()
         self.cfg.raft.mixed_precision = None
@@ -70,6 +72,12 @@ class ConfigStereoHuman:
         self.cfg.depth_fusion.num_heads = 8
         self.cfg.depth_fusion.dropout = 0.1
         self.cfg.depth_fusion.num_sparse_points = 128
+        self.cfg.depth_fusion.attention_downsample = 16  # 注意力下采样因子
+        self.cfg.depth_fusion.residual_weight = 0.1
+        self.cfg.depth_fusion.use_gradient_checkpoint = True
+        self.cfg.depth_fusion.blend_warmup_iters = 0
+        self.cfg.depth_fusion.wide_fov_enable = False
+        self.cfg.depth_fusion.wide_fov_mode = 'concat'
 
         # 高斯预测网络类型
         self.cfg.gs_predictor = 'gsregresser'  # 'gsregresser' or 'transformer_moe'
@@ -84,6 +92,7 @@ class ConfigStereoHuman:
         self.cfg.gs_transformer.max_scale = 0.002
         self.cfg.gs_transformer.max_depth_offset = 0.5
         self.cfg.gs_transformer.downsample_factor = 4  # 下采样因子，节省显存
+        self.cfg.gs_transformer.use_gradient_checkpoint = True
         
         # MoE 配置
         self.cfg.moe = CN()
@@ -99,6 +108,12 @@ class ConfigStereoHuman:
         self.cfg.dynamic_gs.complexity_threshold = 0.3
         self.cfg.dynamic_gs.use_complexity_guidance = True
         self.cfg.dynamic_gs.soft_pruning = True
+        self.cfg.dynamic_gs.gumbel_temperature = 1.0
+        self.cfg.dynamic_gs.gumbel_opacity_scale = 10.0
+        self.cfg.dynamic_gs.soft_pruning_alpha = 10.0
+        self.cfg.dynamic_gs.complexity_weight_min = 0.5
+        self.cfg.dynamic_gs.complexity_weight_max = 1.0
+        self.cfg.dynamic_gs.warmup_iters = 0
 
         # 损失函数配置
         self.cfg.loss = CN()
@@ -108,6 +123,7 @@ class ConfigStereoHuman:
         self.cfg.loss.depth_consistency_weight = 0.1
         self.cfg.loss.moe_balance_weight = 0.01
         self.cfg.loss.allocation_entropy_weight = 0.001
+        self.cfg.loss.allocation_correlation_weight = 0.5
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
@@ -117,6 +133,31 @@ class ConfigStereoHuman:
         self.cfg.record.save_iter = 5000
         self.cfg.record.loss_freq = 0
         self.cfg.record.eval_freq = 0
+        self.cfg.record.print_freq = 100
+
+        # 训练控制参数
+        self.cfg.training = CN()
+        self.cfg.training.chamfer_enabled = True
+        self.cfg.training.chamfer_start_iter = 0
+        self.cfg.training.chamfer_sample_size = 10000
+        self.cfg.training.scale_reg_enabled = False
+        self.cfg.training.scale_reg_log_weight = 0.5
+        self.cfg.training.depth_consistency_start_iter = 0
+        self.cfg.training.depth_consistency_ramp_iters = 0
+
+        # 评估控制参数
+        self.cfg.eval = CN()
+        self.cfg.eval.min_psnr = None
+        self.cfg.eval.stop_on_low_psnr = False
+
+        # 深度对齐参数 (未启用深度融合时使用)
+        self.cfg.depth_align = CN()
+        self.cfg.depth_align.typical_disp_min_ratio = 0.01
+        self.cfg.depth_align.typical_disp_max_ratio = 0.15
+        self.cfg.depth_align.target_range_scale = 0.5
+        self.cfg.depth_align.scale_clamp_min = 0.8
+        self.cfg.depth_align.scale_clamp_max = 1.2
+        self.cfg.depth_align.min_depth = 0.1
 
         # 可视化配置
         self.cfg.visualization = CN()
@@ -129,6 +170,7 @@ class ConfigStereoHuman:
         self.cfg.visualization.save_features = False
         self.cfg.visualization.colormap = 'turbo'
         self.cfg.visualization.max_images = 4
+        self.cfg.visualization.layer_patch_size = 16
 
     def get_cfg(self):
         return self.cfg.clone()

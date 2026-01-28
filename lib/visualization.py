@@ -34,6 +34,7 @@ class TrainingVisualizer:
         """
         self.cfg = cfg
         self.save_dir = Path(save_dir)
+        self.img_range = getattr(getattr(cfg, 'dataset', None), 'img_range', None)
         
         # 从配置读取参数
         vis_cfg = getattr(cfg, 'visualization', None)
@@ -47,6 +48,7 @@ class TrainingVisualizer:
             self.save_features = getattr(vis_cfg, 'save_features', False)
             self.colormap = getattr(vis_cfg, 'colormap', 'turbo')
             self.max_images = getattr(vis_cfg, 'max_images', 4)
+            self.layer_patch_size = getattr(vis_cfg, 'layer_patch_size', 16)
         else:
             self.enabled = True
             self.vis_freq = 100
@@ -57,6 +59,7 @@ class TrainingVisualizer:
             self.save_features = False
             self.colormap = 'turbo'
             self.max_images = 4
+            self.layer_patch_size = 16
         
         # 创建子目录
         self.depth_dir = self.save_dir / 'depth'
@@ -118,7 +121,11 @@ class TrainingVisualizer:
     
     def _visualize_depth(self, data: Dict, prefix: str):
         """可视化深度图"""
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        has_wide = 'depth_wide' in data
+        ncols = 5 if has_wide else 4
+        fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
+        if ncols == 1:
+            axes = [axes]
         
         batch_idx = 0  # 只可视化第一个样本
         
@@ -141,22 +148,33 @@ class TrainingVisualizer:
             axes[1].imshow(depth_r_np)
             axes[1].set_title('Right Depth')
             axes[1].axis('off')
+
+        col_offset = 2
+        if has_wide:
+            depth_wide = data['depth_wide'][batch_idx]
+            if depth_wide.dim() == 3:
+                depth_wide = depth_wide[0]
+            depth_wide_np = self._depth_to_color(depth_wide)
+            axes[2].imshow(depth_wide_np)
+            axes[2].set_title('Wide FOV Depth')
+            axes[2].axis('off')
+            col_offset = 3
         
         # 左视图原始图像
         if 'lmain' in data and 'img' in data['lmain']:
             img_l = data['lmain']['img'][batch_idx]
             img_l_np = self._tensor_to_image(img_l)
-            axes[2].imshow(img_l_np)
-            axes[2].set_title('Left Image')
-            axes[2].axis('off')
+            axes[col_offset].imshow(img_l_np)
+            axes[col_offset].set_title('Left Image')
+            axes[col_offset].axis('off')
         
         # 右视图原始图像
         if 'rmain' in data and 'img' in data['rmain']:
             img_r = data['rmain']['img'][batch_idx]
             img_r_np = self._tensor_to_image(img_r)
-            axes[3].imshow(img_r_np)
-            axes[3].set_title('Right Image')
-            axes[3].axis('off')
+            axes[col_offset + 1].imshow(img_r_np)
+            axes[col_offset + 1].set_title('Right Image')
+            axes[col_offset + 1].axis('off')
         
         plt.tight_layout()
         plt.savefig(self.depth_dir / f'{prefix}_depth.jpg', dpi=150, bbox_inches='tight', pil_kwargs={'quality': 95})
@@ -178,63 +196,149 @@ class TrainingVisualizer:
             fig, axes = plt.subplots(2, 3, figsize=(15, 10))
             has_content = False
             
+            # 检查是否有多层参数格式
+            multilayer_params = view_data.get('multilayer_params')
+            
             # 第一行: 不透明度、缩放、旋转
-            # 注意: 键名是 'opacity_maps', 'scale_maps', 'rot_maps'
-            if 'opacity_maps' in view_data:
-                opacity = view_data['opacity_maps'][batch_idx]
-                if opacity.dim() == 3:
-                    opacity = opacity[0]  # 取第一个通道
-                opacity_np = opacity.detach().cpu().numpy()
-                im = axes[0, 0].imshow(opacity_np, cmap='viridis', vmin=0, vmax=1)
-                axes[0, 0].set_title(f'{view} Opacity')
-                axes[0, 0].axis('off')
-                plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
-                has_content = True
-            
-            if 'scale_maps' in view_data:
-                scales = view_data['scale_maps'][batch_idx]
-                if scales.dim() == 3:
-                    scale_mag = scales.norm(dim=0)  # 计算缩放的模
-                else:
-                    scale_mag = scales
-                scale_np = scale_mag.detach().cpu().numpy()
-                im = axes[0, 1].imshow(scale_np, cmap='plasma')
-                axes[0, 1].set_title(f'{view} Scale Magnitude')
-                axes[0, 1].axis('off')
-                plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
-                has_content = True
-            
-            if 'rot_maps' in view_data:
-                rotations = view_data['rot_maps'][batch_idx]
-                if rotations.dim() == 3:
-                    rot_w = rotations[0]  # 四元数的 w 分量
-                else:
-                    rot_w = rotations
-                rot_np = rot_w.detach().cpu().numpy()
-                im = axes[0, 2].imshow(rot_np, cmap='coolwarm', vmin=-1, vmax=1)
-                axes[0, 2].set_title(f'{view} Rotation (w)')
-                axes[0, 2].axis('off')
-                plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
-                has_content = True
-            
-            # 第二行: 有效点分布、深度、点云密度
-            if 'pts_valid' in view_data:
-                pts_valid = view_data['pts_valid'][batch_idx]
-                # 重塑为图像形状
-                if 'depth' in view_data:
-                    depth = view_data['depth'][batch_idx]
-                    if depth.dim() == 3:
-                        H, W = depth.shape[-2:]
-                    else:
-                        H, W = depth.shape
-                    if pts_valid.numel() == H * W:
-                        pts_valid_img = pts_valid.float().view(H, W)
-                        axes[1, 0].imshow(pts_valid_img.detach().cpu().numpy(), cmap='Greens')
-                        axes[1, 0].set_title(f'{view} Valid Points')
-                        axes[1, 0].axis('off')
+            if multilayer_params is not None:
+                # 新的多层格式: [B, C, L, H, W] 或 [B, 1, L, H, W]
+                if 'opacity' in multilayer_params:
+                    opacity = multilayer_params['opacity'][batch_idx]  # [1, L, H, W]
+                    # 可视化所有层的平均不透明度
+                    opacity_mean = opacity.squeeze(0).mean(dim=0)  # [H, W]
+                    opacity_np = opacity_mean.detach().cpu().numpy()
+                    im = axes[0, 0].imshow(opacity_np, cmap='viridis', vmin=0, vmax=1)
+                    axes[0, 0].set_title(f'{view} Opacity (mean over {opacity.shape[1]} layers)')
+                    axes[0, 0].axis('off')
+                    plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
+                    has_content = True
+                
+                if 'scale' in multilayer_params:
+                    scales = multilayer_params['scale'][batch_idx]  # [3, L, H, W]
+                    # 计算所有层的平均缩放模
+                    scale_mag = scales.norm(dim=0).mean(dim=0)  # [H, W]
+                    scale_np = scale_mag.detach().cpu().numpy()
+                    im = axes[0, 1].imshow(scale_np, cmap='plasma')
+                    axes[0, 1].set_title(f'{view} Scale Magnitude (mean)')
+                    axes[0, 1].axis('off')
+                    plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
+                    has_content = True
+                
+                if 'rotation' in multilayer_params:
+                    rotations = multilayer_params['rotation'][batch_idx]  # [4, L, H, W]
+                    # 可视化第一层的 w 分量
+                    rot_w = rotations[0, 0]  # [H, W]
+                    rot_np = rot_w.detach().cpu().numpy()
+                    im = axes[0, 2].imshow(rot_np, cmap='coolwarm', vmin=-1, vmax=1)
+                    axes[0, 2].set_title(f'{view} Rotation w (layer 0)')
+                    axes[0, 2].axis('off')
+                    plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
+                    has_content = True
+            else:
+                # 旧格式兼容
+                if 'opacity_maps' in view_data:
+                    opacity = view_data['opacity_maps'][batch_idx]
+                    if opacity.dim() == 1:  # [N] 展平格式
+                        # 尝试重塑为图像
+                        if 'depth' in view_data:
+                            depth = view_data['depth'][batch_idx]
+                            if depth.dim() >= 2:
+                                H, W = depth.shape[-2:]
+                                N = opacity.numel()
+                                L = N // (H * W) if H * W > 0 else 1
+                                if N == L * H * W:
+                                    opacity = opacity.view(L, H, W).mean(dim=0)
+                    elif opacity.dim() == 2:  # [N, 1]
+                        if 'depth' in view_data:
+                            depth = view_data['depth'][batch_idx]
+                            if depth.dim() >= 2:
+                                H, W = depth.shape[-2:]
+                                opacity = opacity.squeeze(-1)
+                                N = opacity.numel()
+                                L = N // (H * W) if H * W > 0 else 1
+                                if N == L * H * W:
+                                    opacity = opacity.view(L, H, W).mean(dim=0)
+                    elif opacity.dim() == 3:
+                        opacity = opacity[0]
+                    
+                    if opacity.dim() == 2:
+                        opacity_np = opacity.detach().cpu().numpy()
+                        im = axes[0, 0].imshow(opacity_np, cmap='viridis', vmin=0, vmax=1)
+                        axes[0, 0].set_title(f'{view} Opacity')
+                        axes[0, 0].axis('off')
+                        plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
                         has_content = True
             
-            if 'depth' in view_data:
+            # 第二行: 有效点分布、纹理复杂度、点云统计
+            valid_mask = view_data.get('valid_mask')
+            if valid_mask is not None:
+                # [B, L, H, W] 格式
+                vm = valid_mask[batch_idx]  # [L, H, W]
+                if vm.dim() == 3:
+                    # 可视化每像素的有效层数
+                    layers_per_pixel = vm.float().sum(dim=0)  # [H, W]
+                    L = vm.shape[0]
+                    patch_size = int(self.layer_patch_size)
+                    patch_size = max(1, min(patch_size, layers_per_pixel.shape[-2], layers_per_pixel.shape[-1]))
+                    if patch_size > 1:
+                        pooled = F.avg_pool2d(
+                            layers_per_pixel.unsqueeze(0).unsqueeze(0),
+                            kernel_size=patch_size,
+                            stride=patch_size
+                        )
+                        patch_map = F.interpolate(
+                            pooled, size=layers_per_pixel.shape[-2:],
+                            mode='nearest'
+                        ).squeeze(0).squeeze(0)
+                    else:
+                        patch_map = layers_per_pixel
+                    im = axes[1, 0].imshow(patch_map.detach().cpu().numpy(), cmap='Greens', vmin=0, vmax=L)
+                    axes[1, 0].set_title(f'{view} Layer Count Patches (patch={patch_size})')
+                    axes[1, 0].axis('off')
+                    plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+                    has_content = True
+            elif 'pts_valid' in view_data:
+                pts_valid = view_data['pts_valid'][batch_idx]
+                if 'depth' in view_data:
+                    depth = view_data['depth'][batch_idx]
+                    if depth.dim() >= 2:
+                        H, W = depth.shape[-2:]
+                        N = pts_valid.numel()
+                        L = N // (H * W) if H * W > 0 else 1
+                        if N == L * H * W:
+                            pts_valid_layers = pts_valid.float().view(L, H, W)
+                            layers_per_pixel = pts_valid_layers.sum(dim=0)
+                            patch_size = int(self.layer_patch_size)
+                            patch_size = max(1, min(patch_size, H, W))
+                            if patch_size > 1:
+                                pooled = F.avg_pool2d(
+                                    layers_per_pixel.unsqueeze(0).unsqueeze(0),
+                                    kernel_size=patch_size,
+                                    stride=patch_size
+                                )
+                                patch_map = F.interpolate(
+                                    pooled, size=(H, W),
+                                    mode='nearest'
+                                ).squeeze(0).squeeze(0)
+                            else:
+                                patch_map = layers_per_pixel
+                            im = axes[1, 0].imshow(patch_map.detach().cpu().numpy(), cmap='Greens', vmin=0, vmax=L)
+                            axes[1, 0].set_title(f'{view} Layer Count Patches (patch={patch_size})')
+                            axes[1, 0].axis('off')
+                            plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+                            has_content = True
+            
+            # 纹理复杂度
+            texture = view_data.get('texture_complexity')
+            if texture is not None:
+                tex = texture[batch_idx]
+                if tex.dim() == 3:
+                    tex = tex[0]
+                axes[1, 1].imshow(tex.detach().cpu().numpy(), cmap='hot', vmin=0, vmax=1)
+                axes[1, 1].set_title(f'{view} Texture Complexity')
+                axes[1, 1].axis('off')
+                has_content = True
+            elif 'depth' in view_data:
                 depth = view_data['depth'][batch_idx]
                 if depth.dim() == 3:
                     depth = depth[0]
@@ -328,9 +432,27 @@ class TrainingVisualizer:
             if 'opacity_maps' not in data[view]:
                 continue
             
-            opacity = data[view]['opacity_maps'][batch_idx]
-            if opacity.dim() == 3:
-                opacity = opacity[0]  # 取第一个通道
+            # 优先使用多层格式
+            if 'multilayer_params' in data[view] and 'opacity' in data[view]['multilayer_params']:
+                opacity = data[view]['multilayer_params']['opacity'][batch_idx]  # [1, L, H, W]
+                opacity = opacity.squeeze(0).mean(dim=0)  # [H, W]
+            else:
+                opacity = data[view]['opacity_maps'][batch_idx]
+                if opacity.dim() == 3:
+                    opacity = opacity[0]
+                elif opacity.dim() == 2:
+                    opacity = opacity.squeeze(-1)
+                elif opacity.dim() == 1 and 'depth' in data[view]:
+                    depth = data[view]['depth'][batch_idx]
+                    if depth.dim() >= 2:
+                        H, W = depth.shape[-2:]
+                        N = opacity.numel()
+                        if H * W > 0 and N % (H * W) == 0:
+                            L = N // (H * W)
+                            opacity = opacity.view(L, H, W).mean(dim=0)
+            
+            if opacity.dim() != 2:
+                continue
             
             opacity_np = opacity.detach().cpu().numpy()
             
@@ -421,7 +543,10 @@ class TrainingVisualizer:
         img_np = img.numpy()
         
         # 归一化到 [0, 1]
-        if img_np.max() > 1.0:
+        if self.img_range is not None and len(self.img_range) == 2:
+            img_min, img_max = self.img_range
+            img_np = (img_np - img_min) / (img_max - img_min)
+        elif img_np.max() > 1.0:
             img_np = img_np / 255.0
         
         img_np = np.clip(img_np, 0, 1)

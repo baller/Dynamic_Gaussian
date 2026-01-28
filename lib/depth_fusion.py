@@ -26,10 +26,6 @@ from typing import Tuple, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# 是否使用梯度检查点 (全局开关)
-USE_GRADIENT_CHECKPOINT = True
-
-
 class DepthFusionModule(nn.Module):
     """
     深度联合优化模块
@@ -51,11 +47,17 @@ class DepthFusionModule(nn.Module):
             self.num_heads = getattr(fusion_cfg, 'num_heads', 8)
             self.dropout = getattr(fusion_cfg, 'dropout', 0.1)
             self.num_sparse_points = getattr(fusion_cfg, 'num_sparse_points', 128)
+            self.use_gradient_checkpoint = getattr(fusion_cfg, 'use_gradient_checkpoint', True)
+            self.wide_fov_enable = getattr(fusion_cfg, 'wide_fov_enable', False)
+            self.wide_fov_mode = getattr(fusion_cfg, 'wide_fov_mode', 'concat')
         else:
             self.feat_dim = 256
             self.num_heads = 8
             self.dropout = 0.1
             self.num_sparse_points = 128
+            self.use_gradient_checkpoint = True
+            self.wide_fov_enable = False
+            self.wide_fov_mode = 'concat'
         
         # DA3 特征维度 - 根据模型类型动态设置
         if da3_feat_dim is not None:
@@ -93,11 +95,14 @@ class DepthFusionModule(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        # Cross-View Attention
+        # Cross-View Attention (使用更激进的下采样以节省显存)
+        # 从配置读取下采样因子，默认 16
+        attn_downsample = getattr(fusion_cfg, 'attention_downsample', 16) if fusion_cfg else 16
         self.cross_attention = CrossViewAttention(
             dim=self.feat_dim,
             num_heads=self.num_heads,
-            dropout=self.dropout
+            dropout=self.dropout,
+            downsample_factor=attn_downsample
         )
         
         # 稀疏相关性模块
@@ -200,7 +205,7 @@ class DepthFusionModule(nn.Module):
         combined_r = depth_feat_r + feat_r_proj
         
         # 4. Cross-View Attention (使用梯度检查点)
-        if USE_GRADIENT_CHECKPOINT and self.training:
+        if self.use_gradient_checkpoint and self.training:
             enhanced_l, enhanced_r = checkpoint(
                 self._cross_attention_forward, combined_l, combined_r,
                 use_reentrant=False
@@ -239,7 +244,8 @@ class DepthFusionModule(nn.Module):
         
         # 最终深度 = 平均深度 + 残差
         depth_avg = (depth_l_metric + depth_r_metric) / 2
-        depth_fused = depth_avg + depth_residual * 0.1  # 缩放残差
+        residual_weight = getattr(getattr(self.cfg, 'depth_fusion', None), 'residual_weight', 0.1)
+        depth_fused = depth_avg + depth_residual * residual_weight
         depth_fused = F.relu(depth_fused) + 1e-6  # 确保正值
         
         # 置信度 (sigmoid)
@@ -254,6 +260,15 @@ class DepthFusionModule(nn.Module):
             'sparse_disparities': sparse_output['disparities'],
             'sparse_points': sparse_output['points'],
         }
+
+        # 宽视场角深度图（可选）
+        if self.wide_fov_enable:
+            if self.wide_fov_mode == 'concat':
+                depth_wide = torch.cat([depth_l_metric, depth_r_metric], dim=-1)
+            else:
+                depth_wide = torch.cat([depth_l_metric, depth_r_metric], dim=-1)
+            aux_outputs['depth_wide'] = depth_wide
+            aux_outputs['depth_wide_mode'] = self.wide_fov_mode
         
         return depth_fused, confidence, aux_outputs
     
