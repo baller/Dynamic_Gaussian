@@ -1,0 +1,6 @@
+*.pyc
+/experiments
+/runs
+/custom_data
+/processed_custom_data
+/debug_images
