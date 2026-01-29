@@ -119,12 +119,44 @@ class GaussianTransformerMoE(nn.Module):
                    f"num_experts={self.num_experts}, num_gaussian_layers={self.num_gaussian_layers}")
     
     def _init_output_heads(self):
-        """初始化输出头，使用较小的初始值"""
+        """
+        正确初始化输出头，避免梯度死亡和 NaN
+        
+        问题1: Scale 头 - softplus(0) ≈ 0.693 > max_scale，被 clamp 后梯度为 0
+        解决: 初始化偏置为负数，使 softplus 输出 < max_scale
+        
+        问题2: Rotation 头 - normalize([0,0,0,0]) = NaN (除以零)
+        解决: 初始化偏置为单位四元数 [1, 0, 0, 0]
+        """
+        L = self.num_gaussian_layers
+        
         for name, head in self.output_heads.items():
             if isinstance(head, nn.Conv2d):
                 nn.init.zeros_(head.weight)
+                
                 if head.bias is not None:
-                    nn.init.zeros_(head.bias)
+                    if name == 'scale':
+                        # Scale: 使 softplus 输出在 max_scale 范围内
+                        import math
+                        target_scale = self.max_scale / 2
+                        if target_scale < 20:
+                            init_bias = math.log(math.exp(target_scale) - 1) if target_scale > 0.01 else -7.0
+                        else:
+                            init_bias = target_scale
+                        nn.init.constant_(head.bias, init_bias)
+                        logger.info(f"[GaussianTransformerMoE] Scale head bias = {init_bias:.4f}")
+                    
+                    elif name == 'rotation':
+                        # Rotation: 单位四元数 [1, 0, 0, 0]
+                        bias_data = torch.zeros(4 * L)
+                        for layer_idx in range(L):
+                            bias_data[layer_idx * 4 + 0] = 1.0  # w = 1
+                        head.bias.data = bias_data
+                        logger.info(f"[GaussianTransformerMoE] Rotation head initialized to unit quaternions")
+                    
+                    else:
+                        # Opacity, depth_offset, texture_complexity: 零偏置即可
+                        nn.init.zeros_(head.bias)
 
     def _transformer_block_forward(self, block, x, x_other=None):
         """可被checkpoint包装的transformer block前向"""
@@ -701,6 +733,108 @@ class GaussianTransformerMoESimple(nn.Module):
             nn.Conv2d(self.head_dim, 1, kernel_size=1),
             nn.Sigmoid()
         )
+        
+        # 位置残差: [B, 3*L, H, W] -> [B, 3, L, H, W] - 新增
+        self.xyz_offset_head = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, self.head_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.head_dim, 3 * L, kernel_size=1),
+        )
+        
+        # 读取位置残差最大值
+        self.max_xyz_offset = getattr(gs_cfg, 'max_xyz_offset', 0.1) if gs_cfg else 0.1
+        
+        # 关键：正确初始化输出头以避免梯度死亡和 NaN
+        self._init_output_heads()
+    
+    def _init_output_heads(self):
+        """
+        正确初始化输出头，避免梯度死亡和 NaN
+        
+        问题1: Scale 头 - softplus(0) ≈ 0.693 > max_scale，被 clamp 后梯度为 0
+        解决: 初始化偏置为负数，使 softplus 输出 < max_scale
+        
+        问题2: Rotation 头 - normalize([0,0,0,0]) = NaN (除以零)
+        解决: 初始化偏置为单位四元数 [1, 0, 0, 0]
+        """
+        L = self.num_gaussian_layers
+        
+        # --- Scale 头初始化 ---
+        # 目标: 初始 scale ≈ max_scale / 2
+        # softplus(x) = ln(1 + e^x) = target
+        # e^x = e^target - 1
+        # x = ln(e^target - 1)
+        target_scale = self.max_scale / 2
+        import math
+        # 计算 softplus 反函数: softplus_inv(y) = ln(e^y - 1)
+        # 需要 e^y > 1，即 y > 0
+        if target_scale > 0.001:  # 有效范围
+            # softplus_inv(target_scale)
+            exp_target = math.exp(target_scale)
+            if exp_target > 1.001:  # 确保 ln 参数为正
+                init_bias = math.log(exp_target - 1)
+            else:
+                init_bias = -5.0  # 对应 softplus(-5) ≈ 0.007
+        else:
+            init_bias = -7.0  # 对应 softplus(-7) ≈ 0.001
+        
+        # 找到 scale_head 的最后一个 Conv2d 并设置偏置
+        for module in reversed(list(self.scale_head.modules())):
+            if isinstance(module, nn.Conv2d):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, init_bias)
+                logger.info(f"[GaussianTransformerMoESimple] Scale head bias initialized to {init_bias:.4f}, "
+                           f"softplus({init_bias:.4f}) = {math.log(1 + math.exp(init_bias)):.6f}")
+                break
+        
+        # --- Rotation 头初始化 ---
+        # 目标: 初始四元数 = [1, 0, 0, 0] (单位四元数，无旋转)
+        # 输出形状: [B, 4*L, H, W]，需要每层的 4 个通道分别为 [1, 0, 0, 0]
+        for module in reversed(list(self.rot_head.modules())):
+            if isinstance(module, nn.Conv2d):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    # bias shape: [4*L]
+                    # 每 4 个通道: [w, x, y, z] = [1, 0, 0, 0]
+                    bias_data = torch.zeros(4 * L)
+                    for layer_idx in range(L):
+                        bias_data[layer_idx * 4 + 0] = 1.0  # w = 1
+                        # x, y, z 保持 0
+                    module.bias.data = bias_data
+                logger.info(f"[GaussianTransformerMoESimple] Rotation head initialized to unit quaternions")
+                break
+        
+        # --- Opacity 头初始化 ---
+        # 目标: sigmoid 输出约 0.5 (中间值，便于双向学习)
+        # sigmoid(0) = 0.5，所以 bias = 0 即可
+        for module in reversed(list(self.opacity_head.modules())):
+            if isinstance(module, nn.Conv2d):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                break
+        
+        # --- Depth offset 头初始化 ---
+        # 目标: tanh 输出约 0 (无偏移)
+        # tanh(0) = 0，所以 bias = 0 即可
+        for module in reversed(list(self.depth_head.modules())):
+            if isinstance(module, nn.Conv2d):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                break
+        
+        # --- XYZ offset 头初始化 ---
+        # 目标: tanh 输出约 0 (无位置偏移)
+        # tanh(0) = 0，所以 bias = 0 即可
+        for module in reversed(list(self.xyz_offset_head.modules())):
+            if isinstance(module, nn.Conv2d):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                logger.info(f"[GaussianTransformerMoESimple] XYZ offset head initialized to zeros, max_offset={self.max_xyz_offset}")
+                break
     
     def _transformer_block_forward(self, block, x, x_other=None):
         """可被checkpoint包装的transformer block前向"""
@@ -777,12 +911,14 @@ class GaussianTransformerMoESimple(nn.Module):
         opacity_out = self.opacity_head(x)  # [B, L, H, W]
         depth_out = self.depth_head(x)  # [B, L, H, W]
         texture_out = self.texture_head(x)  # [B, 1, H, W]
+        xyz_offset_out = self.xyz_offset_head(x)  # [B, 3*L, H, W]
         
         # 重塑为多层格式: [B, C, L, H, W]
         rotation = rot_out.view(B, 4, L, H, W)
         scale = scale_out.view(B, 3, L, H, W)
         opacity = opacity_out.view(B, L, H, W).unsqueeze(1)  # [B, 1, L, H, W]
         depth_offset = depth_out.view(B, L, H, W).unsqueeze(1)  # [B, 1, L, H, W]
+        xyz_offset = xyz_offset_out.view(B, 3, L, H, W)  # [B, 3, L, H, W]
         
         # 应用激活函数
         # 四元数归一化 - 对每层分别处理
@@ -802,11 +938,15 @@ class GaussianTransformerMoESimple(nn.Module):
         )
         depth_offset = torch.tanh(depth_offset) * max_depth_offset
         
+        # 位置残差 - 使用 tanh 限制范围
+        xyz_offset = torch.tanh(xyz_offset) * self.max_xyz_offset
+        
         return {
             'rotation': rotation,           # [B, 4, L, H, W]
             'scale': scale,                 # [B, 3, L, H, W]
             'opacity': opacity,             # [B, 1, L, H, W]
             'depth_offset': depth_offset,   # [B, 1, L, H, W]
+            'xyz_offset': xyz_offset,       # [B, 3, L, H, W] - 新增
             'texture_complexity': texture_out,  # [B, 1, H, W]
             'load_balance_loss': total_lb_loss,
         }

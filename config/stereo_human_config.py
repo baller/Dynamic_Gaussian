@@ -64,6 +64,7 @@ class ConfigStereoHuman:
         self.cfg.da3.freeze_backbone = True
         self.cfg.da3.mixed_precision = False
         self.cfg.da3.use_feature_adapter = True  # 是否使用特征适配器
+        self.cfg.da3.use_left_depth_only = True  # 只使用左视图深度
 
         # 深度融合配置
         self.cfg.depth_fusion = CN()
@@ -91,6 +92,7 @@ class ConfigStereoHuman:
         self.cfg.gs_transformer.num_gaussian_layers = 3
         self.cfg.gs_transformer.max_scale = 0.002
         self.cfg.gs_transformer.max_depth_offset = 0.5
+        self.cfg.gs_transformer.max_xyz_offset = 0.1  # 位置残差最大值 (米)
         self.cfg.gs_transformer.downsample_factor = 4  # 下采样因子，节省显存
         self.cfg.gs_transformer.use_gradient_checkpoint = True
         
@@ -124,6 +126,10 @@ class ConfigStereoHuman:
         self.cfg.loss.moe_balance_weight = 0.01
         self.cfg.loss.allocation_entropy_weight = 0.001
         self.cfg.loss.allocation_correlation_weight = 0.5
+        # 新增正则化配置
+        self.cfg.loss.xyz_offset_reg_weight = 0.05  # 位置残差正则化权重
+        self.cfg.loss.scale_reg_weight = 0.1        # Scale 正则化权重
+        self.cfg.loss.scale_target = 0.001          # Scale 目标值
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None

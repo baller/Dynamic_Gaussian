@@ -354,7 +354,15 @@ class CombinedLoss(nn.Module):
                 loss_dict['depth_consistency'] = dc_loss.item()
         
         # MoE 负载均衡损失 (如果使用 Transformer+MoE)
-        if 'moe_router_weights' in data and self.moe_balance_weight > 0:
+        # 优先使用模型已计算好的 load_balance_loss
+        if 'moe_load_balance_loss' in data and self.moe_balance_weight > 0:
+            moe_loss = data['moe_load_balance_loss']
+            if isinstance(moe_loss, torch.Tensor) and moe_loss.numel() > 0:
+                moe_loss_val = moe_loss if moe_loss.dim() == 0 else moe_loss.mean()
+                total_loss = total_loss + self.moe_balance_weight * moe_loss_val
+                loss_dict['moe_balance'] = moe_loss_val.item()
+        # 备选: 使用 router_weights 重新计算 (兼容旧接口)
+        elif 'moe_router_weights' in data and self.moe_balance_weight > 0:
             router_weights = data['moe_router_weights']
             if isinstance(router_weights, list) and len(router_weights) > 0:
                 moe_loss = sum(self.moe_balance_loss(rw) for rw in router_weights)

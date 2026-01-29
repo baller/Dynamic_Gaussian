@@ -377,32 +377,39 @@ class TrainingVisualizer:
         
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         
-        # 预测图像
+        # 预测图像 - 渲染输出已经在 [0, 1] 范围，不需要 img_range 转换
         if 'img_pred' in novel_data:
             img_pred = novel_data['img_pred'][batch_idx]
-            img_pred_np = self._tensor_to_image(img_pred)
+            img_pred_np = self._tensor_to_image(img_pred, use_img_range=False)
             axes[0].imshow(img_pred_np)
             axes[0].set_title('Predicted Novel View')
             axes[0].axis('off')
         
-        # GT 图像
+        # GT 图像 - 来自数据集，使用 img_range 转换
         if 'img' in novel_data:
             img_gt = novel_data['img'][batch_idx]
-            img_gt_np = self._tensor_to_image(img_gt)
+            img_gt_np = self._tensor_to_image(img_gt, use_img_range=True)
             axes[1].imshow(img_gt_np)
             axes[1].set_title('Ground Truth')
             axes[1].axis('off')
         
-        # 差异图
+        # 差异图 - 需要将两者都转换到 [0, 1] 范围再比较
         if 'img_pred' in novel_data and 'img' in novel_data:
-            img_pred = novel_data['img_pred'][batch_idx]
-            img_gt = novel_data['img'][batch_idx]
+            img_pred = novel_data['img_pred'][batch_idx]  # 已经在 [0, 1]
+            img_gt = novel_data['img'][batch_idx]  # 在 img_range (如 [-1, 1])
             
             # 确保在同一设备
             if img_pred.device != img_gt.device:
                 img_gt = img_gt.to(img_pred.device)
             
-            diff = (img_pred - img_gt).abs()
+            # 将 GT 归一化到 [0, 1]
+            if self.img_range is not None and len(self.img_range) == 2:
+                img_min, img_max = self.img_range
+                img_gt_normalized = (img_gt - img_min) / (img_max - img_min)
+            else:
+                img_gt_normalized = img_gt
+            
+            diff = (img_pred - img_gt_normalized).abs()
             diff_np = diff.mean(dim=0).detach().cpu().numpy()  # 平均通道
             
             # 归一化差异
@@ -529,8 +536,16 @@ class TrainingVisualizer:
         
         return depth_colored
     
-    def _tensor_to_image(self, tensor: torch.Tensor) -> np.ndarray:
-        """将张量转换为 numpy 图像"""
+    def _tensor_to_image(self, tensor: torch.Tensor, use_img_range: bool = True) -> np.ndarray:
+        """
+        将张量转换为 numpy 图像
+        
+        Args:
+            tensor: 输入张量
+            use_img_range: 是否使用 img_range 进行归一化
+                - True: 用于原始图像数据 (来自数据集，如 [-1, 1])
+                - False: 用于渲染输出 (已经在 [0, 1] 范围)
+        """
         img = tensor.detach().cpu()
         
         # 处理维度
@@ -543,7 +558,7 @@ class TrainingVisualizer:
         img_np = img.numpy()
         
         # 归一化到 [0, 1]
-        if self.img_range is not None and len(self.img_range) == 2:
+        if use_img_range and self.img_range is not None and len(self.img_range) == 2:
             img_min, img_max = self.img_range
             img_np = (img_np - img_min) / (img_max - img_min)
         elif img_np.max() > 1.0:

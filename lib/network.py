@@ -171,132 +171,227 @@ class RtStereoHumanModel(nn.Module):
             return data, flow_loss, metrics
     
     def forward_da3(self, data, is_train=True):
-        """DA3 模式的前向传播"""
+        """DA3 模式的前向传播
+        
+        简化流程：只使用左视图深度作为统一深度，节省计算并提升一致性
+        """
         bs = data['lmain']['img'].shape[0]
+        
+        # 检查是否只使用左视图深度
+        use_left_depth_only = getattr(
+            getattr(self.cfg, 'da3', None), 
+            'use_left_depth_only', True  # 默认只用左视图
+        )
         
         # 合并左右视图图像
         image = torch.cat([data['lmain']['img'], data['rmain']['img']], dim=0)
-        image_da3 = self._normalize_for_da3(image)
         
-        # 使用 DA3 估计深度和提取特征
-        da3_output = self.da3_estimator(image_da3, return_features=True, return_entropy=True)
-        
-        # 获取深度图
-        depth = da3_output['depth']  # [2*B, 1, H, W]
-        l_depth, r_depth = torch.split(depth, [bs, bs])
-        
-        # 存储原始单目深度
-        data['lmain']['depth_mono'] = l_depth
-        data['rmain']['depth_mono'] = r_depth
-        
-        # 创建伪 flow_pred (用于兼容性)
-        H, W = l_depth.shape[-2:]
-        data['lmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=l_depth.device)
-        data['rmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=r_depth.device)
-        
-        # 存储熵图（纹理复杂度）
-        if 'entropy' in da3_output:
-            entropy = da3_output['entropy']
-            l_entropy, r_entropy = torch.split(entropy, [bs, bs])
-            data['lmain']['entropy'] = l_entropy
-            data['rmain']['entropy'] = r_entropy
-        
-        # 获取 DA3 特征
-        da3_features = da3_output.get('features', None)
-        l_da3_feat = None
-        r_da3_feat = None
-        if da3_features is not None and len(da3_features) > 0:
-            # 使用最后一层特征作为主特征
-            main_feat = da3_features[-1]  # [2*B, C, H', W']
-            l_da3_feat, r_da3_feat = torch.split(main_feat, [bs, bs])
-        
-        # 深度融合
-        flow_loss = None
-        metrics = {}
-        fusion_aux = {}
-        
-        if self.use_depth_fusion and self.depth_fusion is not None and l_da3_feat is not None:
-            # 计算基线距离
-            baseline = self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
+        if use_left_depth_only:
+            # ========== 只使用左视图深度 ==========
+            # 只对左视图进行 DA3 推理 (节省一半计算)
+            l_image = data['lmain']['img']
+            l_image_da3 = self._normalize_for_da3(l_image)
             
-            # 深度融合
-            depth_fused_l, conf_l, aux_l = self.depth_fusion(
-                l_depth, r_depth, l_da3_feat, r_da3_feat,
-                intrinsics=data['lmain']['intr'],
-                baseline=baseline
-            )
-            depth_fused_r, conf_r, aux_r = self.depth_fusion(
-                r_depth, l_depth, r_da3_feat, l_da3_feat,
-                intrinsics=data['rmain']['intr'],
-                baseline=baseline
-            )
+            da3_output = self.da3_estimator(l_image_da3, return_features=True, return_entropy=True)
             
-            # 使用融合后的深度（可选 warmup 混合）
-            blend_iters = getattr(getattr(self.cfg, 'depth_fusion', None), 'blend_warmup_iters', 0)
-            step = data.get('global_step', None)
-            if step is not None and blend_iters > 0:
-                alpha = min(1.0, float(step) / float(blend_iters))
+            # 获取左视图深度
+            l_depth = da3_output['depth']  # [B, 1, H, W]
+            
+            # 右视图使用左视图深度 (统一深度)
+            r_depth = l_depth.clone()
+            
+            # 存储原始单目深度
+            data['lmain']['depth_mono'] = l_depth
+            data['rmain']['depth_mono'] = r_depth  # 与左视图相同
+            
+            # 创建伪 flow_pred (用于兼容性)
+            H, W = l_depth.shape[-2:]
+            data['lmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=l_depth.device)
+            data['rmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=l_depth.device)
+            
+            # 存储熵图（纹理复杂度）
+            if 'entropy' in da3_output:
+                l_entropy = da3_output['entropy']
+                data['lmain']['entropy'] = l_entropy
+                data['rmain']['entropy'] = l_entropy.clone()  # 使用相同熵图
+            
+            # 获取 DA3 特征 (只有左视图)
+            da3_features = da3_output.get('features', None)
+            l_da3_feat = None
+            if da3_features is not None and len(da3_features) > 0:
+                l_da3_feat = da3_features[-1]  # [B, C, H', W']
+            
+            # 深度处理
+            flow_loss = None
+            metrics = {}
+            
+            if self.use_depth_fusion and self.depth_fusion is not None and l_da3_feat is not None:
+                # 深度融合：只对左视图进行处理
+                baseline = self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
+                
+                # 使用左视图深度与自身进行"自融合" (主要用于尺度校正)
+                depth_fused_l, conf_l, aux_l = self.depth_fusion(
+                    l_depth, l_depth, l_da3_feat, l_da3_feat,  # 左视图自融合
+                    intrinsics=data['lmain']['intr'],
+                    baseline=baseline
+                )
+                
+                # Warmup 混合
+                blend_iters = getattr(getattr(self.cfg, 'depth_fusion', None), 'blend_warmup_iters', 0)
+                step = data.get('global_step', None)
+                alpha = min(1.0, float(step) / float(blend_iters)) if step is not None and blend_iters > 0 else 1.0
+                
+                unified_depth = (1.0 - alpha) * l_depth + alpha * depth_fused_l
+                
+                data['lmain']['depth_fused'] = depth_fused_l
+                data['rmain']['depth_fused'] = depth_fused_l  # 右视图使用相同融合深度
+                data['lmain']['depth'] = unified_depth
+                data['rmain']['depth'] = unified_depth  # 统一深度
+                data['lmain']['depth_conf'] = conf_l
+                data['rmain']['depth_conf'] = conf_l
+                
+                # 存储融合辅助输出
+                data['fusion_aux'] = {
+                    'scale_l': aux_l['scale'],
+                    'scale_r': aux_l['scale'],  # 相同
+                    'shift_l': aux_l['shift'],
+                    'shift_r': aux_l['shift'],
+                    'depth_l_metric': aux_l['depth_l_metric'],
+                    'depth_r_metric': aux_l['depth_l_metric'],  # 相同
+                }
+                if 'depth_wide' in aux_l:
+                    data['depth_wide'] = aux_l['depth_wide']
+                
+                logger.debug(f"[DepthFusion] scale_l={aux_l['scale'].mean().item():.4f} (left-only mode)")
             else:
-                alpha = 1.0
-
-            data['lmain']['depth_fused'] = depth_fused_l
-            data['rmain']['depth_fused'] = depth_fused_r
-            data['lmain']['depth'] = (1.0 - alpha) * l_depth + alpha * depth_fused_l
-            data['rmain']['depth'] = (1.0 - alpha) * r_depth + alpha * depth_fused_r
-            data['lmain']['depth_conf'] = conf_l
-            data['rmain']['depth_conf'] = conf_r
+                # 不使用深度融合时，直接使用左视图深度进行尺度对齐
+                l_depth_aligned = self._align_single_depth(
+                    l_depth, 
+                    data['lmain']['mask'],
+                    data['lmain']['intr'], 
+                    self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
+                )
+                data['lmain']['depth'] = l_depth_aligned
+                data['rmain']['depth'] = l_depth_aligned  # 统一深度
             
-            # 存储融合辅助输出 (用于loss计算)
-            fusion_aux = {
-                'scale_l': aux_l['scale'],
-                'scale_r': aux_r['scale'],
-                'shift_l': aux_l['shift'],
-                'shift_r': aux_r['shift'],
-                'depth_l_metric': aux_l['depth_l_metric'],
-                'depth_r_metric': aux_r['depth_r_metric'],
-            }
-            if 'depth_wide' in aux_l:
-                data['depth_wide'] = aux_l['depth_wide']
-                fusion_aux['depth_wide_mode'] = aux_l.get('depth_wide_mode', 'concat')
-            data['fusion_aux'] = fusion_aux
+            # 准备特征用于高斯参数预测
+            if da3_features is not None and self.feature_adapter is not None:
+                with torch.no_grad():
+                    ref_feat = self.img_encoder(image)
+                target_sizes = [f.shape[-2:] for f in ref_feat]
+                
+                # 复制左视图特征给右视图
+                adapted_features = []
+                for feat in da3_features:
+                    # feat: [B, C, H', W'] (只有左视图)
+                    # 复制为左右: [2B, C, H', W']
+                    adapted_features.append(torch.cat([feat, feat], dim=0))
+                
+                img_feat = self.feature_adapter(adapted_features, target_sizes)
+                img_feat = tuple(img_feat)
+            else:
+                with autocast(enabled=self.cfg.raft.mixed_precision):
+                    img_feat = self.img_encoder(image)
             
-            logger.debug(f"[DepthFusion] scale_l={aux_l['scale'].mean().item():.4f}, "
-                        f"scale_r={aux_r['scale'].mean().item():.4f}")
         else:
-            # 不使用深度融合时，进行简单的深度对齐
-            # DA3 输出相对深度，需要对齐左右视图的尺度
-            l_depth_aligned, r_depth_aligned = self._align_stereo_depth(
-                l_depth, r_depth, 
-                data['lmain']['mask'], data['rmain']['mask'],
-                data['lmain']['intr'], 
-                self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
-            )
-            data['lmain']['depth'] = l_depth_aligned
-            data['rmain']['depth'] = r_depth_aligned
+            # ========== 原始双视图模式 ==========
+            image_da3 = self._normalize_for_da3(image)
+            da3_output = self.da3_estimator(image_da3, return_features=True, return_entropy=True)
+            
+            depth = da3_output['depth']  # [2*B, 1, H, W]
+            l_depth, r_depth = torch.split(depth, [bs, bs])
+            
+            data['lmain']['depth_mono'] = l_depth
+            data['rmain']['depth_mono'] = r_depth
+            
+            H, W = l_depth.shape[-2:]
+            data['lmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=l_depth.device)
+            data['rmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=r_depth.device)
+            
+            if 'entropy' in da3_output:
+                entropy = da3_output['entropy']
+                l_entropy, r_entropy = torch.split(entropy, [bs, bs])
+                data['lmain']['entropy'] = l_entropy
+                data['rmain']['entropy'] = r_entropy
+            
+            da3_features = da3_output.get('features', None)
+            l_da3_feat = None
+            r_da3_feat = None
+            if da3_features is not None and len(da3_features) > 0:
+                main_feat = da3_features[-1]
+                l_da3_feat, r_da3_feat = torch.split(main_feat, [bs, bs])
+            
+            flow_loss = None
+            metrics = {}
+            
+            if self.use_depth_fusion and self.depth_fusion is not None and l_da3_feat is not None:
+                baseline = self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
+                
+                depth_fused_l, conf_l, aux_l = self.depth_fusion(
+                    l_depth, r_depth, l_da3_feat, r_da3_feat,
+                    intrinsics=data['lmain']['intr'],
+                    baseline=baseline
+                )
+                depth_fused_r, conf_r, aux_r = self.depth_fusion(
+                    r_depth, l_depth, r_da3_feat, l_da3_feat,
+                    intrinsics=data['rmain']['intr'],
+                    baseline=baseline
+                )
+                
+                blend_iters = getattr(getattr(self.cfg, 'depth_fusion', None), 'blend_warmup_iters', 0)
+                step = data.get('global_step', None)
+                alpha = min(1.0, float(step) / float(blend_iters)) if step is not None and blend_iters > 0 else 1.0
+
+                data['lmain']['depth_fused'] = depth_fused_l
+                data['rmain']['depth_fused'] = depth_fused_r
+                data['lmain']['depth'] = (1.0 - alpha) * l_depth + alpha * depth_fused_l
+                data['rmain']['depth'] = (1.0 - alpha) * r_depth + alpha * depth_fused_r
+                data['lmain']['depth_conf'] = conf_l
+                data['rmain']['depth_conf'] = conf_r
+                
+                fusion_aux = {
+                    'scale_l': aux_l['scale'],
+                    'scale_r': aux_r['scale'],
+                    'shift_l': aux_l['shift'],
+                    'shift_r': aux_r['shift'],
+                    'depth_l_metric': aux_l['depth_l_metric'],
+                    'depth_r_metric': aux_r['depth_r_metric'],
+                }
+                if 'depth_wide' in aux_l:
+                    data['depth_wide'] = aux_l['depth_wide']
+                    fusion_aux['depth_wide_mode'] = aux_l.get('depth_wide_mode', 'concat')
+                data['fusion_aux'] = fusion_aux
+                
+                logger.debug(f"[DepthFusion] scale_l={aux_l['scale'].mean().item():.4f}, "
+                            f"scale_r={aux_r['scale'].mean().item():.4f}")
+            else:
+                l_depth_aligned, r_depth_aligned = self._align_stereo_depth(
+                    l_depth, r_depth, 
+                    data['lmain']['mask'], data['rmain']['mask'],
+                    data['lmain']['intr'], 
+                    self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
+                )
+                data['lmain']['depth'] = l_depth_aligned
+                data['rmain']['depth'] = r_depth_aligned
+            
+            if da3_features is not None and self.feature_adapter is not None:
+                with torch.no_grad():
+                    ref_feat = self.img_encoder(image)
+                target_sizes = [f.shape[-2:] for f in ref_feat]
+                
+                adapted_features = []
+                for feat in da3_features:
+                    l_feat, r_feat = torch.split(feat, [bs, bs])
+                    adapted_features.append(torch.cat([l_feat, r_feat], dim=0))
+                
+                img_feat = self.feature_adapter(adapted_features, target_sizes)
+                img_feat = tuple(img_feat)
+            else:
+                with autocast(enabled=self.cfg.raft.mixed_precision):
+                    img_feat = self.img_encoder(image)
         
         if not self.with_gs_render:
             return data, flow_loss, metrics
-        
-        # 准备特征用于高斯参数预测
-        if da3_features is not None and self.feature_adapter is not None:
-            # 获取 img_encoder 的输出尺寸作为目标
-            with torch.no_grad():
-                ref_feat = self.img_encoder(image)
-            target_sizes = [f.shape[-2:] for f in ref_feat]
-            
-            # 分割左右特征并分别适配
-            adapted_features = []
-            for feat in da3_features:
-                l_feat, r_feat = torch.split(feat, [bs, bs])
-                adapted_features.append(torch.cat([l_feat, r_feat], dim=0))
-            
-            # 适配特征
-            img_feat = self.feature_adapter(adapted_features, target_sizes)
-            img_feat = tuple(img_feat)
-        else:
-            # 使用原始图像编码器
-            with autocast(enabled=self.cfg.raft.mixed_precision):
-                img_feat = self.img_encoder(image)
         
         # 预测高斯参数
         data = self.da3_to_gsparms(image, img_feat, data, bs)
@@ -456,6 +551,71 @@ class RtStereoHumanModel(nn.Module):
         
         return depth_l_aligned, depth_r_aligned
     
+    def _align_single_depth(
+        self, 
+        depth: torch.Tensor, 
+        mask: torch.Tensor,
+        intrinsics: torch.Tensor,
+        baseline: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        对齐单个视图的相对深度到绝对尺度
+        
+        用于只使用左视图深度时的简化对齐。
+        
+        Args:
+            depth: [B, 1, H, W] - 相对深度
+            mask: [B, C, H, W] - 有效掩码
+            intrinsics: [B, 3, 3] - 相机内参
+            baseline: [B] - 基线距离 (用于估计深度范围)
+            
+        Returns:
+            depth_aligned: [B, 1, H, W] - 对齐后的深度
+        """
+        B, _, H, W = depth.shape
+        eps = 1e-6
+        
+        valid = (mask[:, :1] > 0.5).float()
+        
+        def compute_stats(d, m):
+            valid_d = d[m > 0.5]
+            if valid_d.numel() == 0:
+                return torch.tensor(1.0, device=d.device), torch.tensor(0.0, device=d.device)
+            median = valid_d.median()
+            mad = (valid_d - median).abs().median()
+            return median, mad + eps
+        
+        depth_align_cfg = getattr(self.cfg, 'depth_align', None)
+        disp_min_ratio = getattr(depth_align_cfg, 'typical_disp_min_ratio', 0.01)
+        disp_max_ratio = getattr(depth_align_cfg, 'typical_disp_max_ratio', 0.15)
+        target_range_scale = getattr(depth_align_cfg, 'target_range_scale', 0.5)
+        min_depth = getattr(depth_align_cfg, 'min_depth', 0.1)
+        
+        depth_aligned = torch.zeros_like(depth)
+        
+        for b in range(B):
+            fx = intrinsics[b, 0, 0]
+            bl = baseline[b]
+            
+            median, mad = compute_stats(depth[b], valid[b])
+            
+            # 目标深度范围
+            typical_disp_min = W * disp_min_ratio
+            typical_disp_max = W * disp_max_ratio
+            
+            depth_far = bl * fx / (typical_disp_min + eps)
+            depth_near = bl * fx / (typical_disp_max + eps)
+            
+            target_median = (depth_near + depth_far) / 2
+            target_range = (depth_far - depth_near) / 2
+            
+            depth_norm = (depth[b] - median) / (mad + eps)
+            depth_aligned[b] = depth_norm * target_range * target_range_scale + target_median
+        
+        depth_aligned = depth_aligned.clamp(min=min_depth)
+        
+        return depth_aligned
+    
     def da3_to_gsparms(self, lr_img, lr_img_feat, data, bs):
         """
         DA3 模式下的多层高斯参数预测
@@ -473,7 +633,7 @@ class RtStereoHumanModel(nn.Module):
         gs_output = self.gs_parm_regresser(lr_img, lr_depth, lr_img_feat)
         
         # 分离左右视图的参数
-        # gs_output 是 dict: {rotation, scale, opacity, depth_offset, texture_complexity, load_balance_loss}
+        # gs_output 是 dict: {rotation, scale, opacity, depth_offset, xyz_offset, texture_complexity, load_balance_loss}
         l_gs_params, r_gs_params = self._split_gs_params(gs_output, bs)
         
         # 存储 MoE 负载均衡损失
@@ -518,10 +678,11 @@ class RtStereoHumanModel(nn.Module):
             data[view]['scale_maps'] = filtered_params['scale'].permute(0, 2, 3, 4, 1).reshape(B, N, 3)
             data[view]['opacity_maps'] = filtered_params['opacity'].squeeze(1).reshape(B, N)  # [B, N]
             
-            # 也存储原始多层格式 (用于可视化)
+            # 也存储原始多层格式 (用于可视化和正则化)
             data[view]['multilayer_params'] = filtered_params
             data[view]['valid_mask'] = valid_mask
             data[view]['texture_complexity'] = gs_params.get('texture_complexity')
+            data[view]['xyz_offset'] = gs_params.get('xyz_offset')  # 用于正则化损失
         
         # 计算 scale 正则项
         l_scale = l_gs_params['scale']
@@ -632,6 +793,13 @@ class RtStereoHumanModel(nn.Module):
         xyz_world = torch.bmm(xyz_camera_flat, R_inv.transpose(1, 2))
         t_transformed = torch.bmm(t.unsqueeze(1), R_inv.transpose(1, 2))  # [B, 1, 3]
         xyz_world = xyz_world - t_transformed
+        
+        # 应用位置残差 xyz_offset (如果存在)
+        if 'xyz_offset' in gs_params:
+            xyz_offset = gs_params['xyz_offset']  # [B, 3, L, H, W]
+            # 重塑: [B, 3, L, H, W] -> [B, L, H, W, 3] -> [B, N, 3]
+            xyz_offset_flat = xyz_offset.permute(0, 2, 3, 4, 1).reshape(B, N, 3)
+            xyz_world = xyz_world + xyz_offset_flat
         
         # 计算有效掩码: valid_mask AND foreground_mask
         fg_mask = (mask[:, :1] > 0.5).float()  # [B, 1, H, W]

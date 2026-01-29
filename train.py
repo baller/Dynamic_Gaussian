@@ -158,8 +158,9 @@ class Trainer:
         log_ssim = 0
         log_chamfer = 0
         log_scale = 0
-        log_depth_cons = 0
         log_moe_balance = 0
+        log_xyz_reg = 0
+        log_scale_reg = 0
         train_cfg = getattr(self.cfg, 'training', None)
         if_chamfer = getattr(train_cfg, 'chamfer_enabled', True)
         iter_from = getattr(train_cfg, 'chamfer_start_iter', 0)
@@ -215,100 +216,52 @@ class Trainer:
             # 基础损失
             loss = self.l1_weight * Ll1 + self.ssim_weight * Lssim + self.chamfer_weight * chamfer_loss 
 
-            # DA3 模式的额外损失
-            depth_cons_loss = torch.tensor(0.0, device=loss.device)
+            # DA3 模式的额外损失 (简化版)
             moe_balance_loss = torch.tensor(0.0, device=loss.device)
-            allocation_loss = torch.tensor(0.0, device=loss.device)
+            xyz_offset_reg_loss = torch.tensor(0.0, device=loss.device)
+            scale_reg_loss = torch.tensor(0.0, device=loss.device)
             
             if self.depth_mode == 'da3':
-                # 1. 深度一致性损失
-                if self.depth_consistency_loss is not None:
-                    depth_cons_start = getattr(train_cfg, 'depth_consistency_start_iter', 0)
-                    depth_cons_ramp = getattr(train_cfg, 'depth_consistency_ramp_iters', 0)
-                    if self.total_steps < depth_cons_start:
-                        depth_cons_weight = 0.0
-                    elif depth_cons_ramp > 0:
-                        depth_cons_weight = min(
-                            1.0,
-                            float(self.total_steps - depth_cons_start) / float(depth_cons_ramp)
-                        )
-                    else:
-                        depth_cons_weight = 1.0
-
-                    # 优先使用融合后的深度，否则使用原始深度
-                    if 'fusion_aux' in data:
-                        aux = data['fusion_aux']
-                        depth_l = aux.get('depth_l_metric')
-                        depth_r = aux.get('depth_r_metric')
-                    else:
-                        # 使用原始 DA3 深度 (基础深度，不含多层偏移)
-                        depth_l = data['lmain'].get('depth')
-                        depth_r = data['rmain'].get('depth')
-                    
-                    if depth_l is not None and depth_r is not None:
-                        # 确保深度是 4D: [B, 1, H, W]
-                        if depth_l.dim() == 5:  # [B, 1, L, H, W] 多层格式
-                            depth_l = depth_l[:, :, 0, :, :]  # 取第一层
-                            depth_r = depth_r[:, :, 0, :, :]
-                        
-                        baseline = self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
-                        depth_cons_loss = self.depth_consistency_loss(
-                            depth_l, depth_r, data['lmain']['intr'], baseline
-                        )
-                        loss = loss + (self.depth_consistency_weight * depth_cons_weight) * depth_cons_loss
+                # 获取正则化权重
+                loss_cfg = getattr(self.cfg, 'loss', None)
+                xyz_offset_reg_weight = getattr(loss_cfg, 'xyz_offset_reg_weight', 0.05) if loss_cfg else 0.05
+                scale_reg_weight = getattr(loss_cfg, 'scale_reg_weight', 0.1) if loss_cfg else 0.1
+                scale_target = getattr(loss_cfg, 'scale_target', 0.001) if loss_cfg else 0.001
                 
-                # 2. MoE 负载均衡损失
-                # 首先检查 data 中是否直接存储了损失
+                # 1. 位置残差正则化 - 约束 xyz_offset 不要太大
+                for view in ['lmain', 'rmain']:
+                    xyz_offset = data[view].get('xyz_offset')
+                    if xyz_offset is not None:
+                        xyz_offset_reg_loss = xyz_offset_reg_loss + xyz_offset.abs().mean()
+                xyz_offset_reg_loss = xyz_offset_reg_loss / 2  # 平均左右视图
+                if xyz_offset_reg_weight > 0:
+                    loss = loss + xyz_offset_reg_weight * xyz_offset_reg_loss
+                
+                # 2. Scale 正则化 - 约束 scale 在合理范围
+                for view in ['lmain', 'rmain']:
+                    multilayer_params = data[view].get('multilayer_params')
+                    if multilayer_params is not None and 'scale' in multilayer_params:
+                        scale = multilayer_params['scale']
+                        # 惩罚过大或过小的 scale
+                        scale_reg_loss = scale_reg_loss + (scale - scale_target).abs().mean()
+                scale_reg_loss = scale_reg_loss / 2  # 平均左右视图
+                if scale_reg_weight > 0:
+                    loss = loss + scale_reg_weight * scale_reg_loss
+                
+                # 3. MoE 负载均衡损失 (降低权重)
                 if 'moe_load_balance_loss' in data:
                     lb_loss = data['moe_load_balance_loss']
                     if isinstance(lb_loss, torch.Tensor) and lb_loss.numel() > 0:
                         moe_balance_loss = lb_loss if lb_loss.dim() == 0 else lb_loss.mean()
                         loss = loss + self.moe_balance_weight * moe_balance_loss
-                else:
-                    # 备选：从模型中获取
-                    model = self.accelerator.unwrap_model(self.model) if self.use_accelerate else self.model
-                    if hasattr(model, 'gs_parm_regresser'):
-                        regresser = model.gs_parm_regresser
-                        if hasattr(regresser, 'last_moe_balance_loss'):
-                            lb_loss = regresser.last_moe_balance_loss
-                            if lb_loss is not None and isinstance(lb_loss, torch.Tensor):
-                                moe_balance_loss = lb_loss if lb_loss.dim() == 0 else lb_loss.mean()
-                            elif lb_loss is not None and lb_loss > 0:
-                                moe_balance_loss = torch.tensor(lb_loss, device=loss.device)
-                            loss = loss + self.moe_balance_weight * moe_balance_loss
-                
-                # 3. 动态分配熵损失 (可选)
-                allocation_entropy_weight = getattr(
-                    getattr(self.cfg, 'loss', None), 
-                    'allocation_entropy_weight', 0.001
-                )
-                allocation_corr_weight = getattr(
-                    getattr(self.cfg, 'loss', None),
-                    'allocation_correlation_weight',
-                    0.5
-                )
-                if allocation_entropy_weight > 0:
-                    for view in ['lmain', 'rmain']:
-                        if 'valid_mask' in data[view] and 'texture_complexity' in data[view]:
-                            valid_mask = data[view]['valid_mask']
-                            texture = data[view]['texture_complexity']
-                            if valid_mask is not None and texture is not None:
-                                # 计算分配与纹理的相关性损失
-                                L = valid_mask.shape[1] if valid_mask.dim() == 4 else 1
-                                layers_per_pixel = valid_mask.float().sum(dim=1)  # [B, H, W]
-                                target_layers = texture.squeeze(1) * L
-                                alloc_loss = torch.nn.functional.mse_loss(layers_per_pixel, target_layers)
-                                allocation_loss = allocation_loss + alloc_loss * allocation_corr_weight
-                    
-                    if allocation_loss > 0:
-                        loss = loss + allocation_entropy_weight * allocation_loss
 
             log_l1 += self.l1_weight * Ll1.item()
             log_ssim += self.ssim_weight * Lssim.item()
             log_chamfer += self.chamfer_weight * chamfer_loss.item() if if_chamfer and itr_>iter_from else 0 
             log_scale += scale_log_weight * data['novel_view']['scale_regular'].item() if if_scale else 0
-            log_depth_cons += depth_cons_loss.item() if isinstance(depth_cons_loss, torch.Tensor) else depth_cons_loss
             log_moe_balance += moe_balance_loss.item() if isinstance(moe_balance_loss, torch.Tensor) else moe_balance_loss
+            log_xyz_reg += xyz_offset_reg_loss.item() if isinstance(xyz_offset_reg_loss, torch.Tensor) else xyz_offset_reg_loss
+            log_scale_reg += scale_reg_loss.item() if isinstance(scale_reg_loss, torch.Tensor) else scale_reg_loss
 
             if self.is_main_process and self.total_steps and self.cfg.record.loss_freq > 0 and self.total_steps % self.cfg.record.loss_freq == 0:
                 self.logger.writer.add_scalar(f'lr', self.optimizer.param_groups[0]['lr'], self.total_steps)
@@ -323,9 +276,9 @@ class Trainer:
             
             # DA3 模式的额外指标
             if self.depth_mode == 'da3':
-                metrics['depth_consistency'] = depth_cons_loss.item() if isinstance(depth_cons_loss, torch.Tensor) else depth_cons_loss
                 metrics['moe_balance'] = moe_balance_loss.item() if isinstance(moe_balance_loss, torch.Tensor) else moe_balance_loss
-                metrics['allocation_entropy'] = allocation_loss.item() if isinstance(allocation_loss, torch.Tensor) else allocation_loss
+                metrics['xyz_offset_reg'] = xyz_offset_reg_loss.item() if isinstance(xyz_offset_reg_loss, torch.Tensor) else xyz_offset_reg_loss
+                metrics['scale_reg'] = scale_reg_loss.item() if isinstance(scale_reg_loss, torch.Tensor) else scale_reg_loss
                 
                 # 记录动态分配统计
                 for view in ['lmain', 'rmain']:
@@ -384,7 +337,8 @@ class Trainer:
                 ]
                 if self.depth_mode == 'da3':
                     print_items.extend([
-                        f'depth_cons: {log_depth_cons/print_freq:.6f}',
+                        f'xyz_reg: {log_xyz_reg/print_freq:.6f}',
+                        f'scale_reg: {log_scale_reg/print_freq:.6f}',
                         f'moe_bal: {log_moe_balance/print_freq:.6f}',
                     ])
                 print(' | '.join(print_items))
@@ -393,8 +347,9 @@ class Trainer:
                 log_ssim = 0
                 log_chamfer = 0
                 log_scale = 0
-                log_depth_cons = 0
                 log_moe_balance = 0
+                log_xyz_reg = 0
+                log_scale_reg = 0
 
         if self.is_main_process:
             print("FINISHED TRAINING")

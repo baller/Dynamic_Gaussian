@@ -45,12 +45,13 @@ da3:
   freeze_backbone: true                   # 冻结 backbone 节省显存
   mixed_precision: true                   # FP16 混合精度
   use_feature_adapter: true               # 使用特征适配器
+  use_left_depth_only: true               # 只使用左视图深度 (节省一半 DA3 计算)
 
 # ============================================
 # 深度融合模块 (立体几何约束)
 # ============================================
 depth_fusion:
-  enabled: true          # 启用深度融合 (解决左右深度尺度不一致)
+  enabled: false          # 启用深度融合 (解决左右深度尺度不一致)
   feat_dim: 64           # 特征维度 (减小以节省显存)
   num_heads: 4           # 注意力头数
   dropout: 0.1           # Dropout
@@ -59,7 +60,7 @@ depth_fusion:
   residual_weight: 0.1   # 融合残差权重
   use_gradient_checkpoint: true
   blend_warmup_iters: 200
-  wide_fov_enable: true
+  wide_fov_enable: false
   wide_fov_mode: 'concat'
 
 # ============================================
@@ -74,8 +75,9 @@ gs_transformer:
   num_heads: 4             # 注意力头数
   window_size: 8           # 窗口注意力大小
   num_gaussian_layers: 3   # 多层高斯层数 (关键参数)
-  max_scale: 0.003         # 高斯最大缩放
+  max_scale: 0.01          # 高斯最大缩放 (保守值，防止训练中 OOM)
   max_depth_offset: 0.3    # 深度偏移最大值 (米)
+  max_xyz_offset: 0.1      # 位置残差最大值 (米) - 新增
   downsample_factor: 8     # Transformer 输入下采样 (增加以节省显存)
   use_gradient_checkpoint: true
 
@@ -83,7 +85,7 @@ gs_transformer:
 moe:
   num_experts: 4           # 专家数量
   top_k: 2                 # 每次激活的专家数
-  load_balance_weight: 0.01 # 负载均衡损失权重
+  load_balance_weight: 0.001 # 负载均衡损失权重 (降低 10 倍)c
 
 # ============================================
 # 动态高斯分配
@@ -103,16 +105,25 @@ dynamic_gs:
   warmup_iters: 200
 
 # ============================================
-# 损失函数权重
+# 损失函数权重 (简化版)
 # ============================================
 loss:
+  # 核心渲染损失
   l1_weight: 0.8                    # L1 渲染损失
   ssim_weight: 0.2                  # SSIM 损失
-  chamfer_weight: 0.5               # Chamfer 距离 (点云几何)
-  depth_consistency_weight: 0.2     # 深度一致性 (增加权重)
-  moe_balance_weight: 0.01          # MoE 负载均衡
-  allocation_entropy_weight: 0.001  # 分配熵正则
-  allocation_correlation_weight: 0.5
+  
+  # 正则化损失 (新增)
+  xyz_offset_reg_weight: 0.05       # 位置残差正则化 - 约束 xyz_offset 不要太大
+  scale_reg_weight: 0.01            # Scale 正则化 - 降低权重，让模型自由学习
+  scale_target: 0.003               # Scale 目标值
+  
+  # MoE 负载均衡 (降低权重)
+  moe_balance_weight: 0.001         # MoE 负载均衡 (从 0.01 降到 0.001)
+  
+  # 禁用的损失
+  chamfer_weight: 0.0               # Chamfer 距离 - 禁用
+  depth_consistency_weight: 0.0     # 深度一致性 - 禁用 (单深度模式无效)
+  allocation_entropy_weight: 0.0    # 分配熵正则 - 禁用
 
 # ============================================
 # 记录与保存
@@ -128,7 +139,7 @@ record:
 # ============================================
 visualization:
   enabled: true
-  vis_freq: 200              # 可视化输出频率
+  vis_freq: 5              # 可视化输出频率
   save_depth: true           # 保存深度图
   save_gaussian: true        # 保存高斯分布 (多层)
   save_novel_view: true      # 保存 Novel View 对比
