@@ -11,12 +11,13 @@ from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 from lib.human_loader import StereoHumanDataset
-from lib.network import RtStereoHumanModel
+from lib.network import RtStereoHumanModel, create_model, DAV3_AVAILABLE
 from config.stereo_human_config import ConfigStereoHuman as config
 from lib.train_recoder import Logger, file_backup
 from lib.GaussianRender import pts2render
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
+from lib.visualization import create_visualization_grid
 from pytorch3d.loss import chamfer_distance
 
 import trimesh 
@@ -30,13 +31,20 @@ from copy import deepcopy
 warnings.filterwarnings("ignore", category=UserWarning)
 
 class Trainer:
-    def __init__(self, cfg_file):
+    def __init__(self, cfg_file, use_dav3=False):
         self.cfg = cfg_file
         self.bs = self.cfg.batch_size
+        self.use_dav3 = use_dav3
 
-
-
-        self.model = RtStereoHumanModel(self.cfg, with_gs_render=True)
+        # Create model (either RAFT-based or DAV3-based)
+        if use_dav3:
+            if not DAV3_AVAILABLE:
+                raise ImportError("DAV3 model requested but not available. Check Depth-Anything-3 installation.")
+            logging.info("Using DAV3-based depth estimator")
+            self.model = create_model(self.cfg, with_gs_render=True, use_dav3=True)
+        else:
+            logging.info("Using RAFT-Stereo depth estimator")
+            self.model = RtStereoHumanModel(self.cfg, with_gs_render=True)
         self.train_set = StereoHumanDataset(self.cfg.dataset, phase='train')
         self.train_loader = DataLoader(self.train_set, batch_size=self.bs, shuffle=True, num_workers=8, pin_memory=True)
         self.train_iterator = iter(self.train_loader)
@@ -58,7 +66,9 @@ class Trainer:
             logging.info(f"Using checkpoint from stage1")
             self.load_ckpt(self.cfg.stage1_ckpt, load_optimizer=False, strict=False)
         self.model.train()
-        self.model.raft_stereo.freeze_bn()  # We keep BatchNorm frozen in Raft-Stereo
+        # Freeze BatchNorm for RAFT-Stereo (only if not using DAV3)
+        if not self.use_dav3 and hasattr(self.model, 'raft_stereo'):
+            self.model.raft_stereo.freeze_bn()
         self.scaler = GradScaler(enabled=self.cfg.raft.mixed_precision)
 
     def train(self):
@@ -133,7 +143,9 @@ class Trainer:
                 self.model.eval()
                 self.run_eval()
                 self.model.train()
-                self.model.raft_stereo.freeze_bn()
+                # Freeze BatchNorm for RAFT-Stereo (only if not using DAV3)
+                if not self.use_dav3 and hasattr(self.model, 'raft_stereo'):
+                    self.model.raft_stereo.freeze_bn()
                 
             if self.total_steps in self.cfg.record.save_iter:
                 self.save_ckpt(save_path=Path('%s/iter%d.pth' % (cfg.record.ckpt_path, self.total_steps)))
@@ -165,7 +177,7 @@ class Trainer:
         for idx in range(self.len_val):
             data = self.fetch_data(phase='val')
             with torch.no_grad():
-                data, _, _ = self.model(data, is_train=False)
+                data, _, metrics = self.model(data, is_train=False)
                 data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
 
                 render_novel = data['novel_view']['img_pred']
@@ -174,11 +186,24 @@ class Trainer:
                 psnr_list.append(psnr_value.item())
 
                 if idx == show_idx:
+                    # Save original novel view image
                     tmp_novel = data['novel_view']['img_pred'][0].detach()
                     tmp_novel *= 255
                     tmp_novel = tmp_novel.permute(1, 2, 0).cpu().numpy()
                     tmp_img_name = '%s/%s.jpg' % (cfg.record.show_path, self.total_steps)
                     cv2.imwrite(tmp_img_name, tmp_novel[:, :, ::-1].astype(np.uint8))
+                    
+                    # Create comprehensive visualization grid
+                    try:
+                        vis_paths = create_visualization_grid(
+                            data, 
+                            self.total_steps, 
+                            cfg.record.show_path,
+                            prefix=""
+                        )
+                        logging.info(f"Saved visualizations to {cfg.record.show_path}")
+                    except Exception as e:
+                        logging.warning(f"Visualization failed: {e}")
 
         val_psnr = np.round(np.mean(np.array(psnr_list)), 4)
         if val_psnr < 10:
@@ -234,16 +259,26 @@ class Trainer:
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train GPS+ model')
+    parser.add_argument('--use_dav3', type=bool,
+                        default=True,
+                        help='Use Depth Anything V3 instead of RAFT-Stereo')
+    parser.add_argument('--config', type=str, default='config/stage.yaml',
+                        help='Path to config file')
+    args = parser.parse_args()
+    
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
 
     cfg = config()
-    cfg.load("config/stage.yaml")
+    cfg.load(args.config)
     cfg = cfg.get_cfg()
 
     cfg.defrost()
     dt = datetime.today()
-    cfg.exp_name = '%s_%s%s' % (cfg.name, str(dt.month).zfill(2), str(dt.day).zfill(2))
+    # Add dav3 suffix to experiment name if using DAV3
+    model_suffix = '_dav3' if args.use_dav3 else ''
+    cfg.exp_name = '%s%s_%s%s' % (cfg.name, model_suffix, str(dt.month).zfill(2), str(dt.day).zfill(2))
     cfg.record.ckpt_path = "experiments/%s/ckpt" % cfg.exp_name
     cfg.record.show_path = "experiments/%s/show" % cfg.exp_name
     cfg.record.logs_path = "experiments/%s/logs" % cfg.exp_name
@@ -259,5 +294,5 @@ if __name__ == '__main__':
     torch.manual_seed(1314)
     np.random.seed(1314)
 
-    trainer = Trainer(cfg)
+    trainer = Trainer(cfg, use_dav3=args.use_dav3)
     trainer.train()

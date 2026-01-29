@@ -13,9 +13,9 @@ dataset:
   use_depth_init: True
   use_local_data: True
   inverse_depth_init: 0.3
-  local_data_root: '/PATH/TO/data'       # TODO
-  train_data_root: '/PATH/TO/data/train' # TODO
-  val_data_root: '/PATH/TO/data/val'     # TODO
+  local_data_root: '/data/GPS_plus/processed_data'       # TODO
+  train_data_root: '/data/GPS_plus/processed_data/train' # TODO
+  val_data_root: '/data/GPS_plus/processed_data/val'     # TODO
 
 raft:
   mixed_precision: False
@@ -24,11 +24,39 @@ raft:
   encoder_dims: [32, 48, 96]  
   hidden_dims: [96, 96, 96]  
 
+# Depth Anything V3 configuration (alternative to RAFT)
+dav3:
+  # Model configuration
+  model_name: 'da3-base'  # Options: 'da3-base', 'da3-large', 'da3-giant'
+  export_feat_layers: [11]  # Layer indices to export features from (for ViT-B: layers 0-11)
+  
+  # Feature downsampling configuration
+  feature_downsample_size: 64  # Downsample features to this resolution for efficiency
+  
+  # Cost volume configuration
+  max_disparity: 32  # Maximum disparity search range (at downsampled resolution)
+  
+  # Confidence filtering configuration (anchor point selection)
+  confidence_threshold: 0.7  # Minimum confidence to keep anchor point
+  peak_ratio_threshold: 1.3  # Peak should be this much higher than second best
+  min_anchor_points: 50  # Minimum number of anchor points required
+  max_anchor_points: 500  # Maximum number of anchor points to use
+  
+  # Scale/Shift estimation configuration
+  # Note: Now using learned network instead of analytical RANSAC
+  # These params are kept for fallback/comparison
+  use_ransac: True  # Use RANSAC for analytical fallback
+  ransac_iterations: 100
+  ransac_threshold: 0.1  # Inlier threshold (relative to depth range)
+  
+  # Scale/Shift network configuration
+  scale_shift_hidden_dim: 64  # Hidden dimension for scale-shift network
+
 gsnet:
   encoder_dims: [32, 48, 96]
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
 
 record:
-  loss_freq: 3000
-  eval_freq: 3000
+  loss_freq: 20
+  eval_freq: 100
