@@ -1,0 +1,109 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train DAV3 (GPU 0)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--use_dav3", "True",
+                "--config", "config/stage.yaml"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train DAV3 (GPU 1)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--use_dav3", "True",
+                "--config", "config/stage.yaml"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train DAV3 (GPU 2)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--use_dav3", "True",
+                "--config", "config/stage.yaml"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train DAV3 (GPU 3)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--use_dav3", "True",
+                "--config", "config/stage.yaml"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "3"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train RAFT-Stereo (GPU 0)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--use_dav3", "False",
+                "--config", "config/stage.yaml"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Train DAV3 (Custom GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--use_dav3", "True",
+                "--config", "config/stage.yaml"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "${input:gpuId}"
+            },
+            "cwd": "${workspaceFolder}"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "gpuId",
+            "type": "promptString",
+            "description": "输入 GPU ID (例如: 0, 1, 0,1 多卡)",
+            "default": "0"
+        }
+    ]
+}

@@ -1,0 +1,90 @@
+---
+description: Depth-Anything-3 (DA3) 正确使用方式
+globs: "**/dav3*.py"
+alwaysApply: false
+---
+
+# Depth-Anything-3 (DA3) 使用指南
+
+## 项目概述
+
+DA3 是 ByteDance 的多视图深度估计模型，支持：
+- 单目/多目深度估计
+- 相机位姿估计
+- 3D 高斯点云生成
+
+## 核心 API
+
+### 推荐使用方式（高层 API）
+
+```python
+from depth_anything_3.api import DepthAnything3
+
+model = DepthAnything3(model_name="da3-large")  # 或 da3-giant, da3-base
+model = model.to("cuda")
+
+# inference() 方法自动处理预处理和后处理
+prediction = model.inference(
+    image=image_list,  # 路径列表、numpy 数组或 PIL 图像
+    process_res=504,
+    export_format="mini_npz",
+)
+
+# 输出
+depth = prediction.depth  # (N, H, W) float32
+conf = prediction.conf    # (N, H, W) float32
+```
+
+### 底层 forward() 使用（需要手动预处理）
+
+如果必须使用 `forward()` 方法，**必须**进行 ImageNet 归一化：
+
+```python
+# ❌ 错误 - 没有归一化
+output = model.forward(img_tensor)
+
+# ✅ 正确 - 先归一化
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
+
+# 假设 img 范围是 [0, 1]
+img_normalized = (img - IMAGENET_MEAN.to(device)) / IMAGENET_STD.to(device)
+output = model.forward(img_normalized)
+```
+
+## 输入格式要求
+
+### forward() 方法
+- 形状: `(B, N, 3, H, W)` - B=batch, N=视图数
+- 值范围: ImageNet 归一化后（约 [-2, 2]）
+- H, W 必须是 14 的倍数（ViT patch size）
+
+### inference() 方法
+- 自动处理归一化
+- 自动调整尺寸到 14 的倍数
+- 输入可以是路径、numpy 或 PIL 图像
+
+## 常见错误
+
+### 问题：深度图呈点状/稀疏
+
+**原因**：输入图像没有进行 ImageNet 归一化
+
+**解决**：
+1. 使用 `inference()` 而不是 `forward()`
+2. 或者在调用 `forward()` 前手动归一化
+
+### 问题：深度图分辨率不对
+
+**原因**：ViT 需要 14 的倍数输入
+
+**解决**：调整输入尺寸到最近的 14 的倍数
+
+## 模型选择
+
+| 模型名 | 用途 | 支持功能 |
+|--------|------|----------|
+| `da3-giant` | 最高精度 | 深度 + 位姿 + 3DGS |
+| `da3-large` | 平衡选择 | 深度 + 位姿 |
+| `da3-base` | 轻量级 | 仅深度 |
+| `da3nested-giant-large` | 度量深度 | 深度 + 度量尺度 |

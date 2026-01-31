@@ -215,10 +215,22 @@ class DAV3StereoHumanModel(nn.Module):
         r_depth = data['rmain']['depth']
         lr_depth = torch.cat([l_depth, r_depth], dim=0)
         
+        # Debug: Check depth range before GSRegresser
+        if not hasattr(self, '_gs_debug_printed'):
+            print(f"[GSRegresser Debug] Input depth range: min={lr_depth.min().item():.4f}, max={lr_depth.max().item():.4f}")
+            print(f"[GSRegresser Debug] Input depth mean: {lr_depth.mean().item():.4f}, std: {lr_depth.std().item():.4f}")
+            self._gs_debug_printed = True
+        
         # Regress Gaussian parameters
         rot_maps, scale_maps, opacity_maps, depth_maps = self.gs_parm_regresser(
             lr_img, lr_depth, lr_img_feat
         )
+        
+        # Debug: Check Gaussian parameter ranges
+        if not hasattr(self, '_gs_parm_debug_printed'):
+            print(f"[GSRegresser Debug] scale_maps range: min={scale_maps.min().item():.6f}, max={scale_maps.max().item():.6f}")
+            print(f"[GSRegresser Debug] opacity_maps range: min={opacity_maps.min().item():.4f}, max={opacity_maps.max().item():.4f}")
+            self._gs_parm_debug_printed = True
         
         # Add depth residual
         l_resdepth, r_resdepth = torch.split(depth_maps, [bs, bs])

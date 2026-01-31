@@ -18,9 +18,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass
+import torchvision.transforms as T
 
 # Add Depth-Anything-3 to path
 sys.path.insert(0, '/home/user_3/3DGS/Depth-Anything-3/src')
+
+# ImageNet normalization constants for DA3
+# DA3 expects ImageNet-normalized inputs
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
 
 try:
     from depth_anything_3.api import DepthAnything3
@@ -801,7 +807,7 @@ class DAV3DepthEstimator(nn.Module):
         Extract monocular depth and intermediate features from DAV3.
         
         Args:
-            img: (B, 3, H, W) - Input image
+            img: (B, 3, H, W) - Input image (in [-1, 1] range from human_loader)
             
         Returns:
             depth: (B, 1, H, W) - Relative depth (same size as input)
@@ -809,6 +815,13 @@ class DAV3DepthEstimator(nn.Module):
         """
         B, _, H, W = img.shape
         device = img.device
+        
+        # Debug: Print input image range (only once)
+        if not hasattr(self, '_input_debug_printed'):
+            img_min, img_max = img.min().item(), img.max().item()
+            print(f"[DAV3 Debug] Input image range: min={img_min:.4f}, max={img_max:.4f}")
+            print(f"[DAV3 Debug] Input image shape: {img.shape}")
+            self._input_debug_printed = True
         
         # DAV3 ViT requires input size to be multiple of patch_size (14)
         H_pad = (self.PATCH_SIZE - H % self.PATCH_SIZE) % self.PATCH_SIZE
@@ -822,8 +835,43 @@ class DAV3DepthEstimator(nn.Module):
         else:
             img_resized = img
         
+        # CRITICAL: Apply proper normalization before passing to DAV3
+        # Detect input range and convert to [0, 1] first
+        img_min = img_resized.min().item()
+        img_max = img_resized.max().item()
+        
+        if img_min >= -1.1 and img_max <= 1.1 and img_min < 0:
+            # Input is in [-1, 1] range (from human_loader: 2 * (img / 255) - 1)
+            # Convert to [0, 1]: img_01 = (img + 1) / 2
+            img_01 = (img_resized + 1.0) / 2.0
+        elif img_min >= 0 and img_max <= 1.1:
+            # Input is already in [0, 1] range
+            img_01 = img_resized
+        elif img_max > 1.1:
+            # Input might be in [0, 255] range
+            img_01 = img_resized / 255.0
+        else:
+            # Unknown range, assume [-1, 1] and convert
+            img_01 = (img_resized + 1.0) / 2.0
+        
+        # Clamp to [0, 1] to be safe
+        img_01 = torch.clamp(img_01, 0.0, 1.0)
+        
+        # Now apply ImageNet normalization
+        # DAV3 expects ImageNet-normalized inputs (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # Without this normalization, the depth output will be incorrect (sparse/dotted pattern)
+        mean = IMAGENET_MEAN.view(1, 3, 1, 1).to(device=device, dtype=img_01.dtype)
+        std = IMAGENET_STD.view(1, 3, 1, 1).to(device=device, dtype=img_01.dtype)
+        img_normalized = (img_01 - mean) / std
+        
+        # Debug: Print normalized image range (only once)
+        if not hasattr(self, '_norm_debug_printed'):
+            norm_min, norm_max = img_normalized.min().item(), img_normalized.max().item()
+            print(f"[DAV3 Debug] After ImageNet normalization: min={norm_min:.4f}, max={norm_max:.4f}")
+            self._norm_debug_printed = True
+        
         # Prepare input for DAV3 (expects (B, N, 3, H, W) where N is number of views)
-        img_dav3 = img_resized.unsqueeze(1)  # (B, 1, 3, H_new, W_new)
+        img_dav3 = img_normalized.unsqueeze(1)  # (B, 1, 3, H_new, W_new)
         
         # Forward pass through DAV3 with feature export
         # DAV3 is already in eval mode with frozen weights
@@ -835,13 +883,24 @@ class DAV3DepthEstimator(nn.Module):
             )
         
         # Get depth
-        depth = output['depth']  # (B, N, H_new/14, W_new/14) or similar
+        depth = output['depth']  # (B, N, H, W) - should be full resolution from DualDPT
+        
+        # Debug: Print shape to verify resolution
+        if not hasattr(self, '_debug_printed'):
+            print(f"[DAV3 Debug] Output depth shape: {depth.shape}")
+            print(f"[DAV3 Debug] Input image shape: (B, 3, {H}, {W})")
+            print(f"[DAV3 Debug] Depth value range: min={depth.min().item():.4f}, max={depth.max().item():.4f}")
+            self._debug_printed = True
+        
         if depth.dim() == 4:
             depth = depth[:, 0]  # Take first view: (B, H', W')
         
-        # Resize depth to input resolution
+        # Resize depth to input resolution (should be minimal change if DualDPT works correctly)
         depth = depth.unsqueeze(1)  # (B, 1, H', W')
-        depth = F.interpolate(depth.float(), size=(H, W), mode='bilinear', align_corners=False)
+        if depth.shape[-2:] != (H, W):
+            depth = F.interpolate(depth.float(), size=(H, W), mode='bilinear', align_corners=False)
+        else:
+            depth = depth.float()
         
         # Get features from auxiliary outputs
         feat_key = f"feat_layer_{self.cfg.export_feat_layers[-1]}"

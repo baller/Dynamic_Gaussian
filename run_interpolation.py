@@ -12,7 +12,7 @@ from tqdm import tqdm
 from datetime import datetime
 
 from lib.human_loader import StereoHumanDataset, load_json_to_np, stereo_depth2flow
-from lib.network import RtStereoHumanModel
+from lib.network import RtStereoHumanModel, DAV3StereoHumanModel
 from config.stereo_human_config import ConfigStereoHuman as config
 from lib.train_recoder import Logger, file_backup
 from lib.GaussianRender import pts2render
@@ -115,7 +115,7 @@ class StereoHumanModel(nn.Module):
     def __init__(self, cfg, ckpt_path, novel_extrs, novel_intrs, s_id = 1):
         super().__init__()
         
-        self.model = RtStereoHumanModel(cfg, with_gs_render=True)# RtStereoHumanModel(cfg, True)
+        self.model = DAV3StereoHumanModel(cfg, with_gs_render=True)
         ckpt = torch.load(ckpt_path, map_location='cuda')
         self.model.load_state_dict(ckpt['network'], strict=True)
         self.model = self.model.cuda()
@@ -260,10 +260,10 @@ if __name__ == '__main__':
 
     cfg.defrost()
     dt = datetime.today()
-    cfg.exp_name = 'gps_plus' # TODO
+    cfg.exp_name = 'gps_plus_show_0131' # TODO
 
     cfg.record.show_path = "experiments/%s/show_free_%s" % (cfg.exp_name, tar_n)
-    cfg.restore_ckpt = 'PATH/TO/gps_plus_latest.pth' # TODO
+    cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_dav3_0129/ckpt/iter40000.pth' # TODO
     cfg.freeze()
     LOOP_NUM = 20
 
@@ -296,7 +296,7 @@ if __name__ == '__main__':
     cut = 100
     tar_ply = -10
     start_frame = 0
-    end_frame = 60
+    end_frame = 600
 
     for fr_i in tqdm(range(start_frame, end_frame)):
         wi_ct = fr_i // LOOP_NUM
