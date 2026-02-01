@@ -1,4 +1,4 @@
-name: 'gps_plus'
+name: 'gps_plus_transformer'
 
 lr: 0.0002
 wdecay: 1e-5
@@ -34,7 +34,7 @@ da3:
   model_name: 'depth-anything/DA3METRIC-LARGE'  # Metric 模型直接输出绝对深度
   export_feat_layers: [11, 15, 19, 23]  # 导出的特征层
   freeze_backbone: True  # 是否冻结 DA3 参数
-  mixed_precision: False  # 是否使用混合精度
+  mixed_precision: True  # 是否使用混合精度
   local_files_only: False  # 是否只使用本地文件 (首次使用需设为 False 下载模型)
 
 # Depth alignment parameters (块匹配极线搜索)
@@ -49,6 +49,14 @@ gsnet:
   encoder_dims: [32, 48, 96]
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
+  # GSTransformer 配置 (交替注意力 + DPT Head)
+  use_transformer: True  # 设为 True 启用 Transformer 架构
+  transformer_embed_dim: 1024
+  transformer_depth: 8
+  transformer_num_heads: 16
+  transformer_patch_size: 14
+  transformer_mlp_ratio: 4.0
+  transformer_use_checkpoint: True  # Gradient Checkpointing 节省 ~50% 显存
 
 record:
   loss_freq: 20

@@ -772,48 +772,58 @@ def create_visualization_grid(data: Dict, step: int, save_dir: str, prefix: str 
         plt.close(fig)
         paths['novel_view'] = novel_path
     
-    # 4. 点云投影
-    if 'lmain' in data and 'xyz' in data['lmain'] and 'pts_valid' in data['lmain']:
-        xyz = data['lmain']['xyz'][batch_idx].detach().cpu().numpy()
-        valid = data['lmain']['pts_valid'][batch_idx].detach().cpu().numpy().astype(bool)
+    # 4. 点云投影 (左、右、合并)
+    has_left = 'lmain' in data and 'xyz' in data['lmain'] and 'pts_valid' in data['lmain']
+    has_right = 'rmain' in data and 'xyz' in data['rmain'] and 'pts_valid' in data['rmain']
+    
+    if has_left or has_right:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         
-        if 'depth' in data['lmain']:
-            depth = data['lmain']['depth'][batch_idx]
-            H, W = depth.shape[-2:]
+        def get_point_cloud(view_data):
+            """提取并过滤点云"""
+            xyz = view_data['xyz'][batch_idx].detach().cpu().numpy()
+            valid = view_data['pts_valid'][batch_idx].detach().cpu().numpy().astype(bool)
+            xyz_valid = xyz[valid]
+            if len(xyz_valid) > 0:
+                finite_mask = np.all(np.isfinite(xyz_valid), axis=1)
+                xyz_valid = xyz_valid[finite_mask]
+            return xyz_valid
+        
+        def plot_pointcloud(ax, xyz_valid, title, color_offset=0.0):
+            """绘制点云"""
+            if len(xyz_valid) > 100:
+                z_vals = xyz_valid[:, 2]
+                z_min, z_max = np.percentile(z_vals, [2, 98])
+                z_norm = (z_vals - z_min) / (z_max - z_min + 1e-8)
+                z_norm = np.clip(z_norm + color_offset, 0, 1)
+                colors = cmap(z_norm)[:, :3]
+                
+                n_show = min(100000, len(xyz_valid))
+                indices = np.random.choice(len(xyz_valid), n_show, replace=False)
+                ax.scatter(xyz_valid[indices, 0], xyz_valid[indices, 1],
+                          c=colors[indices], s=0.3, alpha=0.6)
+            ax.set_title(f'{title} ({len(xyz_valid):,} pts)', fontsize=12)
+            ax.set_aspect('equal')
+            ax.axis('off')
+        
+        # 左视图点云
+        xyz_left = get_point_cloud(data['lmain']) if has_left else np.array([]).reshape(0, 3)
+        plot_pointcloud(axes[0], xyz_left, 'Left Point Cloud')
+        
+        # 右视图点云
+        xyz_right = get_point_cloud(data['rmain']) if has_right else np.array([]).reshape(0, 3)
+        plot_pointcloud(axes[1], xyz_right, 'Right Point Cloud')
+        
+        # 合并点云
+        if len(xyz_left) > 0 and len(xyz_right) > 0:
+            xyz_merged = np.concatenate([xyz_left, xyz_right], axis=0)
+        elif len(xyz_left) > 0:
+            xyz_merged = xyz_left
         else:
-            H, W = 1024, 1024
+            xyz_merged = xyz_right
+        plot_pointcloud(axes[2], xyz_merged, 'Merged Point Cloud')
         
-        fig, ax = plt.subplots(figsize=(10, 10))
-        
-        # 过滤有效点
-        xyz_valid = xyz[valid]
-        
-        # 过滤异常值
-        if len(xyz_valid) > 0:
-            # 移除 NaN 和 Inf
-            finite_mask = np.all(np.isfinite(xyz_valid), axis=1)
-            xyz_valid = xyz_valid[finite_mask]
-        
-        if len(xyz_valid) > 100:
-            # 使用 z 坐标作为深度着色
-            z_vals = xyz_valid[:, 2]
-            z_min, z_max = np.percentile(z_vals, [2, 98])
-            z_norm = (z_vals - z_min) / (z_max - z_min + 1e-8)
-            z_norm = np.clip(z_norm, 0, 1)
-            
-            colors = cmap(z_norm)[:, :3]
-            
-            # 随机采样显示
-            n_show = min(100000, len(xyz_valid))
-            indices = np.random.choice(len(xyz_valid), n_show, replace=False)
-            
-            ax.scatter(xyz_valid[indices, 0], xyz_valid[indices, 1], 
-                      c=colors[indices], s=0.3, alpha=0.6)
-        
-        ax.set_title(f'Point Cloud (valid: {valid.sum():,})', fontsize=14)
-        ax.set_aspect('equal')
-        ax.axis('off')
-        
+        plt.tight_layout()
         pc_path = str(pointcloud_dir / f'{prefix}{step:06d}.jpg')
         plt.savefig(pc_path, dpi=150, bbox_inches='tight')
         plt.close(fig)

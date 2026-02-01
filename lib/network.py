@@ -35,7 +35,20 @@ class RtStereoHumanModel(nn.Module):
         
         self.raft_stereo = RAFTStereoHuman(self.cfg.raft)
         if self.with_gs_render:
-            self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
+            # 根据配置选择 GSRegresser (CNN) 或 GSTransformer
+            if getattr(self.cfg.gsnet, 'use_transformer', False):
+                from lib.gs_transformer import GSTransformer
+                self.gs_parm_regresser = GSTransformer(
+                    self.cfg,
+                    embed_dim=getattr(self.cfg.gsnet, 'transformer_embed_dim', 768),
+                    depth=getattr(self.cfg.gsnet, 'transformer_depth', 16),
+                    num_heads=getattr(self.cfg.gsnet, 'transformer_num_heads', 12),
+                    patch_size=getattr(self.cfg.gsnet, 'transformer_patch_size', 14),
+                    mlp_ratio=getattr(self.cfg.gsnet, 'transformer_mlp_ratio', 4.0),
+                    use_checkpoint=getattr(self.cfg.gsnet, 'transformer_use_checkpoint', False),
+                )
+            else:
+                self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
 
     def forward(self, data, is_train=True):
         bs = data['lmain']['img'].shape[0]
@@ -156,7 +169,20 @@ class DAV3StereoHumanModel(nn.Module):
         
         # Gaussian parameter regresser
         if self.with_gs_render:
-            self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
+            # 根据配置选择 GSRegresser (CNN) 或 GSTransformer
+            if getattr(self.cfg.gsnet, 'use_transformer', False):
+                from lib.gs_transformer import GSTransformer
+                self.gs_parm_regresser = GSTransformer(
+                    self.cfg,
+                    embed_dim=getattr(self.cfg.gsnet, 'transformer_embed_dim', 768),
+                    depth=getattr(self.cfg.gsnet, 'transformer_depth', 16),
+                    num_heads=getattr(self.cfg.gsnet, 'transformer_num_heads', 12),
+                    patch_size=getattr(self.cfg.gsnet, 'transformer_patch_size', 14),
+                    mlp_ratio=getattr(self.cfg.gsnet, 'transformer_mlp_ratio', 4.0),
+                    use_checkpoint=getattr(self.cfg.gsnet, 'transformer_use_checkpoint', False),
+                )
+            else:
+                self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
     
     def _normalize_for_da3(self, image: torch.Tensor) -> torch.Tensor:
         """

@@ -67,6 +67,14 @@ class ConfigStereoHuman:
         self.cfg.gsnet.encoder_dims = None
         self.cfg.gsnet.decoder_dims = None
         self.cfg.gsnet.parm_head_dim = None
+        # GSTransformer 配置
+        self.cfg.gsnet.use_transformer = False  # 是否使用 Transformer 替代 CNN
+        self.cfg.gsnet.transformer_embed_dim = 768
+        self.cfg.gsnet.transformer_depth = 16
+        self.cfg.gsnet.transformer_num_heads = 12
+        self.cfg.gsnet.transformer_patch_size = 14
+        self.cfg.gsnet.transformer_mlp_ratio = 4.0
+        self.cfg.gsnet.transformer_use_checkpoint = False  # Gradient Checkpointing 节省显存
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
