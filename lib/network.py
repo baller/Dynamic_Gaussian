@@ -11,13 +11,13 @@ from lib.embedder import get_embedder
 from lib.attention_module import LocalFeatureTransformer
 from torch.cuda.amp import autocast as autocast
 
-# Import DAV3 depth estimator
+# Import DA3 depth estimator (正确的实现)
 try:
-    from lib.dav3_depth_estimator import DAV3DepthEstimator, DAV3Config, create_dav3_depth_estimator
+    from lib.da3_depth import DA3DepthEstimator, DA3FeatureAdapter, create_da3_estimator
     DAV3_AVAILABLE = True
 except ImportError:
     DAV3_AVAILABLE = False
-    print("Warning: DAV3 depth estimator not available")
+    print("Warning: DA3 depth estimator not available")
 
 
 class RtStereoHumanModel(nn.Module):
@@ -126,18 +126,10 @@ class DAV3StereoHumanModel(nn.Module):
     """
     Stereo human model using Depth Anything V3 for depth estimation.
     
-    This model replaces RAFT-Stereo with DAV3-based depth estimation:
-    1. DAV3 provides monocular relative depth for both views
-    2. Sparse stereo matching computes anchor points with high-confidence disparity
-    3. Scale and shift are estimated from anchor points
-    4. Relative depth is converted to absolute depth
-    5. GSRegresser regresses Gaussian Splatting parameters
-    
-    Architecture:
-    - DAV3: Monocular depth estimation + feature extraction
-    - Sparse Cost Volume: Efficient stereo matching at low resolution
-    - Scale/Shift Estimator: Linear regression for depth alignment
-    - GSRegresser: Gaussian parameter regression (same as original)
+    使用正确的 DA3 API (da3_depth.py):
+    1. DA3 提供单目相对深度
+    2. 基于基线的简单尺度对齐
+    3. GSRegresser 回归高斯参数
     """
     
     def __init__(self, cfg, with_gs_render=False):
@@ -146,109 +138,188 @@ class DAV3StereoHumanModel(nn.Module):
         self.with_gs_render = with_gs_render
         
         if not DAV3_AVAILABLE:
-            raise ImportError("DAV3 depth estimator is required but not available. "
+            raise ImportError("DA3 depth estimator is required but not available. "
                             "Please ensure Depth-Anything-3 is installed.")
         
-        # DAV3 depth estimator (replaces RAFT-Stereo + UnetExtractor + LoFTR)
-        self.dav3_depth = create_dav3_depth_estimator(cfg)
+        # DA3 深度估计器
+        self.da3_estimator = DA3DepthEstimator(cfg)
         
         # Image encoder for GSRegresser compatibility
-        # Keep a lightweight encoder for generating multi-scale features
         self.img_encoder = UnetExtractor(
             in_channel=3, 
             encoder_dim=self.cfg.raft.encoder_dims
         )
         
-        # Gaussian parameter regresser (same as original)
+        # Gaussian parameter regresser
         if self.with_gs_render:
             self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
     
-    def forward(self, data, is_train=True):
+    def _normalize_for_da3(self, image: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the model.
+        将输入图像归一化到 DA3 期望的 [0, 1] 范围
+        """
+        img_range = getattr(self.cfg.dataset, 'img_range', None)
+        if img_range is not None and len(img_range) == 2:
+            img_min, img_max = img_range
+            image = (image - img_min) / (img_max - img_min)
+        else:
+            # 假设输入是 [-1, 1]
+            img_min = image.min().item()
+            if img_min < 0:
+                image = (image + 1.0) / 2.0
+        return image.clamp(0, 1)
+    
+    def _compute_baseline(self, extr_l: torch.Tensor, extr_r: torch.Tensor) -> torch.Tensor:
+        """计算立体基线距离"""
+        if extr_l.shape[1] == 4:
+            t_l = extr_l[:, :3, 3]
+            t_r = extr_r[:, :3, 3]
+        else:
+            t_l = extr_l[:, :, 3]
+            t_r = extr_r[:, :, 3]
+        return torch.norm(t_l - t_r, dim=1)
+    
+    def _align_depth(
+        self, 
+        depth: torch.Tensor, 
+        mask: torch.Tensor,
+        intrinsics: torch.Tensor,
+        baseline: torch.Tensor,
+        img_width: int
+    ) -> torch.Tensor:
+        """将相对深度对齐到绝对尺度"""
+        B = depth.shape[0]
+        device = depth.device
+        eps = 1e-6
         
-        Args:
-            data: Dictionary containing:
-                - 'lmain': Left view data (img, intr, extr, mask, etc.)
-                - 'rmain': Right view data
-                - 'novel_view': Novel view rendering target
-            is_train: Whether in training mode
+        # 获取深度对齐配置
+        depth_align_cfg = getattr(self.cfg, 'depth_align', None)
+        disp_min_ratio = getattr(depth_align_cfg, 'typical_disp_min_ratio', 0.01) if depth_align_cfg else 0.01
+        disp_max_ratio = getattr(depth_align_cfg, 'typical_disp_max_ratio', 0.15) if depth_align_cfg else 0.15
+        min_depth = getattr(depth_align_cfg, 'min_depth', 0.1) if depth_align_cfg else 0.1
+        
+        valid_mask = (mask[:, :1] > 0.5).float()
+        aligned_depths = []
+        
+        for b in range(B):
+            fx = intrinsics[b, 0, 0]
+            bl = baseline[b]
             
-        Returns:
-            data: Updated with depth, xyz, and Gaussian parameters
-            depth_loss: None (no explicit depth supervision)
-            metrics: Empty dict (can be extended for monitoring)
-        """
-        bs = data['lmain']['img'].shape[0]
+            # 估计目标深度范围
+            typical_disp_min = img_width * disp_min_ratio
+            typical_disp_max = img_width * disp_max_ratio
+            
+            depth_far = bl * fx / (typical_disp_min + eps)
+            depth_near = bl * fx / (typical_disp_max + eps)
+            
+            target_median = (depth_near + depth_far) / 2
+            target_range = (depth_far - depth_near) / 2
+            
+            # 计算相对深度统计量
+            valid_depth = depth[b] * valid_mask[b]
+            valid_flat = valid_depth[valid_mask[b] > 0.5]
+            
+            if valid_flat.numel() > 0:
+                median = valid_flat.median()
+                mad = (valid_flat - median).abs().median() + eps
+            else:
+                median = torch.tensor(0.5, device=device)
+                mad = torch.tensor(0.25, device=device)
+            
+            # 对齐
+            depth_norm = (depth[b] - median) / mad
+            depth_aligned = depth_norm * target_range * 0.5 + target_median
+            aligned_depths.append(depth_aligned)
         
-        # Step 1: Estimate depth using DAV3 with sparse stereo alignment
-        data = self.dav3_depth(data, is_train=is_train)
+        result = torch.stack(aligned_depths, dim=0)
+        return result.clamp(min=min_depth)
+    
+    def forward(self, data, is_train=True):
+        """前向传播"""
+        bs = data['lmain']['img'].shape[0]
+        device = data['lmain']['img'].device
+        _, _, H, W = data['lmain']['img'].shape
+        
+        # 合并左右视图图像
+        image = torch.cat([data['lmain']['img'], data['rmain']['img']], dim=0)
+        
+        # 归一化到 [0, 1]
+        image_da3 = self._normalize_for_da3(image)
+        
+        # DA3 推理
+        da3_output = self.da3_estimator(image_da3, return_features=True, return_entropy=False)
+        
+        # 获取深度
+        depth = da3_output['depth']  # [2B, 1, H, W]
+        l_depth_rel, r_depth_rel = torch.split(depth, [bs, bs])
+        
+        # 存储相对深度
+        data['lmain']['depth_relative'] = l_depth_rel
+        data['rmain']['depth_relative'] = r_depth_rel
+        
+        # 计算基线
+        baseline = self._compute_baseline(data['lmain']['extr'], data['rmain']['extr'])
+        
+        # 深度对齐
+        l_depth = self._align_depth(
+            l_depth_rel, data['lmain']['mask'],
+            data['lmain']['intr'], baseline, W
+        )
+        r_depth = self._align_depth(
+            r_depth_rel, data['rmain']['mask'],
+            data['rmain']['intr'], baseline, W
+        )
+        
+        data['lmain']['depth'] = l_depth
+        data['rmain']['depth'] = r_depth
+        
+        # 创建伪 flow_pred (用于兼容性)
+        data['lmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=device)
+        data['rmain']['flow_pred'] = torch.zeros(bs, 2, H, W, device=device)
         
         depth_loss = None
-        metrics = {
-            'scale': data['scale'].mean().item(),
-            'shift': data['shift'].mean().item(),
-            'num_anchors': data['sparse_stereo']['num_anchors'].float().mean().item()
-        }
+        metrics = {}
         
         if not self.with_gs_render:
             return data, depth_loss, metrics
         
-        # Step 2: Generate multi-scale features for GSRegresser
-        image = torch.cat([data['lmain']['img'], data['rmain']['img']], dim=0)
-        
+        # 生成多尺度特征
         with autocast(enabled=self.cfg.raft.mixed_precision):
             img_feat = self.img_encoder(image)
         
-        # Step 3: Regress Gaussian parameters
+        # 预测高斯参数
         data = self.depth2gsparms(image, img_feat, data, bs)
         
         return data, depth_loss, metrics
     
     def depth2gsparms(self, lr_img, lr_img_feat, data, bs):
-        """
-        Convert depth to Gaussian splatting parameters.
-        
-        Similar to flow2gsparms but works with absolute depth directly.
-        """
+        """转换深度到高斯参数"""
         l_depth = data['lmain']['depth']
         r_depth = data['rmain']['depth']
         lr_depth = torch.cat([l_depth, r_depth], dim=0)
         
-        # Debug: Check depth range before GSRegresser
-        if not hasattr(self, '_gs_debug_printed'):
-            print(f"[GSRegresser Debug] Input depth range: min={lr_depth.min().item():.4f}, max={lr_depth.max().item():.4f}")
-            print(f"[GSRegresser Debug] Input depth mean: {lr_depth.mean().item():.4f}, std: {lr_depth.std().item():.4f}")
-            self._gs_debug_printed = True
-        
-        # Regress Gaussian parameters
+        # 预测高斯参数
         rot_maps, scale_maps, opacity_maps, depth_maps = self.gs_parm_regresser(
             lr_img, lr_depth, lr_img_feat
         )
         
-        # Debug: Check Gaussian parameter ranges
-        if not hasattr(self, '_gs_parm_debug_printed'):
-            print(f"[GSRegresser Debug] scale_maps range: min={scale_maps.min().item():.6f}, max={scale_maps.max().item():.6f}")
-            print(f"[GSRegresser Debug] opacity_maps range: min={opacity_maps.min().item():.4f}, max={opacity_maps.max().item():.4f}")
-            self._gs_parm_debug_printed = True
-        
-        # Add depth residual
+        # 添加深度残差
         l_resdepth, r_resdepth = torch.split(depth_maps, [bs, bs])
         data['lmain']['depth'] = data['lmain']['depth'] + l_resdepth
         data['rmain']['depth'] = data['rmain']['depth'] + r_resdepth
         
-        # Convert depth to point cloud
+        # 转换深度到点云
         for view in ['lmain', 'rmain']:
             data[view]['xyz'] = depth2pc(
                 data[view]['depth'], 
                 data[view]['extr'], 
                 data[view]['intr']
-            ).view(bs, -1, 3)  # [B, S*S, 3]
+            ).view(bs, -1, 3)
             
-            valid = data[view]['mask'][:, :1, :, :] > 0.5  # [B, 1, S, S]
-            data[view]['pts_valid'] = valid.view(bs, -1)  # [B, S*S]
+            valid = data[view]['mask'][:, :1, :, :] > 0.5
+            data[view]['pts_valid'] = valid.view(bs, -1)
         
-        # Store Gaussian parameters
+        # 存储高斯参数
         data['novel_view']['scale_regular'] = torch.mean(scale_maps)
         
         data['lmain']['rot_maps'], data['rmain']['rot_maps'] = torch.split(rot_maps, [bs, bs])
@@ -257,14 +328,14 @@ class DAV3StereoHumanModel(nn.Module):
         
         return data
     
-    def freeze_dav3(self):
-        """Freeze DAV3 parameters for fine-tuning only the GSRegresser."""
-        for param in self.dav3_depth.parameters():
+    def freeze_da3(self):
+        """冻结 DA3 参数"""
+        for param in self.da3_estimator.parameters():
             param.requires_grad = False
     
-    def unfreeze_dav3(self):
-        """Unfreeze DAV3 parameters for end-to-end training."""
-        for param in self.dav3_depth.parameters():
+    def unfreeze_da3(self):
+        """解冻 DA3 参数"""
+        for param in self.da3_estimator.parameters():
             param.requires_grad = True
 
 

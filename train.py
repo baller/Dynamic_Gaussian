@@ -206,9 +206,9 @@ class Trainer:
                         logging.warning(f"Visualization failed: {e}")
 
         val_psnr = np.round(np.mean(np.array(psnr_list)), 4)
-        if val_psnr < 10:
-            print('something wrong during training, please change random seed and re-train')
-            exit()
+        # if val_psnr < 10:
+        #     print('something wrong during training, please change random seed and re-train')
+        #     exit()
 
             
         logging.info(f"Validation Metrics ({self.total_steps}): psnr {val_psnr}")

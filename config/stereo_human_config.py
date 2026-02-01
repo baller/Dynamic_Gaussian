@@ -44,20 +44,18 @@ class ConfigStereoHuman:
         self.cfg.raft.encoder_dims = [64, 96, 128]
         self.cfg.raft.hidden_dims = [128]*3
 
-        # Depth Anything V3 configuration (alternative to RAFT)
-        self.cfg.dav3 = CN()
-        self.cfg.dav3.model_name = 'da3-base'
-        self.cfg.dav3.export_feat_layers = [11]
-        self.cfg.dav3.feature_downsample_size = 64
-        self.cfg.dav3.max_disparity = 32
-        self.cfg.dav3.confidence_threshold = 0.7
-        self.cfg.dav3.peak_ratio_threshold = 1.3
-        self.cfg.dav3.min_anchor_points = 50
-        self.cfg.dav3.max_anchor_points = 500
-        self.cfg.dav3.scale_shift_hidden_dim = 64
-        self.cfg.dav3.use_ransac = True
-        self.cfg.dav3.ransac_iterations = 100
-        self.cfg.dav3.ransac_threshold = 0.1
+        # Depth Anything V3 configuration (正确的实现)
+        self.cfg.da3 = CN()
+        self.cfg.da3.model_name = 'depth-anything/DA3-LARGE'
+        self.cfg.da3.export_feat_layers = [11, 15, 19, 23]
+        self.cfg.da3.freeze_backbone = True
+        self.cfg.da3.mixed_precision = False
+        
+        # Depth alignment configuration
+        self.cfg.depth_align = CN()
+        self.cfg.depth_align.typical_disp_min_ratio = 0.01
+        self.cfg.depth_align.typical_disp_max_ratio = 0.15
+        self.cfg.depth_align.min_depth = 0.1
 
         self.cfg.gsnet = CN()
         self.cfg.gsnet.use_pe = None

@@ -24,33 +24,18 @@ raft:
   encoder_dims: [32, 48, 96]  
   hidden_dims: [96, 96, 96]  
 
-# Depth Anything V3 configuration (alternative to RAFT)
-dav3:
+# Depth Anything V3 configuration (正确的实现)
+da3:
   # Model configuration
-  model_name: 'da3-base'  # Options: 'da3-base', 'da3-large', 'da3-giant'
-  export_feat_layers: [11]  # Layer indices to export features from (for ViT-B: layers 0-11)
-  
-  # Feature downsampling configuration
-  feature_downsample_size: 64  # Downsample features to this resolution for efficiency
-  
-  # Cost volume configuration
-  max_disparity: 32  # Maximum disparity search range (at downsampled resolution)
-  
-  # Confidence filtering configuration (anchor point selection)
-  confidence_threshold: 0.7  # Minimum confidence to keep anchor point
-  peak_ratio_threshold: 1.3  # Peak should be this much higher than second best
-  min_anchor_points: 50  # Minimum number of anchor points required
-  max_anchor_points: 500  # Maximum number of anchor points to use
-  
-  # Scale/Shift estimation configuration
-  # Note: Now using learned network instead of analytical RANSAC
-  # These params are kept for fallback/comparison
-  use_ransac: True  # Use RANSAC for analytical fallback
-  ransac_iterations: 100
-  ransac_threshold: 0.1  # Inlier threshold (relative to depth range)
-  
-  # Scale/Shift network configuration
-  scale_shift_hidden_dim: 64  # Hidden dimension for scale-shift network
+  model_name: '/home/user_3/.cache/huggingface/hub/models--depth-anything--DA3-LARGE/snapshots/c54c26b16ec04d218e8d584ecf4bce082a9fcc20/model.safetensors'  # HuggingFace 模型名
+  export_feat_layers: [11, 15, 19, 23]  # 导出的特征层
+  freeze_backbone: True  # 是否冻结 DA3 参数
+  mixed_precision: False  # 是否使用混合精度
+
+# Depth alignment parameters
+depth_align:
+  typical_disp_min_ratio: 0.01  # 典型最小视差 (图像宽度的比例)
+  typical_disp_max_ratio: 0.15  # 典型最大视差 (图像宽度的比例)
 
 gsnet:
   encoder_dims: [32, 48, 96]
