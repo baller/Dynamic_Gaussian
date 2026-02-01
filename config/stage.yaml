@@ -24,18 +24,26 @@ raft:
   encoder_dims: [32, 48, 96]  
   hidden_dims: [96, 96, 96]  
 
-# Depth Anything V3 configuration (正确的实现)
+# Depth Anything V3 configuration
+# 使用 DA3-METRIC-LARGE 直接输出绝对深度，无需复杂的对齐
 da3:
   # Model configuration
-  model_name: '/home/user_3/.cache/huggingface/hub/models--depth-anything--DA3-LARGE/snapshots/c54c26b16ec04d218e8d584ecf4bce082a9fcc20/model.safetensors'  # HuggingFace 模型名
+  # 选项: 
+  #   - 'depth-anything/DA3-LARGE' (相对深度，需要对齐)
+  #   - 'depth-anything/DA3METRIC-LARGE' (绝对深度，推荐)
+  model_name: 'depth-anything/DA3METRIC-LARGE'  # Metric 模型直接输出绝对深度
   export_feat_layers: [11, 15, 19, 23]  # 导出的特征层
   freeze_backbone: True  # 是否冻结 DA3 参数
   mixed_precision: False  # 是否使用混合精度
+  local_files_only: False  # 是否只使用本地文件 (首次使用需设为 False 下载模型)
 
-# Depth alignment parameters
+# Depth alignment parameters (块匹配极线搜索)
 depth_align:
-  typical_disp_min_ratio: 0.01  # 典型最小视差 (图像宽度的比例)
-  typical_disp_max_ratio: 0.15  # 典型最大视差 (图像宽度的比例)
+  num_keypoints: 500      # 选取的关键点数量
+  patch_size: 11          # 匹配窗口大小
+  max_disparity: 128      # 最大视差搜索范围
+  min_depth: 0.1          # 最小深度
+  max_depth: 100.0        # 最大深度
 
 gsnet:
   encoder_dims: [32, 48, 96]

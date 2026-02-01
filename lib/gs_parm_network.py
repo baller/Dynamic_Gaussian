@@ -90,4 +90,4 @@ class GSRegresser(nn.Module):
         dep_out = self.depth_head(out)*0.5
 
 
-        return rot_out, scale_out, opacity_out, dep_out 
+        return rot_out, scale_out, opacity_out, dep_out

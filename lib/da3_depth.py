@@ -139,25 +139,28 @@ class DA3DepthEstimator(nn.Module):
         # 否则认为是 HuggingFace repo id
         return model_name
     
-    def forward(self, images, return_features=True, return_entropy=True):
+    def forward(self, images, intrinsics=None, return_features=True, return_entropy=True):
         """
         前向传播
         
         Args:
             images: 输入图像 [B, 3, H, W]，值范围 [0, 1]
+            intrinsics: 相机内参 [B, 3, 3]，用于 metric 模型
             return_features: 是否返回多尺度特征
             return_entropy: 是否返回注意力熵
             
         Returns:
             dict: {
-                'depth': [B, 1, H, W] 相对深度图,
+                'depth': [B, 1, H, W] 深度图 (metric 模型返回绝对深度),
                 'features': list of [B, C, H', W'] 多尺度特征 (可选),
-                'entropy': [B, 1, H, W] 注意力熵 (可选)
+                'entropy': [B, 1, H, W] 注意力熵 (可选),
+                'is_metric': bool 是否为 metric 深度
             }
         """
         self._lazy_load_model()
         
         B, C, H, W = images.shape
+        device = images.device
         
         # DA3/DINOv2 要求输入尺寸是 14 的倍数
         PATCH_SIZE = 14
@@ -174,6 +177,14 @@ class DA3DepthEstimator(nn.Module):
         # 对于单视图输入，N=1
         images_da3 = images.unsqueeze(1)  # [B, 1, 3, H, W]
         
+        # 准备内参 (用于 metric 模型)
+        intrinsics_da3 = None
+        if intrinsics is not None:
+            # 调整内参以适应 padding 后的尺寸
+            intrinsics_da3 = intrinsics.clone()
+            # 不需要调整，因为深度会被裁剪回原始尺寸
+            intrinsics_da3 = intrinsics_da3.unsqueeze(1)  # [B, 1, 3, 3]
+        
         # 获取要导出的特征层
         export_feat_layers = self.da3_cfg.get('export_feat_layers', [11, 15, 19, 23])
         
@@ -181,10 +192,15 @@ class DA3DepthEstimator(nn.Module):
             # DA3 前向传播
             output = self.model(
                 images_da3,
+                intrinsics=intrinsics_da3,
                 export_feat_layers=export_feat_layers if return_features else []
             )
         
         result = {}
+        
+        # 检查是否为 metric 模型
+        is_metric_model = 'metric' in self.da3_cfg.get('model_name', '').lower()
+        result['is_metric'] = is_metric_model
         
         # 提取深度图
         # DA3 输出深度形状: [B, N, H, W]
@@ -202,7 +218,22 @@ class DA3DepthEstimator(nn.Module):
         if depth.shape[-2:] != (H, W):
             depth = F.interpolate(depth, size=(H, W), mode='bilinear', align_corners=False)
         
+        # 对于 metric 模型，应用 focal scaling: metric_depth = focal * raw_depth / 300
+        # 参考官方代码: https://github.com/DepthAnything/Depth-Anything-3
+        if is_metric_model and intrinsics is not None:
+            # intrinsics: [B, 3, 3]
+            # 提取焦距 (fx, fy 的平均值)
+            focal_length = (intrinsics[:, 0, 0] + intrinsics[:, 1, 1]) / 2.0  # [B]
+            
+            # 应用 metric scaling
+            SCALE_FACTOR = 300.0
+            depth = depth * (focal_length[:, None, None, None] / SCALE_FACTOR)
+            
+            logger.debug(f"[DA3] Applied metric scaling with focal={focal_length.mean().item():.2f}, "
+                        f"depth range: [{depth.min().item():.3f}, {depth.max().item():.3f}]")
+        
         result['depth'] = depth
+        result['depth_raw'] = output.depth.clone()  # 保存原始深度
         
         # 提取多尺度特征
         if return_features and hasattr(output, 'aux') and output.aux is not None:

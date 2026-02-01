@@ -44,18 +44,21 @@ class ConfigStereoHuman:
         self.cfg.raft.encoder_dims = [64, 96, 128]
         self.cfg.raft.hidden_dims = [128]*3
 
-        # Depth Anything V3 configuration (正确的实现)
+        # Depth Anything V3 configuration
         self.cfg.da3 = CN()
-        self.cfg.da3.model_name = 'depth-anything/DA3-LARGE'
+        self.cfg.da3.model_name = 'depth-anything/DA3METRIC-LARGE'  # Metric 模型直接输出绝对深度
         self.cfg.da3.export_feat_layers = [11, 15, 19, 23]
         self.cfg.da3.freeze_backbone = True
         self.cfg.da3.mixed_precision = False
+        self.cfg.da3.local_files_only = False
         
-        # Depth alignment configuration
+        # Depth alignment configuration (块匹配极线搜索)
         self.cfg.depth_align = CN()
-        self.cfg.depth_align.typical_disp_min_ratio = 0.01
-        self.cfg.depth_align.typical_disp_max_ratio = 0.15
+        self.cfg.depth_align.num_keypoints = 500
+        self.cfg.depth_align.patch_size = 11
+        self.cfg.depth_align.max_disparity = 128
         self.cfg.depth_align.min_depth = 0.1
+        self.cfg.depth_align.max_depth = 100.0
 
         self.cfg.gsnet = CN()
         self.cfg.gsnet.use_pe = None
