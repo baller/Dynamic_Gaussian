@@ -108,8 +108,12 @@ class RtStereoHumanModel(nn.Module):
         for view in ['lmain', 'rmain']:
             data[view]['xyz'] = depth2pc(data[view]['depth'], data[view]['extr'], data[view]['intr']).view(bs, -1, 3)  # [B, S*S, 3]
     
-            valid = data[view]['mask'][:,:1,:,:] > 0.5  # [B, 1, S, S]
-            data[view]['pts_valid'] = valid.view(bs, -1)  # [B, S*S]
+            # 基于深度有效性设置 pts_valid
+            # 倒数深度 > 0.01 表示真实深度 < 100m（有效范围）
+            # 倒数深度 < 10 表示真实深度 > 0.1m（避免过近的点）
+            depth_valid = (data[view]['depth'][:, :1, :, :] > 0.01) & \
+                         (data[view]['depth'][:, :1, :, :] < 10.0)
+            data[view]['pts_valid'] = depth_valid.view(bs, -1)  # [B, S*S]
 
 
 
@@ -738,8 +742,12 @@ class DAV3StereoHumanModel(nn.Module):
                 data[view]['intr']
             ).view(bs, -1, 3)
             
-            valid = data[view]['mask'][:, :1, :, :] > 0.5
-            data[view]['pts_valid'] = valid.view(bs, -1)
+            # 基于深度有效性设置 pts_valid
+            # 倒数深度 > 0.01 表示真实深度 < 100m（有效范围）
+            # 倒数深度 < 10 表示真实深度 > 0.1m（避免过近的点）
+            depth_valid = (data[view]['depth'][:, :1, :, :] > 0.01) & \
+                         (data[view]['depth'][:, :1, :, :] < 10.0)
+            data[view]['pts_valid'] = depth_valid.view(bs, -1)
         
         # 存储高斯参数
         data['novel_view']['scale_regular'] = torch.mean(scale_maps)
