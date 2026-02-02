@@ -162,14 +162,26 @@ def depth2mesh(pts, depth):
     return obj_out
 
 
-def depth2pc(depth, extrinsic, intrinsic):
+def depth2pc(depth, extrinsic, intrinsic, return_2d=False):
+    """
+    将深度图转换为点云
+    
+    Args:
+        depth: [B, C, H, W] 倒数深度图
+        extrinsic: [B, 3, 4] 或 [B, 4, 4] 外参矩阵
+        intrinsic: [B, 3, 3] 内参矩阵
+        return_2d: 如果为 True，返回 [B, 3, H, W] 格式；否则返回 [B, H*W, 3]
+    
+    Returns:
+        点云坐标
+    """
     B, C, H, W = depth.shape
     depth = depth[:, 0, :, :]
     rot = extrinsic[:, :3, :3]
     trans = extrinsic[:, :3, 3:]
 
     y, x = torch.meshgrid(torch.linspace(0.5, H-0.5, H, device=depth.device), torch.linspace(0.5, W-0.5, W, device=depth.device))
-    pts_2d = torch.stack([x, y, torch.ones_like(x)], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # B S S 3
+    pts_2d = torch.stack([x, y, torch.ones_like(x)], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # B H W 3
 
     pts_2d[..., 2] = 1.0 / (depth + 1e-8)
     pts_2d[:, :, :, 0] -= intrinsic[:, None, None, 0, 2]
@@ -180,11 +192,15 @@ def depth2pc(depth, extrinsic, intrinsic):
     pts_2d[..., 0] /= intrinsic[:, 0, 0][:, None, None]
     pts_2d[..., 1] /= intrinsic[:, 1, 1][:, None, None]
 
-    pts_2d = pts_2d.view(B, -1, 3).permute(0, 2, 1)
+    pts_2d = pts_2d.view(B, -1, 3).permute(0, 2, 1)  # [B, 3, H*W]
     rot_t = rot.permute(0, 2, 1)
-    pts = torch.bmm(rot_t, pts_2d) - torch.bmm(rot_t, trans)
+    pts = torch.bmm(rot_t, pts_2d) - torch.bmm(rot_t, trans)  # [B, 3, H*W]
 
-    return pts.permute(0, 2, 1)
+    if return_2d:
+        # 返回 [B, 3, H, W] 格式，便于与 xyz_res 相加
+        return pts.view(B, 3, H, W)
+    
+    return pts.permute(0, 2, 1)  # [B, H*W, 3]                       
 
 
 def flow2depth(data):

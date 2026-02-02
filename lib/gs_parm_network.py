@@ -50,10 +50,11 @@ class GSRegresser(nn.Module):
             nn.Conv2d(self.head_dim, 1, kernel_size=1),
             nn.Sigmoid()
         )
-        self.depth_head = nn.Sequential(
+        # XYZ residual head (3 channels for x, y, z)
+        self.xyz_head = nn.Sequential(
             nn.Conv2d(self.head_dim, self.head_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(self.head_dim, 1, kernel_size=1),
+            nn.Conv2d(self.head_dim, 3, kernel_size=1),
             nn.Tanh()
         )
 
@@ -87,7 +88,8 @@ class GSRegresser(nn.Module):
         rot_out = self.rot_head(out)
         rot_out = torch.nn.functional.normalize(rot_out, dim=1)
 
-        dep_out = self.depth_head(out)*0.5
+        # XYZ residual (3 channels)
+        xyz_out = self.xyz_head(out) * 0.1  # smaller scale for xyz residuals
 
 
-        return rot_out, scale_out, opacity_out, dep_out
+        return rot_out, scale_out, opacity_out, xyz_out

@@ -105,8 +105,8 @@ class Trainer:
                     r_xyz_i = r_xyz[b_i, :, :]
                     r_xyz_i = r_xyz_i[r_valid_i].view(1, -1, 3).contiguous()
                     
-                    sample_l = np.random.choice(l_xyz_i.shape[1], 10000, replace = False)
-                    sample_r = np.random.choice(r_xyz_i.shape[1], 10000, replace = False)
+                    sample_l = np.random.choice(l_xyz_i.shape[1], 100000, replace = False)
+                    sample_r = np.random.choice(r_xyz_i.shape[1], 100000, replace = False)
                     chamfer_loss_i, _ = chamfer_distance(l_xyz_i[:, sample_l], r_xyz_i[:, sample_r])
                     chamfer_loss += chamfer_loss_i
                 
@@ -114,7 +114,7 @@ class Trainer:
 
             Ll1 = l1_loss(render_novel, gt_novel)
             Lssim = 1.0 - ssim(render_novel, gt_novel)
-            loss = 0.8 * Ll1 + 0.2 * Lssim + 0.5 * chamfer_loss 
+            loss = 0.8 * Ll1 + 0.2 * Lssim + 2.0 * chamfer_loss 
 
             log_l1 += 0.8 * Ll1.item()
             log_ssim += 0.2 * Lssim.item()

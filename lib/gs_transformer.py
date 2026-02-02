@@ -241,9 +241,9 @@ class GSTransformer(nn.Module):
             nn.Sigmoid(),
         )
         
-        # Depth residual head
-        self.depth_head = nn.Sequential(
-            nn.Conv2d(head_features, 1, kernel_size=1),
+        # XYZ residual head (3 channels for x, y, z)
+        self.xyz_head = nn.Sequential(
+            nn.Conv2d(head_features, 3, kernel_size=1),
             nn.Tanh(),
         )
         
@@ -381,14 +381,14 @@ class GSTransformer(nn.Module):
         # Opacity
         opacity_out = self.opacity_head(out)
         
-        # Depth residual
-        depth_out = self.depth_head(out) * 0.5
+        # XYZ residual (3 channels)
+        xyz_out = self.xyz_head(out) * 0.1  # smaller scale for xyz residuals
         
         # 9. 裁剪回原始分辨率 (移除 padding)
         if pad_h > 0 or pad_w > 0:
             rot_out = rot_out[:, :, :H_orig, :W_orig].contiguous()
             scale_out = scale_out[:, :, :H_orig, :W_orig].contiguous()
             opacity_out = opacity_out[:, :, :H_orig, :W_orig].contiguous()
-            depth_out = depth_out[:, :, :H_orig, :W_orig].contiguous()
+            xyz_out = xyz_out[:, :, :H_orig, :W_orig].contiguous()
         
-        return rot_out, scale_out, opacity_out, depth_out
+        return rot_out, scale_out, opacity_out, xyz_out

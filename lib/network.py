@@ -102,6 +102,7 @@ class RtStereoHumanModel(nn.Module):
             return data, flow_loss, metrics
 
     def flow2gsparms(self, lr_img, lr_img_feat, data, bs):
+        """转换 flow 到高斯参数，使用 xyz 残差调整点云位置"""
         for view in ['lmain', 'rmain']:
             data[view]['depth'] = flow2depth(data[view])
             
@@ -109,26 +110,41 @@ class RtStereoHumanModel(nn.Module):
         r_depth = data['rmain']['depth'] 
         lr_depth = torch.concat([l_depth, r_depth], dim=0)
         
-        # regress gaussian parms
-        rot_maps, scale_maps, opacity_maps, depth_maps = self.gs_parm_regresser(lr_img, lr_depth, lr_img_feat)
-        l_resdepth, r_resdepth =  torch.split(depth_maps, [bs, bs])
-        # depth input
-
-        data['lmain']['depth'] += l_resdepth
-        data['rmain']['depth'] += r_resdepth
-
-        cut_m = 0
+        # 1. 先计算初始点云 (从原始深度，返回 [B, 3, H, W] 格式)
+        l_xyz_init = depth2pc(
+            data['lmain']['depth'], 
+            data['lmain']['extr'], 
+            data['lmain']['intr'],
+            return_2d=True
+        )  # [B, 3, H, W]
+        r_xyz_init = depth2pc(
+            data['rmain']['depth'], 
+            data['rmain']['extr'], 
+            data['rmain']['intr'],
+            return_2d=True
+        )  # [B, 3, H, W]
+        
+        # 2. 预测高斯参数和 xyz 残差
+        rot_maps, scale_maps, opacity_maps, xyz_res = self.gs_parm_regresser(lr_img, lr_depth, lr_img_feat)
+        
+        # 3. 分割 xyz 残差
+        l_xyz_res, r_xyz_res = torch.split(xyz_res, [bs, bs])
+        
+        # 4. 加上 xyz 残差
+        l_xyz = l_xyz_init + l_xyz_res  # [B, 3, H, W]
+        r_xyz = r_xyz_init + r_xyz_res  # [B, 3, H, W]
+        
+        # 5. 转换为 [B, H*W, 3] 格式
+        data['lmain']['xyz'] = l_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
+        data['rmain']['xyz'] = r_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
+        
+        # 6. 基于深度有效性设置 pts_valid
         for view in ['lmain', 'rmain']:
-            data[view]['xyz'] = depth2pc(data[view]['depth'], data[view]['extr'], data[view]['intr']).view(bs, -1, 3)  # [B, S*S, 3]
-    
-            # 基于深度有效性设置 pts_valid
             # 倒数深度 > 0.01 表示真实深度 < 100m（有效范围）
             # 倒数深度 < 10 表示真实深度 > 0.1m（避免过近的点）
             depth_valid = (data[view]['depth'][:, :1, :, :] > 0.01) & \
                          (data[view]['depth'][:, :1, :, :] < 10.0)
             data[view]['pts_valid'] = depth_valid.view(bs, -1)  # [B, S*S]
-
-
 
         data['novel_view']['scale_regular'] = torch.mean(scale_maps)
 
@@ -745,30 +761,43 @@ class DAV3StereoHumanModel(nn.Module):
         return data, depth_loss, metrics
     
     def depth2gsparms(self, lr_img, lr_img_feat, data, bs):
-        """转换深度到高斯参数"""
+        """转换深度到高斯参数，使用 xyz 残差调整点云位置"""
         l_depth = data['lmain']['depth']
         r_depth = data['rmain']['depth']
         lr_depth = torch.cat([l_depth, r_depth], dim=0)
         
-        # 预测高斯参数
-        rot_maps, scale_maps, opacity_maps, depth_maps = self.gs_parm_regresser(
+        # 1. 先计算初始点云 (从原始深度，返回 [B, 3, H, W] 格式)
+        l_xyz_init = depth2pc(
+            data['lmain']['depth'], 
+            data['lmain']['extr'], 
+            data['lmain']['intr'],
+            return_2d=True
+        )  # [B, 3, H, W]
+        r_xyz_init = depth2pc(
+            data['rmain']['depth'], 
+            data['rmain']['extr'], 
+            data['rmain']['intr'],
+            return_2d=True
+        )  # [B, 3, H, W]
+        
+        # 2. 预测高斯参数和 xyz 残差
+        rot_maps, scale_maps, opacity_maps, xyz_res = self.gs_parm_regresser(
             lr_img, lr_depth, lr_img_feat
         )
         
-        # 添加深度残差
-        l_resdepth, r_resdepth = torch.split(depth_maps, [bs, bs])
-        data['lmain']['depth'] = data['lmain']['depth'] + l_resdepth
-        data['rmain']['depth'] = data['rmain']['depth'] + r_resdepth
+        # 3. 分割 xyz 残差
+        l_xyz_res, r_xyz_res = torch.split(xyz_res, [bs, bs])
         
-        # 转换深度到点云
+        # 4. 加上 xyz 残差
+        l_xyz = l_xyz_init + l_xyz_res  # [B, 3, H, W]
+        r_xyz = r_xyz_init + r_xyz_res  # [B, 3, H, W]
+        
+        # 5. 转换为 [B, H*W, 3] 格式
+        data['lmain']['xyz'] = l_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
+        data['rmain']['xyz'] = r_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
+        
+        # 6. 基于深度有效性设置 pts_valid
         for view in ['lmain', 'rmain']:
-            data[view]['xyz'] = depth2pc(
-                data[view]['depth'], 
-                data[view]['extr'], 
-                data[view]['intr']
-            ).view(bs, -1, 3)
-            
-            # 基于深度有效性设置 pts_valid
             # 倒数深度 > 0.01 表示真实深度 < 100m（有效范围）
             # 倒数深度 < 10 表示真实深度 > 0.1m（避免过近的点）
             depth_valid = (data[view]['depth'][:, :1, :, :] > 0.01) & \

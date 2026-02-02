@@ -1,4 +1,4 @@
-name: 'gps_plus_transformer'
+name: 'gps_plus_transformer_debug'
 
 lr: 0.0002
 wdecay: 1e-5
