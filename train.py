@@ -76,6 +76,7 @@ class Trainer:
         log_ssim = 0
         log_chamfer = 0
         log_scale = 0
+        log_xyz_res = 0
         if_chamfer = True   
         if_scale = False  
         iter_from = -1 
@@ -114,12 +115,18 @@ class Trainer:
 
             Ll1 = l1_loss(render_novel, gt_novel)
             Lssim = 1.0 - ssim(render_novel, gt_novel)
-            loss = 0.8 * Ll1 + 0.2 * Lssim + 2.0 * chamfer_loss 
+            
+            # xyz 残差正则化损失 - 防止点云漂移
+            xyz_res_regular = data['novel_view'].get('xyz_res_regular', torch.tensor(0.0).cuda())
+            xyz_res_loss = 10.0 * xyz_res_regular  # 权重 10.0
+            
+            loss = 0.8 * Ll1 + 0.2 * Lssim + 2.0 * chamfer_loss + xyz_res_loss
 
             log_l1 += 0.8 * Ll1.item()
             log_ssim += 0.2 * Lssim.item()
             log_chamfer += 0.5 * chamfer_loss.item() if if_chamfer and itr_>iter_from else 0 
             log_scale += 0.5 * data['novel_view']['scale_regular'].item() if if_scale else 0
+            log_xyz_res += xyz_res_regular.item() if isinstance(xyz_res_regular, torch.Tensor) else xyz_res_regular
 
             if self.total_steps and self.total_steps % self.cfg.record.loss_freq == 0:
                 self.logger.writer.add_scalar(f'lr', self.optimizer.param_groups[0]['lr'], self.total_steps)
@@ -127,7 +134,8 @@ class Trainer:
             metrics.update({
                 'l1': Ll1.item(),
                 'ssim': Lssim.item(),
-                'chamfer': 0.5*chamfer_loss.item() if if_chamfer and itr_>iter_from else 0
+                'chamfer': 0.5*chamfer_loss.item() if if_chamfer and itr_>iter_from else 0,
+                'xyz_res': xyz_res_regular.item() if isinstance(xyz_res_regular, torch.Tensor) else xyz_res_regular
             })
             self.logger.push(metrics)
 
@@ -158,11 +166,13 @@ class Trainer:
                     'ssim', log_ssim/100,
                     'chamfer', log_chamfer/100,
                     'scale', log_scale/100,
+                    'xyz_res', log_xyz_res/100,
                     )
                 log_l1 = 0
                 log_ssim = 0
                 log_chamfer = 0
                 log_scale = 0
+                log_xyz_res = 0
 
         print("FINISHED TRAINING")
         self.logger.close()
@@ -238,14 +248,46 @@ class Trainer:
         assert os.path.exists(load_path)
         logging.info(f"Loading checkpoint from {load_path} ...")
         ckpt = torch.load(load_path, map_location='cuda')
-        self.model.load_state_dict(ckpt['network'], strict=strict)
-        logging.info(f"Parameter loading done")
+        
+        # Try strict loading first, fall back to non-strict if needed
+        try:
+            self.model.load_state_dict(ckpt['network'], strict=strict)
+            logging.info(f"Parameter loading done (strict={strict})")
+        except RuntimeError as e:
+            if strict:
+                logging.warning(f"Strict loading failed: {e}")
+                logging.info("Retrying with strict=False...")
+                
+                # Load with strict=False and report missing/unexpected keys
+                model_state = self.model.state_dict()
+                ckpt_state = ckpt['network']
+                
+                # Find missing and unexpected keys
+                missing_keys = set(model_state.keys()) - set(ckpt_state.keys())
+                unexpected_keys = set(ckpt_state.keys()) - set(model_state.keys())
+                
+                if missing_keys:
+                    logging.warning(f"Missing keys ({len(missing_keys)}): {list(missing_keys)[:5]}...")
+                if unexpected_keys:
+                    logging.warning(f"Unexpected keys ({len(unexpected_keys)}): {list(unexpected_keys)[:5]}...")
+                
+                # Filter out unexpected keys and load
+                filtered_state = {k: v for k, v in ckpt_state.items() if k in model_state}
+                self.model.load_state_dict(filtered_state, strict=False)
+                logging.info(f"Parameter loading done (strict=False, loaded {len(filtered_state)}/{len(model_state)} keys)")
+            else:
+                raise e
+        
         if load_optimizer:
             self.total_steps = ckpt['total_steps'] + 1
             self.logger.total_steps = self.total_steps
-            self.optimizer.load_state_dict(ckpt['optimizer'])
-            self.scheduler.load_state_dict(ckpt['scheduler'])
-            logging.info(f"Optimizer loading done")
+            try:
+                self.optimizer.load_state_dict(ckpt['optimizer'])
+                self.scheduler.load_state_dict(ckpt['scheduler'])
+                logging.info(f"Optimizer loading done, resuming from step {self.total_steps}")
+            except Exception as e:
+                logging.warning(f"Failed to load optimizer state: {e}")
+                logging.warning("Optimizer will start fresh, but training will resume from the saved step")
 
     def save_ckpt(self, save_path, show_log=True):
         if show_log:
@@ -258,6 +300,29 @@ class Trainer:
         }, save_path)
 
 
+def find_latest_checkpoint(ckpt_dir):
+    """Find the latest checkpoint in the directory."""
+    if not os.path.exists(ckpt_dir):
+        return None
+    
+    ckpt_files = []
+    for f in os.listdir(ckpt_dir):
+        if f.endswith('.pth'):
+            ckpt_files.append(os.path.join(ckpt_dir, f))
+    
+    if not ckpt_files:
+        return None
+    
+    # Prefer *_latest.pth if exists
+    for f in ckpt_files:
+        if '_latest.pth' in f:
+            return f
+    
+    # Otherwise return the most recently modified checkpoint
+    ckpt_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    return ckpt_files[0]
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train GPS+ model')
     parser.add_argument('--use_dav3', type=bool,
@@ -265,6 +330,11 @@ if __name__ == '__main__':
                         help='Use Depth Anything V3 instead of RAFT-Stereo')
     parser.add_argument('--config', type=str, default='config/stage.yaml',
                         help='Path to config file')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from. Use "auto" to find latest checkpoint, '
+                             'or provide explicit path to .pth file')
+    parser.add_argument('--exp_name', type=str, default=None,
+                        help='Experiment name (required when resume="auto" to locate checkpoint)')
     args = parser.parse_args()
     
     logging.basicConfig(level=logging.INFO,
@@ -275,14 +345,59 @@ if __name__ == '__main__':
     cfg = cfg.get_cfg()
 
     cfg.defrost()
-    dt = datetime.today()
-    # Add dav3 suffix to experiment name if using DAV3
-    model_suffix = '_dav3' if args.use_dav3 else ''
-    cfg.exp_name = '%s%s_%s%s' % (cfg.name, model_suffix, str(dt.month).zfill(2), str(dt.day).zfill(2))
+    
+    # Determine experiment name
+    if args.exp_name:
+        # Use provided experiment name (for resume)
+        cfg.exp_name = args.exp_name
+    elif args.resume and args.resume != 'auto' and os.path.exists(args.resume):
+        # Extract exp_name from checkpoint path: experiments/{exp_name}/ckpt/*.pth
+        try:
+            ckpt_path = os.path.abspath(args.resume)
+            exp_name = ckpt_path.split('/experiments/')[-1].split('/')[0]
+            cfg.exp_name = exp_name
+            logging.info(f"Extracted experiment name from checkpoint path: {exp_name}")
+        except:
+            # Fallback to default naming
+            dt = datetime.today()
+            model_suffix = '_dav3' if args.use_dav3 else ''
+            cfg.exp_name = '%s%s_%s%s' % (cfg.name, model_suffix, str(dt.month).zfill(2), str(dt.day).zfill(2))
+    else:
+        # Create new experiment name
+        dt = datetime.today()
+        model_suffix = '_dav3' if args.use_dav3 else ''
+        cfg.exp_name = '%s%s_%s%s' % (cfg.name, model_suffix, str(dt.month).zfill(2), str(dt.day).zfill(2))
+    
     cfg.record.ckpt_path = "experiments/%s/ckpt" % cfg.exp_name
     cfg.record.show_path = "experiments/%s/show" % cfg.exp_name
     cfg.record.logs_path = "experiments/%s/logs" % cfg.exp_name
     cfg.record.file_path = "experiments/%s/file" % cfg.exp_name
+    
+    # Handle resume logic
+    if args.resume:
+        if args.resume == 'auto':
+            # Auto-find latest checkpoint
+            if not args.exp_name:
+                logging.error("--exp_name is required when using --resume auto")
+                exit(1)
+            latest_ckpt = find_latest_checkpoint(cfg.record.ckpt_path)
+            if latest_ckpt:
+                cfg.restore_ckpt = latest_ckpt
+                logging.info(f"Auto-detected checkpoint: {latest_ckpt}")
+            else:
+                logging.warning(f"No checkpoint found in {cfg.record.ckpt_path}, starting from scratch")
+                cfg.restore_ckpt = None
+        else:
+            # Use provided checkpoint path
+            if os.path.exists(args.resume):
+                cfg.restore_ckpt = args.resume
+                logging.info(f"Using provided checkpoint: {args.resume}")
+            else:
+                logging.error(f"Checkpoint not found: {args.resume}")
+                exit(1)
+    else:
+        cfg.restore_ckpt = getattr(cfg, 'restore_ckpt', None)
+    
     cfg.freeze()
 
 

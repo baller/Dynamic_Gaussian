@@ -382,7 +382,8 @@ class GSTransformer(nn.Module):
         opacity_out = self.opacity_head(out)
         
         # XYZ residual (3 channels)
-        xyz_out = self.xyz_head(out) * 0.1  # smaller scale for xyz residuals
+        # 缩放因子要非常小，防止点云漂移
+        xyz_out = self.xyz_head(out) * 0.01  # very small scale to prevent drift
         
         # 9. 裁剪回原始分辨率 (移除 padding)
         if pad_h > 0 or pad_w > 0:

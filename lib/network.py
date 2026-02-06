@@ -147,6 +147,11 @@ class RtStereoHumanModel(nn.Module):
             data[view]['pts_valid'] = depth_valid.view(bs, -1)  # [B, S*S]
 
         data['novel_view']['scale_regular'] = torch.mean(scale_maps)
+        
+        # 存储 xyz 残差用于正则化
+        data['lmain']['xyz_res'] = l_xyz_res
+        data['rmain']['xyz_res'] = r_xyz_res
+        data['novel_view']['xyz_res_regular'] = torch.mean(xyz_res.abs())  # L1 正则化
 
         data['lmain']['rot_maps'], data['rmain']['rot_maps'] = torch.split(rot_maps, [bs, bs])
         data['lmain']['scale_maps'], data['rmain']['scale_maps'] = torch.split(scale_maps, [bs, bs])
@@ -806,6 +811,11 @@ class DAV3StereoHumanModel(nn.Module):
         
         # 存储高斯参数
         data['novel_view']['scale_regular'] = torch.mean(scale_maps)
+        
+        # 存储 xyz 残差用于正则化
+        data['lmain']['xyz_res'] = l_xyz_res
+        data['rmain']['xyz_res'] = r_xyz_res
+        data['novel_view']['xyz_res_regular'] = torch.mean(xyz_res.abs())  # L1 正则化
         
         data['lmain']['rot_maps'], data['rmain']['rot_maps'] = torch.split(rot_maps, [bs, bs])
         data['lmain']['scale_maps'], data['rmain']['scale_maps'] = torch.split(scale_maps, [bs, bs])

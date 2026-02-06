@@ -61,3 +61,14 @@ gsnet:
 record:
   loss_freq: 20
   eval_freq: 100
+  save_iter: [5000, 10000, 20000, 30000, 50000, 80000]  # Save checkpoint at these iterations
+
+# Resume training from checkpoint
+# Options:
+#   - null: Start training from scratch
+#   - 'path/to/checkpoint.pth': Resume from specific checkpoint
+#   - Use --resume argument in command line for more flexibility
+restore_ckpt: '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_transformer_debug_dav3_0203/ckpt/iter20000.pth'
+
+# Stage 1 checkpoint (for stage 2 training, load weights without optimizer state)
+stage1_ckpt: null

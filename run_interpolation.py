@@ -116,6 +116,8 @@ class StereoHumanModel(nn.Module):
         super().__init__()
         
         self.model = DAV3StereoHumanModel(cfg, with_gs_render=True)
+        # 确保 DA3 模型已初始化，以匹配 checkpoint 中的 state_dict 结构
+        self.model.da3_estimator._lazy_load_model()
         ckpt = torch.load(ckpt_path, map_location='cuda')
         self.model.load_state_dict(ckpt['network'], strict=True)
         self.model = self.model.cuda()
@@ -260,10 +262,10 @@ if __name__ == '__main__':
 
     cfg.defrost()
     dt = datetime.today()
-    cfg.exp_name = 'gps_plus_show_0131' # TODO
+    cfg.exp_name = 'gps_plus_show_0205' # TODO
 
     cfg.record.show_path = "experiments/%s/show_free_%s" % (cfg.exp_name, tar_n)
-    cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_dav3_0129/ckpt/iter40000.pth' # TODO
+    cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_transformer_debug_dav3_0203/ckpt/iter20000.pth' # TODO
     cfg.freeze()
     LOOP_NUM = 20
 

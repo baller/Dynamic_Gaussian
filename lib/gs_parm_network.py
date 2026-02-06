@@ -89,7 +89,8 @@ class GSRegresser(nn.Module):
         rot_out = torch.nn.functional.normalize(rot_out, dim=1)
 
         # XYZ residual (3 channels)
-        xyz_out = self.xyz_head(out) * 0.1  # smaller scale for xyz residuals
+        # 缩放因子要非常小，防止点云漂移
+        xyz_out = self.xyz_head(out) * 0.01  # very small scale to prevent drift
 
 
         return rot_out, scale_out, opacity_out, xyz_out
