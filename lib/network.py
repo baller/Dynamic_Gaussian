@@ -11,13 +11,20 @@ from lib.embedder import get_embedder
 from lib.attention_module import LocalFeatureTransformer
 from torch.cuda.amp import autocast as autocast
 
-# Import DA3 depth estimator (正确的实现)
+# Import DA3 depth estimator
 try:
     from lib.da3_depth import DA3DepthEstimator, DA3FeatureAdapter, create_da3_estimator
     DAV3_AVAILABLE = True
 except ImportError:
     DAV3_AVAILABLE = False
     print("Warning: DA3 depth estimator not available")
+
+# Import depth refinement module
+try:
+    from lib.depth_refine import DepthRefineNet
+except ImportError:
+    DepthRefineNet = None
+    print("Warning: DepthRefineNet not available")
 
 
 class RtStereoHumanModel(nn.Module):
@@ -138,12 +145,12 @@ class RtStereoHumanModel(nn.Module):
         data['lmain']['xyz'] = l_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
         data['rmain']['xyz'] = r_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
         
-        # 6. 基于深度有效性设置 pts_valid
+        # 6. 基于深度有效性设置 pts_valid (从配置读取阈值)
+        depth_valid_min = getattr(self.cfg.gsnet, 'depth_valid_min', 0.01)
+        depth_valid_max = getattr(self.cfg.gsnet, 'depth_valid_max', 10.0)
         for view in ['lmain', 'rmain']:
-            # 倒数深度 > 0.01 表示真实深度 < 100m（有效范围）
-            # 倒数深度 < 10 表示真实深度 > 0.1m（避免过近的点）
-            depth_valid = (data[view]['depth'][:, :1, :, :] > 0.01) & \
-                         (data[view]['depth'][:, :1, :, :] < 10.0)
+            depth_valid = (data[view]['depth'][:, :1, :, :] > depth_valid_min) & \
+                         (data[view]['depth'][:, :1, :, :] < depth_valid_max)
             data[view]['pts_valid'] = depth_valid.view(bs, -1)  # [B, S*S]
 
         data['novel_view']['scale_regular'] = torch.mean(scale_maps)
@@ -174,6 +181,7 @@ class DAV3StereoHumanModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.with_gs_render = with_gs_render
+        self.use_transformer = getattr(self.cfg.gsnet, 'use_transformer', False)
         
         if not DAV3_AVAILABLE:
             raise ImportError("DA3 depth estimator is required but not available. "
@@ -182,16 +190,16 @@ class DAV3StereoHumanModel(nn.Module):
         # DA3 深度估计器
         self.da3_estimator = DA3DepthEstimator(cfg)
         
-        # Image encoder for GSRegresser compatibility
-        self.img_encoder = UnetExtractor(
-            in_channel=3, 
-            encoder_dim=self.cfg.raft.encoder_dims
-        )
+        # 深度细化模块 (可学习, DA3 输出后细化边缘)
+        depth_refine_cfg = getattr(cfg, 'depth_refine', None)
+        if depth_refine_cfg is not None and getattr(depth_refine_cfg, 'enabled', False) and DepthRefineNet is not None:
+            self.depth_refine = DepthRefineNet(cfg)
+        else:
+            self.depth_refine = None
         
         # Gaussian parameter regresser
         if self.with_gs_render:
-            # 根据配置选择 GSRegresser (CNN) 或 GSTransformer
-            if getattr(self.cfg.gsnet, 'use_transformer', False):
+            if self.use_transformer:
                 from lib.gs_transformer import GSTransformer
                 self.gs_parm_regresser = GSTransformer(
                     self.cfg,
@@ -202,8 +210,17 @@ class DAV3StereoHumanModel(nn.Module):
                     mlp_ratio=getattr(self.cfg.gsnet, 'transformer_mlp_ratio', 4.0),
                     use_checkpoint=getattr(self.cfg.gsnet, 'transformer_use_checkpoint', False),
                 )
+                # Transformer 使用 DA3 特征，不需要 UNet
+                self.img_encoder = None
             else:
+                # CNN GSRegresser 仍需要 UNet 特征
+                self.img_encoder = UnetExtractor(
+                    in_channel=3,
+                    encoder_dim=self.cfg.raft.encoder_dims
+                )
                 self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
+        else:
+            self.img_encoder = None
     
     def _normalize_for_da3(self, image: torch.Tensor) -> torch.Tensor:
         """
@@ -672,8 +689,18 @@ class DAV3StereoHumanModel(nn.Module):
             return_entropy=False
         )
         
+        # 保存 DA3 DINOv2 特征供 GSTransformer 使用
+        da3_features = da3_output.get('features', None)
+        if da3_features is not None:
+            data['da3_features'] = da3_features  # list of [2B, C, H', W']
+        
         # 获取深度
         depth = da3_output['depth']  # [2B, 1, H, W]
+        
+        # 深度细化 (可学习模块)
+        if self.depth_refine is not None:
+            depth = self.depth_refine(depth, image_da3)
+        
         l_depth_raw, r_depth_raw = torch.split(depth, [bs, bs])
         
         # 检查是否为 metric 模型
@@ -756,17 +783,27 @@ class DAV3StereoHumanModel(nn.Module):
         if not self.with_gs_render:
             return data, depth_loss, metrics
         
-        # 生成多尺度特征
-        with autocast(enabled=self.cfg.raft.mixed_precision):
-            img_feat = self.img_encoder(image)
-        
         # 预测高斯参数
-        data = self.depth2gsparms(image, img_feat, data, bs)
+        if self.use_transformer:
+            # Transformer 使用 DA3 特征，不需要 UNet
+            data = self.depth2gsparms(image, da3_features, data, bs)
+        else:
+            # CNN 使用 UNet 特征
+            with autocast(enabled=self.cfg.raft.mixed_precision):
+                img_feat = self.img_encoder(image)
+            data = self.depth2gsparms(image, img_feat, data, bs)
         
         return data, depth_loss, metrics
     
-    def depth2gsparms(self, lr_img, lr_img_feat, data, bs):
-        """转换深度到高斯参数，使用 xyz 残差调整点云位置"""
+    def depth2gsparms(self, lr_img, lr_features, data, bs):
+        """转换深度到高斯参数，使用 xyz 残差调整点云位置
+        
+        Args:
+            lr_img: [2B, 3, H, W] 左右视图图像
+            lr_features: DA3 features (list of tensors) 或 UNet img_feat (tuple of tensors)
+            data: 数据字典
+            bs: batch size
+        """
         l_depth = data['lmain']['depth']
         r_depth = data['rmain']['depth']
         lr_depth = torch.cat([l_depth, r_depth], dim=0)
@@ -786,8 +823,9 @@ class DAV3StereoHumanModel(nn.Module):
         )  # [B, 3, H, W]
         
         # 2. 预测高斯参数和 xyz 残差
+        # GSTransformer 接受 da3_features; GSRegresser 接受 img_feat
         rot_maps, scale_maps, opacity_maps, xyz_res = self.gs_parm_regresser(
-            lr_img, lr_depth, lr_img_feat
+            lr_img, lr_depth, lr_features
         )
         
         # 3. 分割 xyz 残差
@@ -801,12 +839,12 @@ class DAV3StereoHumanModel(nn.Module):
         data['lmain']['xyz'] = l_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
         data['rmain']['xyz'] = r_xyz.view(bs, 3, -1).permute(0, 2, 1)  # [B, H*W, 3]
         
-        # 6. 基于深度有效性设置 pts_valid
+        # 6. 基于深度有效性设置 pts_valid (从配置读取阈值)
+        depth_valid_min = getattr(self.cfg.gsnet, 'depth_valid_min', 0.01)
+        depth_valid_max = getattr(self.cfg.gsnet, 'depth_valid_max', 10.0)
         for view in ['lmain', 'rmain']:
-            # 倒数深度 > 0.01 表示真实深度 < 100m（有效范围）
-            # 倒数深度 < 10 表示真实深度 > 0.1m（避免过近的点）
-            depth_valid = (data[view]['depth'][:, :1, :, :] > 0.01) & \
-                         (data[view]['depth'][:, :1, :, :] < 10.0)
+            depth_valid = (data[view]['depth'][:, :1, :, :] > depth_valid_min) & \
+                         (data[view]['depth'][:, :1, :, :] < depth_valid_max)
             data[view]['pts_valid'] = depth_valid.view(bs, -1)
         
         # 存储高斯参数

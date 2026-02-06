@@ -225,9 +225,9 @@ class DA3DepthEstimator(nn.Module):
             # 提取焦距 (fx, fy 的平均值)
             focal_length = (intrinsics[:, 0, 0] + intrinsics[:, 1, 1]) / 2.0  # [B]
             
-            # 应用 metric scaling
-            SCALE_FACTOR = 300.0
-            depth = depth * (focal_length[:, None, None, None] / SCALE_FACTOR)
+            # 应用 metric scaling (从配置读取 scale factor)
+            scale_factor = getattr(self.da3_cfg, 'metric_scale_factor', 300.0) if self.da3_cfg else 300.0
+            depth = depth * (focal_length[:, None, None, None] / scale_factor)
             
             logger.debug(f"[DA3] Applied metric scaling with focal={focal_length.mean().item():.2f}, "
                         f"depth range: [{depth.min().item():.3f}, {depth.max().item():.3f}]")

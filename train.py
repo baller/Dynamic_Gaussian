@@ -106,24 +106,27 @@ class Trainer:
                     r_xyz_i = r_xyz[b_i, :, :]
                     r_xyz_i = r_xyz_i[r_valid_i].view(1, -1, 3).contiguous()
                     
-                    sample_l = np.random.choice(l_xyz_i.shape[1], 100000, replace = False)
-                    sample_r = np.random.choice(r_xyz_i.shape[1], 100000, replace = False)
+                    chamfer_sample_num = getattr(self.cfg.loss, 'chamfer_sample_num', 100000)
+                    sample_l = np.random.choice(l_xyz_i.shape[1], chamfer_sample_num, replace = False)
+                    sample_r = np.random.choice(r_xyz_i.shape[1], chamfer_sample_num, replace = False)
                     chamfer_loss_i, _ = chamfer_distance(l_xyz_i[:, sample_l], r_xyz_i[:, sample_r])
                     chamfer_loss += chamfer_loss_i
                 
                 chamfer_loss /= self.bs
 
+            # 从配置读取损失权重
+            loss_cfg = self.cfg.loss
             Ll1 = l1_loss(render_novel, gt_novel)
             Lssim = 1.0 - ssim(render_novel, gt_novel)
             
-            # xyz 残差正则化损失 - 防止点云漂移
+            # xyz 残差正则化损失 - 防止点云漂移 (权重从配置读取)
             xyz_res_regular = data['novel_view'].get('xyz_res_regular', torch.tensor(0.0).cuda())
-            xyz_res_loss = 10.0 * xyz_res_regular  # 权重 10.0
+            xyz_res_loss = loss_cfg.xyz_res_weight * xyz_res_regular
             
-            loss = 0.8 * Ll1 + 0.2 * Lssim + 2.0 * chamfer_loss + xyz_res_loss
+            loss = loss_cfg.l1_weight * Ll1 + loss_cfg.ssim_weight * Lssim + loss_cfg.chamfer_weight * chamfer_loss + xyz_res_loss
 
-            log_l1 += 0.8 * Ll1.item()
-            log_ssim += 0.2 * Lssim.item()
+            log_l1 += loss_cfg.l1_weight * Ll1.item()
+            log_ssim += loss_cfg.ssim_weight * Lssim.item()
             log_chamfer += 0.5 * chamfer_loss.item() if if_chamfer and itr_>iter_from else 0 
             log_scale += 0.5 * data['novel_view']['scale_regular'].item() if if_scale else 0
             log_xyz_res += xyz_res_regular.item() if isinstance(xyz_res_regular, torch.Tensor) else xyz_res_regular

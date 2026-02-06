@@ -51,6 +51,7 @@ class ConfigStereoHuman:
         self.cfg.da3.freeze_backbone = True
         self.cfg.da3.mixed_precision = False
         self.cfg.da3.local_files_only = False
+        self.cfg.da3.metric_scale_factor = 300.0   # focal scaling factor for metric model
         
         # Depth alignment configuration (块匹配极线搜索)
         self.cfg.depth_align = CN()
@@ -75,6 +76,29 @@ class ConfigStereoHuman:
         self.cfg.gsnet.transformer_patch_size = 14
         self.cfg.gsnet.transformer_mlp_ratio = 4.0
         self.cfg.gsnet.transformer_use_checkpoint = False  # Gradient Checkpointing 节省显存
+        # GSTransformer / GSRegresser 参数约束
+        self.cfg.gsnet.xyz_res_scale = 0.01       # Tanh 后的缩放因子
+        self.cfg.gsnet.scale_max = 0.002           # scale head 最大值
+        self.cfg.gsnet.depth_valid_min = 0.01      # 倒数深度有效下界
+        self.cfg.gsnet.depth_valid_max = 10.0      # 倒数深度有效上界
+        # DA3 特征融合
+        self.cfg.gsnet.da3_feat_dim = 1024         # DA3 DINOv2 特征维度
+        self.cfg.gsnet.use_da3_features = True     # 是否使用 DA3 特征融合
+
+        # Loss 权重配置
+        self.cfg.loss = CN()
+        self.cfg.loss.l1_weight = 0.8
+        self.cfg.loss.ssim_weight = 0.2
+        self.cfg.loss.chamfer_weight = 2.0
+        self.cfg.loss.xyz_res_weight = 10.0
+        self.cfg.loss.chamfer_sample_num = 100000
+
+        # 深度细化模块配置
+        self.cfg.depth_refine = CN()
+        self.cfg.depth_refine.enabled = True
+        self.cfg.depth_refine.channels = 64
+        self.cfg.depth_refine.num_blocks = 3
+        self.cfg.depth_refine.residual_scale = 0.1
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None

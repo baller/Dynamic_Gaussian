@@ -12,6 +12,9 @@ class GSRegresser(nn.Module):
         self.depth_dims = cfg.gsnet.encoder_dims
         self.decoder_dims = cfg.gsnet.decoder_dims
         self.head_dim = cfg.gsnet.parm_head_dim
+        # 从配置读取参数约束
+        self.xyz_res_scale = getattr(cfg.gsnet, 'xyz_res_scale', 0.01)
+        self.scale_max = getattr(cfg.gsnet, 'scale_max', 0.002)
         self.depth_encoder = UnetExtractor(in_channel=depth_dim, encoder_dim=self.depth_dims)
 
         self.decoder3 = nn.Sequential(
@@ -77,9 +80,8 @@ class GSRegresser(nn.Module):
         out = self.out_conv(out)
         out = self.out_relu(out)
 
-        # scale head
-        scale_out = torch.clamp_max(self.scale_head(out), 0.002) 
-        # scale_out = torch.concat([scale_out, scale_out, scale_out], dim=1)
+        # scale head (从配置读取最大值)
+        scale_out = torch.clamp_max(self.scale_head(out), self.scale_max)
 
         # opacity head
         opacity_out = self.opacity_head(out)
@@ -88,9 +90,7 @@ class GSRegresser(nn.Module):
         rot_out = self.rot_head(out)
         rot_out = torch.nn.functional.normalize(rot_out, dim=1)
 
-        # XYZ residual (3 channels)
-        # 缩放因子要非常小，防止点云漂移
-        xyz_out = self.xyz_head(out) * 0.01  # very small scale to prevent drift
-
+        # XYZ residual (从配置读取缩放因子)
+        xyz_out = self.xyz_head(out) * self.xyz_res_scale
 
         return rot_out, scale_out, opacity_out, xyz_out

@@ -36,6 +36,7 @@ da3:
   freeze_backbone: True  # 是否冻结 DA3 参数
   mixed_precision: True  # 是否使用混合精度
   local_files_only: False  # 是否只使用本地文件 (首次使用需设为 False 下载模型)
+  metric_scale_factor: 300.0  # focal scaling factor for metric depth
 
 # Depth alignment parameters (块匹配极线搜索)
 depth_align:
@@ -57,6 +58,29 @@ gsnet:
   transformer_patch_size: 14
   transformer_mlp_ratio: 4.0
   transformer_use_checkpoint: True  # Gradient Checkpointing 节省 ~50% 显存
+  # 参数约束
+  xyz_res_scale: 0.1       # Tanh 后的缩放因子 (允许 +/-0.1m 修正)
+  scale_max: 0.002          # scale head 最大值
+  depth_valid_min: 0.01     # 倒数深度有效下界
+  depth_valid_max: 10.0     # 倒数深度有效上界
+  # DA3 特征融合
+  da3_feat_dim: 1024        # DA3 DINOv2 特征维度
+  use_da3_features: True    # 是否使用 DA3 特征融合
+
+# Loss 权重配置
+loss:
+  l1_weight: 0.8
+  ssim_weight: 0.2
+  chamfer_weight: 2.0
+  xyz_res_weight: 1.0       # 放宽 (原 10.0)
+  chamfer_sample_num: 100000
+
+# 深度细化模块
+depth_refine:
+  enabled: True
+  channels: 64
+  num_blocks: 3
+  residual_scale: 0.1
 
 record:
   loss_freq: 20
@@ -68,7 +92,7 @@ record:
 #   - null: Start training from scratch
 #   - 'path/to/checkpoint.pth': Resume from specific checkpoint
 #   - Use --resume argument in command line for more flexibility
-restore_ckpt: '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_transformer_debug_dav3_0203/ckpt/iter20000.pth'
+restore_ckpt: null  # 新架构，从头训练
 
 # Stage 1 checkpoint (for stage 2 training, load weights without optimizer state)
 stage1_ckpt: null
