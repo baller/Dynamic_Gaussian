@@ -65,6 +65,36 @@ class ConfigStereoHuman:
         self.cfg.gsnet.decoder_dims = None
         self.cfg.gsnet.parm_head_dim = None
 
+        # PAGSplat 专属配置
+        self.cfg.pagsplat = CN()
+        # DA3 模型: HF repo id 或本地 checkpoint 路径
+        self.cfg.pagsplat.da3_checkpoint = 'depth-anything/DA3-LARGE'
+        # DINOv2 backbone embed_dim (ViT-B=768, ViT-L=1024, ViT-G=1536)
+        self.cfg.pagsplat.embed_dim = 768
+        # 内部统一特征通道数
+        self.cfg.pagsplat.feat_channels = 256
+        # 特征图相对原图的下采样倍数
+        self.cfg.pagsplat.feat_stride = 4
+        # 从 DINOv2 哪一层提取中间特征 (ViT-B 共12层)
+        self.cfg.pagsplat.feat_layer = 8
+        # ScaleAlignmentMLP 隐藏层维度
+        self.cfg.pagsplat.mlp_hidden = 256
+        # GaussianDecoder 编/解码器通道配置
+        self.cfg.pagsplat.enc_dims = [128, 256, 512]
+        self.cfg.pagsplat.dec_dims = [128, 256, 512]
+        # 预测头共享特征通道数
+        self.cfg.pagsplat.head_ch = 32
+        # 高斯缩放上限 (与 GPS+ 一致)
+        self.cfg.pagsplat.scale_max = 0.002
+        # 混合精度训练
+        self.cfg.pagsplat.mixed_precision = False
+        # 辅助损失权重
+        self.cfg.pagsplat.loss_smooth = 0.001   # 边缘感知深度平滑
+        self.cfg.pagsplat.loss_warp   = 0.010   # 扭曲一致性 (无效区域高 opacity 惩罚)
+        self.cfg.pagsplat.loss_unc    = 0.010   # 不确定性稀疏正则
+        # 渲染时不透明度裁剪阈值
+        self.cfg.pagsplat.min_opacity = 0.01
+
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
         self.cfg.record.show_path = None

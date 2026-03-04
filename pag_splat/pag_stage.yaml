@@ -1,0 +1,125 @@
+name: 'pag_splat'
+
+lr: 0.0002
+wdecay: 1e-5
+batch_size: 1
+num_steps: 100000
+
+# 深度估计模式 (pagsplat 固定为 'pagsplat'，保留字段供 config schema 兼容)
+depth_mode: 'pagsplat'
+
+# ───────────────────────────────────────────────
+# 数据集配置 (与 GPS+ 共享相同的 StereoHumanDataset)
+# ───────────────────────────────────────────────
+dataset:
+  source_id: [0, 1]
+  train_novel_id: [2, 3, 4, 5]
+  val_novel_id: [2, 3]
+  use_hr_img: False
+  use_depth_init: False       # PAGSplat 不需要 flow_init
+  use_local_data: True
+  inverse_depth_init: 0.3     # 保留字段，不影响 PAGSplat
+  local_data_root: '/data/sifang/GPS_plus_data/processed_data'        # TODO: 修改为实际路径
+  train_data_root: '/data/sifang/GPS_plus_data/processed_data/train'  # TODO
+  val_data_root:   '/data/sifang/GPS_plus_data/processed_data/val'    # TODO
+  bg_color: [0, 0, 0]
+  znear: 0.01
+  zfar: 100.0
+  trans: [0.0, 0.0, 0.0]
+  scale: 1.0
+
+# ───────────────────────────────────────────────
+# RAFT 配置 (schema 兼容占位，PAGSplat 不使用)
+# ───────────────────────────────────────────────
+raft:
+  mixed_precision: False
+  train_iters: 3
+  val_iters: 3
+  encoder_dims: [32, 48, 96]
+  hidden_dims: [96, 96, 96]
+  n_downsample: 3
+  n_gru_layers: 1
+  slow_fast_gru: False
+  corr_implementation: 'reg'
+  corr_radius: 4
+  corr_levels: 4
+  context_norm: 'batch'
+
+# ───────────────────────────────────────────────
+# DA3 配置 (schema 兼容占位)
+# ───────────────────────────────────────────────
+da3:
+  model_name: 'depth-anything/DA3-LARGE'
+  mode: 'single'
+  use_loftr: False
+  finetune: False
+  mixed_precision: False
+  scale_factor: 1.0
+  use_metric: False
+
+# ───────────────────────────────────────────────
+# GSNet 配置 (schema 兼容占位)
+# ───────────────────────────────────────────────
+gsnet:
+  encoder_dims: [32, 48, 96]
+  decoder_dims: [48, 64, 96]
+  parm_head_dim: 32
+
+# ───────────────────────────────────────────────
+# PAGSplat 核心配置
+# ───────────────────────────────────────────────
+pagsplat:
+  # DA3 预训练权重: HuggingFace repo id 或本地 .safetensors 路径
+  # 示例: 'depth-anything/DA3-LARGE'
+  #       '/data/sifang/Depth-Anything-3/checkpoints/da3-large.safetensors'
+  da3_checkpoint: 'depth-anything/DA3-LARGE'
+
+  # DINOv2 backbone embed_dim (由 build_pag_splat 自动从权重检测，此处仅作文档参考)
+  # ViT-B: 768 | ViT-L: 1024 | ViT-G: 1536
+  # DA3-LARGE 使用 ViT-L，embed_dim = 1024
+  embed_dim: 1024
+
+  # 内部统一特征通道数 (越大越强但更占显存)
+  feat_channels: 256
+
+  # 特征图下采样倍数 (推荐 4 → H/4 分辨率)
+  feat_stride: 4
+
+  # 从 DINOv2 第几层提取特征 (ViT-B 共 12 层，推荐 6~9)
+  feat_layer: 8
+
+  # ScaleAlignmentMLP 隐藏层维度
+  mlp_hidden: 256
+
+  # GaussianDecoder 通道配置
+  # 内存受限时可改为 [64, 128, 256] / [64, 128, 256]
+  enc_dims: [128, 256, 512]
+  dec_dims: [128, 256, 512]
+
+  # 预测头共享特征通道数 (与 GPS+ gsnet.parm_head_dim 对应)
+  head_ch: 32
+
+  # 高斯缩放上限 (保持像素级小高斯，与 GPS+ 一致)
+  scale_max: 0.002
+
+  # 是否使用混合精度 (建议 False 以保证数值稳定)
+  mixed_precision: False
+
+  # ── 辅助损失权重 ──
+  # 边缘感知深度平滑: 防止深度图产生高频噪声
+  loss_smooth: 0.001
+  # 扭曲一致性: 惩罚无效扭曲区域的高不透明度
+  loss_warp: 0.010
+  # 不确定性稀疏正则: 防止不确定性图退化为全 0 或全 1
+  loss_unc: 0.010
+
+  # 渲染时不透明度裁剪阈值 (低于此值的点不参与渲染)
+  min_opacity: 0.01
+
+# ───────────────────────────────────────────────
+# 训练记录配置
+# ───────────────────────────────────────────────
+record:
+  loss_freq: 20      # 每 100 步打印一次 loss
+  eval_freq: 500     # 每 3000 步做一次验证
+  save_iter: 10000    # 每 10000 步保存一次 checkpoint
