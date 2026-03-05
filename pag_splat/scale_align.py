@@ -68,18 +68,24 @@ class ScaleAlignmentMLP(nn.Module):
         use_view2_intr: 是否把视图2 内参也作为输入
     """
 
-    INPUT_DIM: int = 4 + 6 + 3  # K1(4) + R12_6d(6) + t12(3) = 13
-    # 也可选择加入 K2: 4 + 4 + 6 + 3 = 17
+    # t12_mode="log_len": K1(4)+R12_6d(6)+t12_dir(3)+t12_loglen(1) = 14  [新版，推荐]
+    # t12_mode="norm"   : K1(4)+R12_6d(6)+t12_unit(3)              = 13  [旧版，兼容]
+    INPUT_DIM_NEW: int = 14   # log_len 模式
+    INPUT_DIM_OLD: int = 13   # norm 模式 (旧 checkpoint 兼容)
 
     def __init__(
         self,
         hidden_dim: int = 256,
         num_layers: int = 4,
         use_view2_intr: bool = True,
+        t12_mode: str = "log_len",   # "log_len"(新) 或 "norm"(旧 checkpoint 兼容)
     ) -> None:
         super().__init__()
         self.use_view2_intr = use_view2_intr
-        in_dim = (self.INPUT_DIM + 4) if use_view2_intr else self.INPUT_DIM
+        self.t12_mode = t12_mode
+        base_dim = self.INPUT_DIM_NEW if t12_mode == "log_len" else self.INPUT_DIM_OLD
+        in_dim = (base_dim + 4) if use_view2_intr else base_dim
+        # 含 K2 时: log_len=18, norm=17
 
         layers = []
         prev = in_dim
@@ -136,10 +142,19 @@ class ScaleAlignmentMLP(nn.Module):
         # 即视图1 原点在视图2 坐标系中的表示
         t12 = t2 - (R12 @ t1.unsqueeze(-1)).squeeze(-1)  # (B, 3)
 
-        # 归一化平移：用 t12 的 L2 范数除，防止量纲影响
-        t12_norm = t12 / (t12.norm(dim=-1, keepdim=True).clamp(min=1e-6))
+        if self.t12_mode == "log_len":
+            # 新版：保留平移幅度（方向 3D + 对数幅度 1D = 4D）
+            # 幅度信息是预测度量深度尺度的关键输入
+            t12_len = t12.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            t12_dir = t12 / t12_len                         # (B, 3)
+            t12_log_len = torch.log(t12_len)                # (B, 1)
+            t12_enc = torch.cat([t12_dir, t12_log_len], dim=-1)  # (B, 4)
+        else:
+            # 旧版 "norm"：归一化为单位方向向量（3D），旧 checkpoint 兼容
+            t12_len = t12.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            t12_enc = t12 / t12_len                         # (B, 3)
 
-        parts = [k1_enc, r12_6d, t12_norm]
+        parts = [k1_enc, r12_6d, t12_enc]
         if self.use_view2_intr:
             parts.insert(1, k2_enc)
 

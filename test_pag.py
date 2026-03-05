@@ -98,6 +98,7 @@ class PAGSplatTester:
             head_ch=pag_cfg.head_ch,
             scale_max=pag_cfg.scale_max,
             device="cuda",
+            ckpt_path=cfg.restore_ckpt,   # 自动检测旧/新 checkpoint 的 t12_mode
         )
 
         assert cfg.restore_ckpt and os.path.exists(cfg.restore_ckpt), \

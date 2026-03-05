@@ -280,8 +280,10 @@ class GaussianDecoder(nn.Module):
         d1 = self.dec1(d2, skip=x0)   # → (B, dec_dims[1], Hf,   Wf  )
 
         # 最后上采样到全分辨率，拼接全分辨率 RGB
-        # dec0 内部会 ×2 再 cat RGB，之后需对齐到 (H, W)
-        d0 = self.dec0(d1, skip=img1_feat)  # ×2 → Hf*2, 如果 feat_stride=4 则是 H/2
+        # dec0 内部 ×2 后对齐到 img1 的 (H, W)，skip 必须是全分辨率 img1
+        # 若传 img1_feat (H/4) 会让 UpBlock 把 x 从 H/2 缩回 H/4，
+        # 导致最终强行 4× 插值放大，产生波浪纹拉伸 —— 已修复
+        d0 = self.dec0(d1, skip=img1)  # ×2 后对齐到 img1: (B, dec_dims[0], H, W)
 
         # 额外上采样（feat_stride > 4 时）
         if self.extra_up is not None:

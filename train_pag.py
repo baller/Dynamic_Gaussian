@@ -182,6 +182,8 @@ class PAGSplatTrainer:
 
         # ── 模型 ──
         logging.info(f"正在加载 DA3 ({pag_cfg.da3_checkpoint}) ...")
+        # restore_ckpt 用于继续训练时自动检测旧/新 checkpoint 的 t12_mode
+        _ckpt_for_detect = cfg.restore_ckpt or cfg.stage1_ckpt or None
         self.model = build_pag_splat(
             da3_checkpoint=pag_cfg.da3_checkpoint,
             feat_channels=pag_cfg.feat_channels,
@@ -193,7 +195,7 @@ class PAGSplatTrainer:
             head_ch=pag_cfg.head_ch,
             scale_max=pag_cfg.scale_max,
             device="cuda",
-            # embed_dim 由 build_pag_splat 自动从模型权重检测，兼容不同 DA3 变体
+            ckpt_path=_ckpt_for_detect,   # 自动检测旧/新 checkpoint 的 t12_mode
         )
         logging.info("模型构建完成")
 

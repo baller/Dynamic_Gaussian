@@ -28,6 +28,7 @@ PAGSplat — Prior-Aware 2D Gaussian Splatting (主模型)
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -121,6 +122,7 @@ class PAGSplat(nn.Module):
         dec_dims: list[int] | None = None,
         head_ch: int = 32,
         scale_max: float = 0.002,
+        t12_mode: str = "log_len",   # "log_len"(新) 或 "norm"(旧 checkpoint 兼容)
     ) -> None:
         super().__init__()
 
@@ -137,7 +139,7 @@ class PAGSplat(nn.Module):
         )
 
         # ── Module 1b: 尺度对齐 MLP ──
-        self.scale_align = ScaleAlignmentMLP(hidden_dim=mlp_hidden)
+        self.scale_align = ScaleAlignmentMLP(hidden_dim=mlp_hidden, t12_mode=t12_mode)
 
         # ── Module 2: 单表面特征扭曲 ──
         self.warping = SingleSurfaceWarping(feat_stride=feat_stride)
@@ -341,6 +343,37 @@ def pag_pts2render(data: Dict, bg_color: list[float] = [0, 0, 0]) -> Dict:
 #  工厂函数
 # ──────────────────────────────────────────────
 
+def detect_t12_mode(ckpt_path: str | None) -> str:
+    """
+    从 checkpoint 文件中自动检测 ScaleAlignmentMLP 的 t12 编码模式。
+
+    通过检查 scale_align.mlp.0.weight 的输入维度推断：
+      - 输入维度 17 (use_view2_intr=True) → "norm" 旧版 (K1+K2+R12_6d+t12_dir3 = 4+4+6+3)
+      - 输入维度 18 (use_view2_intr=True) → "log_len" 新版 (K1+K2+R12_6d+t12_dir3+loglen1 = 4+4+6+4)
+
+    Args:
+        ckpt_path: checkpoint 文件路径，None 时默认返回 "log_len"
+
+    Returns:
+        "log_len" 或 "norm"
+    """
+    if ckpt_path is None or not os.path.exists(ckpt_path):
+        return "log_len"
+    try:
+        import torch as _torch
+        ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        state = ckpt.get("network", ckpt)
+        w = state.get("scale_align.mlp.0.weight")
+        if w is not None:
+            in_dim = w.shape[1]
+            mode = "norm" if in_dim in (13, 17) else "log_len"
+            print(f"[PAGSplat] 检测到 scale_align 输入维度={in_dim}, t12_mode='{mode}'")
+            return mode
+    except Exception as e:
+        print(f"[PAGSplat] checkpoint 检测失败 ({e})，使用默认 t12_mode='log_len'")
+    return "log_len"
+
+
 def build_pag_splat(
     da3_checkpoint: str | None = None,
     da3_model_name: str = "da3-large",
@@ -353,13 +386,14 @@ def build_pag_splat(
     head_ch: int = 32,
     scale_max: float = 0.002,
     device: str = "cuda",
+    ckpt_path: str | None = None,   # 传入后自动检测 t12_mode，无需手动指定
+    t12_mode: str | None = None,    # 显式覆盖；None 时由 ckpt_path 自动推断
 ) -> PAGSplat:
     """
     构建 PAGSplat 模型，可选从 HuggingFace Hub 或本地路径加载 DA3。
 
     Args:
-        da3_checkpoint:  DA3 预训练权重路径或 HF Hub repo id
-                         None 时从 Hub 自动下载
+        da3_checkpoint:  DA3 预训练权重路径或 HF Hub repo id，None 时从 Hub 自动下载
         da3_model_name:  DA3 preset 名称 ("da3-large" / "da3-base" 等)
         feat_channels:   PAGSplat 内部特征维度
         feat_stride:     特征下采样倍数
@@ -370,12 +404,20 @@ def build_pag_splat(
         head_ch:         预测头共享通道数
         scale_max:       高斯缩放上限
         device:          目标设备
+        ckpt_path:       待加载的 PAGSplat checkpoint 路径（用于自动检测 t12_mode）
+        t12_mode:        显式指定 t12 编码模式，覆盖自动检测
 
     Returns:
         PAGSplat 实例 (DA3 已冻结)
     """
+    import os as _os
     enc_dims = enc_dims or [128, 256, 512]
     dec_dims = dec_dims or [128, 256, 512]
+
+    # 自动检测旧/新 checkpoint 的 t12 编码维度
+    if t12_mode is None:
+        t12_mode = detect_t12_mode(ckpt_path)
+
     try:
         from depth_anything_3.api import DepthAnything3
     except ImportError:
@@ -392,7 +434,6 @@ def build_pag_splat(
     da3_api = da3_api.to(device).eval()
 
     # 从 patch_embed 投影权重反推 DINOv2 embed_dim
-    # 权重形状: (embed_dim, 3, patch_size, patch_size)
     try:
         for name, param in da3_api.model.backbone.named_parameters():
             if "patch_embed" in name and "weight" in name and param.ndim == 4:
@@ -402,7 +443,7 @@ def build_pag_splat(
             embed_dim = 768
     except Exception:
         embed_dim = 768
-    print(f"[PAGSplat] embed_dim = {embed_dim}")
+    print(f"[PAGSplat] embed_dim={embed_dim}, t12_mode='{t12_mode}'")
 
     model = PAGSplat(
         da3_net=da3_api.model,
@@ -415,6 +456,7 @@ def build_pag_splat(
         dec_dims=dec_dims,
         head_ch=head_ch,
         scale_max=scale_max,
+        t12_mode=t12_mode,
     ).to(device)
 
     return model

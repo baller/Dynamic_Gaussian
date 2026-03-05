@@ -292,6 +292,7 @@ if __name__ == '__main__':
         head_ch=pag_cfg.head_ch,
         scale_max=pag_cfg.scale_max,
         device='cuda',
+        ckpt_path=arg.ckpt,   # 自动检测旧/新 checkpoint 的 t12_mode
     )
     assert os.path.exists(arg.ckpt), f'Checkpoint 不存在: {arg.ckpt}'
     ckpt = torch.load(arg.ckpt, map_location='cuda', weights_only=False)
