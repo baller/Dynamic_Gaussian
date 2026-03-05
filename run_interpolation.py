@@ -257,7 +257,7 @@ class StereoHumanModel(nn.Module):
 if __name__ == '__main__':
     # python run_interpolation.py -i example_data
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input', type=str, required=True, help='input sequence')
+    parser.add_argument('-i', '--input', default='s1a6',type=str, required=False, help='input sequence')
     arg = parser.parse_args()
     
     tar_n = arg.input
@@ -276,7 +276,7 @@ if __name__ == '__main__':
     cfg.exp_name = f'gps_plus_{depth_mode}'
 
     cfg.record.show_path = "experiments/%s/show_free_%s" % (cfg.exp_name, tar_n)
-    cfg.restore_ckpt = '/home/user_3/3DGS/GPS_plus/experiments/gps_plus_da3_0121/ckpt/iter20000.pth'  # TODO: 设置检查点路径
+    cfg.restore_ckpt = '/data/sifang/GPS_plus_data/processed_data/gps_plus_final.pth'  # TODO: 设置检查点路径
     cfg.freeze()
     LOOP_NUM = 20
 

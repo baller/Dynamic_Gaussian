@@ -6,7 +6,7 @@ batch_size: 1
 num_steps: 100000
 
 # 深度估计模式: 'raft' 或 'da3'
-depth_mode: 'da3'
+depth_mode: 'raft'
 
 dataset:
   source_id: [0, 1]
@@ -16,9 +16,9 @@ dataset:
   use_depth_init: True
   use_local_data: True
   inverse_depth_init: 0.11468429026724969
-  local_data_root: '/data/GPS_plus/processed_data'       # TODO
-  train_data_root: '/data/GPS_plus/processed_data/train' # TODO
-  val_data_root: '/data/GPS_plus/processed_data/val'     # TODO
+  local_data_root: '/data/sifang/GPS_plus_data/processed_data'       # TODO
+  train_data_root: '/data/sifang/GPS_plus_data/processed_data/train' # TODO
+  val_data_root: '/data/sifang/GPS_plus_data/processed_data/val'     # TODO
   bg_color: [0, 0, 0]
   znear: 0.01
   zfar: 100.0
@@ -33,12 +33,12 @@ raft:
   encoder_dims: [32, 48, 96]  
   hidden_dims: [96, 96, 96]
   n_downsample: 3
-  n_gru_layers: 3
+  n_gru_layers: 1
   slow_fast_gru: False
   corr_implementation: 'reg'
   corr_radius: 4
   corr_levels: 4
-  context_norm: 'batch'
+  context_norm: 'group'
 
 # DA3配置（当depth_mode='da3'时使用）
 da3:
