@@ -89,11 +89,20 @@ class ConfigStereoHuman:
         # 混合精度训练
         self.cfg.pagsplat.mixed_precision = False
         # 辅助损失权重
-        self.cfg.pagsplat.loss_smooth = 0.001   # 边缘感知深度平滑
-        self.cfg.pagsplat.loss_warp   = 0.010   # 扭曲一致性 (无效区域高 opacity 惩罚)
-        self.cfg.pagsplat.loss_unc    = 0.010   # 不确定性稀疏正则
+        self.cfg.pagsplat.loss_smooth  = 0.001  # 边缘感知深度平滑
+        self.cfg.pagsplat.loss_warp    = 0.010  # 扭曲一致性 (无效区域高 opacity 惩罚)
+        self.cfg.pagsplat.loss_unc     = 0.010  # 不确定性稀疏正则
+        # P0: 几何先验损失 (G3Splat 风格)
+        self.cfg.pagsplat.loss_scale   = 0.05   # Scale 各向同性惩罚 (抑制蚯蚓状浮块)
+        self.cfg.pagsplat.loss_normal  = 0.01   # 方向一致性 (Gaussian 短轴 ≈ 表面法线)
+        # P1: 点云几何一致性
+        self.cfg.pagsplat.loss_chamfer  = 0.50  # Chamfer Distance (左右点云一致性，与 GPS+ 同权)
+        self.cfg.pagsplat.chamfer_samples = 5000  # Chamfer 每次采样点数
         # 渲染时不透明度裁剪阈值
-        self.cfg.pagsplat.min_opacity = 0.01
+        self.cfg.pagsplat.min_opacity  = 0.01
+        # 迭代深度精化 (DepthGRUCell，参考 Splat-SAP Translation)
+        self.cfg.pagsplat.gru_iters     = 3    # GRU 迭代次数 (0=不使用 GRU)
+        self.cfg.pagsplat.gru_hidden_ch = 64   # GRU 隐藏状态通道数
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None

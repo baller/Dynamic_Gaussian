@@ -4,14 +4,19 @@ Module 1 (续) — ScaleAlignmentMLP (相机感知的尺度对齐网络)
 将 DA3 输出的无尺度相对深度 D_rel 对齐到物理米制深度：
     D_metric = exp(log_s) * D_rel + t
 
-其中 log_s 和 t 由 MLP 从相机参数中回归，per-image 独立预测。
+其中 log_s 和 t 由 MLP 从相机参数 + 双视图全局图像特征中回归。
 
 输入特征编码：
   - 相机内参 K: (fx, fy, cx, cy) → 归一化后拼接
   - 相对位姿 [R12|t12]: 视图1 → 视图2 的变换
       R12 以 6D 旋转表示 (连续性优于四元数)
-      t12 直接使用 3D 向量
-  - 合计输入维度: 4 + 6 + 3 = 13 → hidden_dim → 2 (log_scale, shift)
+      t12 = 方向(3D) + 对数幅度(1D) = 4D
+  - 双视图全局图像特征 (可选，use_img_feat=True):
+      f_self  = avg_pool(f_mono_self)   (B, feat_ch)
+      f_other = avg_pool(f_mono_other)  (B, feat_ch)
+      → 经线性层压缩后拼接，使 MLP 感知场景内容而非仅相机参数
+      参考: Splat-SAP Eq.(1-3) 双视图双边感知设计
+  - 合计输入维度: 14 + img_feat_proj_dim (= 14 + 64 = 78, use_view2_intr → 82)
 """
 
 from __future__ import annotations
@@ -52,40 +57,58 @@ def encode_intrinsics(
 
 class ScaleAlignmentMLP(nn.Module):
     """
-    从相机参数中预测尺度-偏移对，将 DA3 相对深度转为度量深度。
+    从相机参数 + 双视图全局图像特征中预测尺度-偏移对，将 DA3 相对深度转为度量深度。
 
     D_metric = exp(log_s) * D_rel + t_shift
 
     设计选择：
       - 使用 exp(log_s) 保证尺度恒正
       - t_shift 无约束，允许相对深度存在系统偏移
-      - 对视图1 和视图2 分别预测（共享权重，但输入不同）
-      - 输入: 视图1 内参 + 视图2 内参 + 相对位姿 = 4 + 4 + 9 = 17 维
+      - 双视图全局特征 (avg_pool f_mono_self + f_mono_other) 使 MLP 感知场景内容
+      - 参考: Splat-SAP 双边全局感知 (Eq.1-3)
 
     Args:
-        hidden_dim:   MLP 隐藏层维度
-        num_layers:   MLP 层数
+        hidden_dim:    MLP 隐藏层维度
+        num_layers:    MLP 层数
         use_view2_intr: 是否把视图2 内参也作为输入
+        use_img_feat:  是否加入双视图全局图像特征（推荐 True）
+        feat_channels: DA3 特征维度 (须与 MonoPriorExtractor 输出一致)
     """
 
     # t12_mode="log_len": K1(4)+R12_6d(6)+t12_dir(3)+t12_loglen(1) = 14  [新版，推荐]
     # t12_mode="norm"   : K1(4)+R12_6d(6)+t12_unit(3)              = 13  [旧版，兼容]
     INPUT_DIM_NEW: int = 14   # log_len 模式
     INPUT_DIM_OLD: int = 13   # norm 模式 (旧 checkpoint 兼容)
+    IMG_FEAT_PROJ_DIM: int = 64  # 双视图全局特征压缩后的维度
 
     def __init__(
         self,
         hidden_dim: int = 256,
         num_layers: int = 4,
         use_view2_intr: bool = True,
-        t12_mode: str = "log_len",   # "log_len"(新) 或 "norm"(旧 checkpoint 兼容)
+        t12_mode: str = "log_len",    # "log_len"(新) 或 "norm"(旧 checkpoint 兼容)
+        use_img_feat: bool = True,    # 是否加入双视图全局图像特征
+        feat_channels: int = 256,     # DA3 特征通道数
     ) -> None:
         super().__init__()
         self.use_view2_intr = use_view2_intr
         self.t12_mode = t12_mode
+        self.use_img_feat = use_img_feat
+
         base_dim = self.INPUT_DIM_NEW if t12_mode == "log_len" else self.INPUT_DIM_OLD
-        in_dim = (base_dim + 4) if use_view2_intr else base_dim
+        cam_dim  = (base_dim + 4) if use_view2_intr else base_dim
         # 含 K2 时: log_len=18, norm=17
+
+        # 双视图全局图像特征压缩层: [f_self; f_other] = feat_ch*2 → IMG_FEAT_PROJ_DIM
+        if use_img_feat:
+            self.img_feat_proj = nn.Sequential(
+                nn.Linear(feat_channels * 2, self.IMG_FEAT_PROJ_DIM),
+                nn.SiLU(),
+            )
+            in_dim = cam_dim + self.IMG_FEAT_PROJ_DIM
+        else:
+            self.img_feat_proj = None
+            in_dim = cam_dim
 
         layers = []
         prev = in_dim
@@ -169,6 +192,8 @@ class ScaleAlignmentMLP(nn.Module):
         d_rel: torch.Tensor,
         img_h: int,
         img_w: int,
+        f_self:  torch.Tensor | None = None,
+        f_other: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         预测尺度/偏移，并应用到相对深度上。
@@ -180,13 +205,28 @@ class ScaleAlignmentMLP(nn.Module):
             extr2:  (B, 3, 4)
             d_rel:  (B, 1, H, W)  DA3 输出的相对深度
             img_h, img_w: 图像尺寸 (与 d_rel 一致)
+            f_self:  (B, feat_ch, Hf, Wf) 当前视图的单目特征图（可为 None）
+            f_other: (B, feat_ch, Hf, Wf) 对向视图的单目特征图（可为 None）
 
         Returns:
             d_metric:  (B, 1, H, W)  度量深度 (米)
             log_scale: (B,)          预测的对数尺度
             t_shift:   (B,)          预测的深度偏移
         """
-        feat = self._build_input(intr1, intr2, extr1, extr2, img_h, img_w)
+        cam_feat = self._build_input(intr1, intr2, extr1, extr2, img_h, img_w)
+
+        if self.use_img_feat and self.img_feat_proj is not None and \
+                f_self is not None and f_other is not None:
+            # 全局平均池化: (B, C, Hf, Wf) → (B, C)
+            g_self  = f_self.mean(dim=[-2, -1])   # (B, feat_ch)
+            g_other = f_other.mean(dim=[-2, -1])  # (B, feat_ch)
+            img_feat = self.img_feat_proj(
+                torch.cat([g_self, g_other], dim=-1)
+            )  # (B, IMG_FEAT_PROJ_DIM)
+            feat = torch.cat([cam_feat, img_feat], dim=-1)
+        else:
+            feat = cam_feat
+
         out = self.mlp(feat)  # (B, 2)
 
         log_scale = out[:, 0]   # (B,)

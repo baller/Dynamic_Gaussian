@@ -216,9 +216,10 @@ class SingleSurfaceWarping(nn.Module):
         intr2: torch.Tensor,
         extr1: torch.Tensor,
         extr2: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        img2: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
-        执行特征扭曲，计算交互特征 ΔF。
+        执行特征扭曲，计算交互特征 ΔF；可选同步扭曲 img2 颜色图。
 
         Args:
             f_mono1:   (B, C, Hf, Wf)  视图1 特征
@@ -228,10 +229,12 @@ class SingleSurfaceWarping(nn.Module):
             intr2:     (B, 3, 3)  视图2 全分辨率内参
             extr1:     (B, 3, 4)  视图1 外参
             extr2:     (B, 3, 4)  视图2 外参
+            img2:      (B, 3, H,  W )  视图2 原始 RGB [-1,1]（可为 None）
 
         Returns:
-            delta_f:    (B, 3*C, Hf, Wf)  交互特征图 ΔF
-            valid_mask: (B, 1, Hf, Wf)    有效扭曲区域掩码 (1=有效)
+            delta_f:       (B, 3*C, Hf, Wf)  交互特征图 ΔF
+            valid_mask:    (B, 1, Hf, Wf)     有效扭曲区域掩码 (1=有效)
+            img2_warped:   (B, 3, Hf, Wf)     扭曲到视图1 的 img2 颜色图（若 img2=None 则为 None）
         """
         B, C, Hf, Wf = f_mono1.shape
 
@@ -241,7 +244,6 @@ class SingleSurfaceWarping(nn.Module):
         )  # (B, 1, Hf, Wf)
 
         # --- Step 1: 反投影 D_feat1 → 相机1 3D 点云 ---
-        # feat_stride=1 因为 d_feat 和 intr 已在同一尺度 (通过 feat_stride 缩放内参)
         pts_cam1 = unproject_depth(d_feat, intr1, feat_stride=self.feat_stride)
         # (B, Hf, Wf, 3)
 
@@ -250,7 +252,6 @@ class SingleSurfaceWarping(nn.Module):
         t1 = extr1[:, :3, 3]   # (B, 3)
         B_, H_, W_, _ = pts_cam1.shape
         pts_flat = pts_cam1.reshape(B_, H_ * W_, 3)
-        # X_world = R1^T @ (X_cam1 - t1)
         pts_world_flat = (pts_flat - t1.unsqueeze(1)) @ R1
         pts_world = pts_world_flat.reshape(B_, H_, W_, 3)
 
@@ -258,7 +259,7 @@ class SingleSurfaceWarping(nn.Module):
         uv2_feat, z_cam2 = project_to_view(pts_world, intr2, extr2, self.feat_stride)
         # uv2_feat: (B, Hf, Wf, 2)  z_cam2: (B, Hf, Wf)
 
-        # --- Step 4: 计算有效掩码 (投影点在视野内 & 深度为正) ---
+        # --- Step 4: 有效掩码 ---
         u_valid = (uv2_feat[..., 0] >= 0) & (uv2_feat[..., 0] <= Wf - 1)
         v_valid = (uv2_feat[..., 1] >= 0) & (uv2_feat[..., 1] <= Hf - 1)
         depth_valid = z_cam2 > 1e-3
@@ -276,13 +277,29 @@ class SingleSurfaceWarping(nn.Module):
             padding_mode=self.padding_mode,
             align_corners=True,
         )  # (B, C, Hf, Wf)
-
-        # 无效区域置零（grid_sample padding_mode="zeros" 已处理视野外区域，
-        # 但 depth_valid 掩码需手动应用）
         f_2to1 = f_2to1 * valid_mask
 
         # --- Step 7: 构造交互特征 ΔF ---
         diff = torch.abs(f_mono1 - f_2to1)
         delta_f = torch.cat([f_mono1, f_2to1, diff], dim=1)  # (B, 3C, Hf, Wf)
 
-        return delta_f, valid_mask
+        # --- Step 8 (可选): 同步扭曲 img2 颜色图 ---
+        img2_warped = None
+        if img2 is not None:
+            # 将 img2 下采样到特征分辨率后用同一 grid 采样
+            img2_down = F.interpolate(
+                img2, size=(Hf, Wf), mode="bilinear", align_corners=False
+            )  # (B, 3, Hf, Wf)
+            # padding_mode="zeros"：视野外区域置 0，配合 valid_mask 使 decoder 显式感知无效区
+            # 不用 "border" 是因为 border 重复边缘色素，在重叠小时污染非重叠区颜色
+            img2_warped = F.grid_sample(
+                img2_down,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )  # (B, 3, Hf, Wf)
+            # 用 valid_mask 进一步清零非重叠像素（防止 grid 边界的插值残留）
+            img2_warped = img2_warped * valid_mask  # (B, 3, Hf, Wf)
+
+        return delta_f, valid_mask, img2_warped

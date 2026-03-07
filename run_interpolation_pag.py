@@ -16,7 +16,13 @@ PAG-Splat 自由视角插值渲染脚本
 from __future__ import print_function, division
 
 import argparse
+import atexit
+import glob
 import logging
+import re
+import signal
+import subprocess
+import sys
 
 import numpy as np
 import cv2
@@ -39,6 +45,73 @@ import torch.nn as nn
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 from PIL import Image
+
+
+# ──────────────────────────────────────────────────────────
+#  视频生成工具
+# ──────────────────────────────────────────────────────────
+
+_videos_generated = False
+_show_path_global: str = ''
+_video_dir_global: str = ''
+
+
+def get_iter_label(ckpt_path: str) -> str:
+    """从 checkpoint 文件名中提取 'latest' 或 iter 步数标签。"""
+    stem = Path(ckpt_path).stem
+    if 'latest' in stem.lower():
+        return 'latest'
+    m = re.search(r'(\d{5,8})$', stem)
+    if m:
+        return f'iter_{int(m.group(1))}'
+    return stem
+
+
+def make_videos(show_path: str, video_dir: str) -> None:
+    """用 ffmpeg 将帧序列合成 RGB 视频和深度视频。"""
+    tasks = [
+        ('RGB',   '%05d.jpg',       os.path.join(video_dir, 'rgb.mp4')),
+        ('depth', '%05d_depth.png', os.path.join(video_dir, 'depth.mp4')),
+    ]
+    for label, fmt, out_mp4 in tasks:
+        ext = fmt.split('.')[-1]
+        existing = sorted(glob.glob(os.path.join(show_path, f'*.{ext}')))
+        if not existing:
+            logging.info(f'无 {label} 帧文件，跳过视频生成')
+            continue
+
+        os.makedirs(video_dir, exist_ok=True)
+        # 以实际最小帧号作为起始索引，避免 ffmpeg 从 0 找不到文件
+        start_num = int(Path(existing[0]).stem.replace('_depth', ''))
+        cmd = [
+            'ffmpeg', '-y',
+            '-framerate', '30',
+            '-start_number', str(start_num),
+            '-i', os.path.join(show_path, fmt),
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            out_mp4,
+        ]
+        logging.info(f'生成 {label} 视频（共 {len(existing)} 帧）: {out_mp4}')
+        ret = subprocess.run(cmd, capture_output=True)
+        if ret.returncode != 0:
+            logging.warning(f'{label} 视频生成失败:\n{ret.stderr.decode(errors="replace")}')
+        else:
+            logging.info(f'{label} 视频已保存至: {out_mp4}')
+
+
+def _finalize_videos() -> None:
+    global _videos_generated
+    if _videos_generated or not _show_path_global:
+        return
+    _videos_generated = True
+    logging.info('正在生成渲染结果视频...')
+    make_videos(_show_path_global, _video_dir_global)
+
+
+def _signal_handler(sig, frame) -> None:
+    logging.info(f'收到中断信号 ({sig})，先生成视频再退出...')
+    _finalize_videos()
+    sys.exit(0)
 
 
 # ──────────────────────────────────────────────────────────
@@ -253,9 +326,16 @@ if __name__ == '__main__':
     cfg_obj.load(arg.config)
     cfg = cfg_obj.get_cfg()
 
+    # ── 推导输出目录：ckpt 上级目录 / test_result / free_<seq>_<cam0>_<cam1>_<iter> ──
+    iter_label  = get_iter_label(arg.ckpt)
+    ckpt_parent = Path(arg.ckpt).parent.parent   # e.g. experiments/pag_splat_0304
+    result_name = 'free_%s_%s_%s_%s' % (tar_n, cam_ids[0], cam_ids[1], iter_label)
+    show_path   = str(ckpt_parent / 'test_result' / result_name)
+    video_dir   = os.path.join(show_path, 'video')
+
     cfg.defrost()
     cfg.exp_name         = 'pag_splat'
-    cfg.record.show_path = 'experiments/pag_splat/free_%s_%s_%s' % (tar_n, cam_ids[0], cam_ids[1])
+    cfg.record.show_path = show_path
     cfg.restore_ckpt     = arg.ckpt
     cfg.freeze()
 
@@ -266,6 +346,14 @@ if __name__ == '__main__':
     to_list   = [cfg.dataset.source_id[1]]
 
     Path(cfg.record.show_path).mkdir(exist_ok=True, parents=True)
+    Path(video_dir).mkdir(exist_ok=True, parents=True)
+
+    # ── 注册退出时自动生成视频（正常结束或 Ctrl+C 均触发）──
+    _show_path_global = cfg.record.show_path
+    _video_dir_global = video_dir
+    atexit.register(_finalize_videos)
+    signal.signal(signal.SIGINT,  _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     print('=' * 55)
     print('PAG-Splat 自由视角插值渲染')
@@ -295,7 +383,11 @@ if __name__ == '__main__':
         ckpt_path=arg.ckpt,   # 自动检测旧/新 checkpoint 的 t12_mode
     )
     assert os.path.exists(arg.ckpt), f'Checkpoint 不存在: {arg.ckpt}'
-    ckpt = torch.load(arg.ckpt, map_location='cuda', weights_only=False)
+    try:
+        ckpt = torch.load(arg.ckpt, map_location='cuda', weights_only=False)
+    except Exception as e:
+        logging.error(f'Checkpoint 加载失败（文件可能损坏或不完整）: {arg.ckpt}\n  {e}')
+        sys.exit(1)
     missing, unexpected = model.load_state_dict(ckpt['network'], strict=False)
     if len(unexpected) > 0:
         print(f'[警告] 忽略了 {len(unexpected)} 个不匹配的键')
@@ -367,8 +459,4 @@ if __name__ == '__main__':
                 cv2.imwrite('%s/%05d_depth.png' % (cfg.record.show_path, fr_i), depth_color)
 
     logging.info(f'渲染完成！输出目录: {cfg.record.show_path}')
-    logging.info(
-        '生成视频命令:\n'
-        f'  ffmpeg -framerate 30 -i {cfg.record.show_path}/%05d.jpg '
-        f'-c:v libx264 -pix_fmt yuv420p {cfg.record.show_path}/output.mp4'
-    )
+    _finalize_videos()

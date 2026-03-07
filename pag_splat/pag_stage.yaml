@@ -1,4 +1,4 @@
-name: 'pag_splat'
+name: 'pag_splat_vis'
 
 lr: 0.0002
 wdecay: 1e-5
@@ -113,13 +113,33 @@ pagsplat:
   # 不确定性稀疏正则: 防止不确定性图退化为全 0 或全 1
   loss_unc: 0.010
 
+  # ── P0: 几何先验损失 (G3Splat 风格，抑制浮块/蚯蚓纹) ──
+  # Scale 各向同性惩罚: 防止高斯退化为球形团块或蚯蚓状拉伸体
+  # 鼓励扁平 surfel: s_min/s_max 比值越大越惩罚
+  loss_scale: 0.05
+  # 方向一致性: 高斯最短轴应与表面法线对齐
+  # 初期训练可设为 0 逐步引入，稳定后调高
+  loss_normal: 0.01
+
+  # ── P1: 点云几何一致性 (GPS-Gaussian+ 和 Splat-SAP 均使用) ──
+  # Chamfer Distance: 防止左右视图点云空间不一致引发的视角欺骗浮块
+  loss_chamfer: 0.50
+  # Chamfer 每次随机采样点数 (越大越准确但显存/速度代价越高)
+  chamfer_samples: 5000
+
   # 渲染时不透明度裁剪阈值 (低于此值的点不参与渲染)
   min_opacity: 0.01
+
+  # ── 迭代深度精化 (DepthGRUCell，参考 Splat-SAP Translation Module Eq.5) ──
+  # GRU 迭代次数: 0 = 关闭 GRU（退回单次 delta_depth），3 = 推荐
+  gru_iters: 3
+  # GRU 隐藏状态通道数: 越大越强但显存更多
+  gru_hidden_ch: 64
 
 # ───────────────────────────────────────────────
 # 训练记录配置
 # ───────────────────────────────────────────────
 record:
-  loss_freq: 20      # 每 100 步打印一次 loss
+  loss_freq: 50      # 每 100 步打印一次 loss
   eval_freq: 500     # 每 3000 步做一次验证
   save_iter: 10000    # 每 10000 步保存一次 checkpoint

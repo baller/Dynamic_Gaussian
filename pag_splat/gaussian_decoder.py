@@ -3,14 +3,22 @@ Module 3 — Uncertainty-Aware Gaussian Maps Decoding
        (不确定性感知的 2D 高斯图解码器)
 
 输入: ΔF (B, 3C, Hf, Wf) + 原始 RGB I1 (B, 3, H, W)
-输出: 与原图等分辨率的像素级 2D 高斯参数图
+      可选: img2_warped_feat (B, 3, Hf, Wf) — 扭曲到视图1 的 img2 颜色图
 
-预测头 (共享 32ch 特征):
-  ┌─ rot_head      → 4ch  (L2 归一化四元数)
-  ├─ scale_head    → 3ch  (Softplus → clamp ≤ scale_max)
-  ├─ opacity_head  → 1ch  (Sigmoid)
-  ├─ depth_head    → 1ch  (Tanh × 0.5, 度量深度残差)
-  └─ uncertainty_head → 1ch (Sigmoid, 不确定性权重)
+输出: 与原图等分辨率的像素级 2D 高斯参数图 + 颜色融合图
+
+预测头 (共享 head_ch 特征):
+  ┌─ rot_head           → 4ch  (L2 归一化四元数)
+  ├─ scale_head         → 3ch  (Softplus → clamp ≤ scale_max)
+  ├─ opacity_head       → 1ch  (Sigmoid)
+  ├─ depth_head         → 1ch  (Tanh × 1.0, 度量深度残差)
+  ├─ uncertainty_head   → 1ch  (Sigmoid, 不确定性权重)
+  ├─ color_blend_head   → 2ch  (Softmax，双视图融合权重)
+  └─ color_residual_head→ 3ch  (Tanh × 0.3，颜色残差修正)
+
+颜色融合 (Splat-SAP 风格):
+  blend_w = softmax(color_blend_head(feat))         # (B, 2, H, W)
+  color_map = blend_w[:,0:1]*I1 + blend_w[:,1:2]*I2w + residual
 
 架构设计：
   - Encoder: ΔF @ Hf/1 → Hf/2 → Hf/4 (3 级，每级 2×Conv2d+BN+GELU)
@@ -101,52 +109,42 @@ class UpBlock(nn.Module):
 
 class GaussianHeads(nn.Module):
     """
-    5 个预测头，共享输入的 32 通道特征图。
+    4 个预测头，共享输入的 head_ch 通道特征图。
+    去掉了 uncertainty_head：其乘法调制 eff_opa = opa×(1-unc) 会导致梯度消失陷阱
+    （浮块 unc→1 → eff_opa→0 → 梯度→0 → 无法被修正，即 StableGS 伪平衡现象）。
+    可靠性控制改由 valid_mask（几何越界）和 opacity_head 直接承担。
 
     Outputs (all at full resolution H×W):
       rot:         (B, 4, H, W)  L2 归一化单位四元数 [w, x, y, z]
       scale:       (B, 3, H, W)  各向异性缩放，clamp ≤ scale_max
       opacity:     (B, 1, H, W)  Sigmoid 不透明度
-      delta_depth: (B, 1, H, W)  Tanh×0.5 深度残差
-      uncertainty: (B, 1, H, W)  Sigmoid 不确定性 (越高→越不可靠)
+      delta_depth: (B, 1, H, W)  Tanh×1.0 深度残差
     """
 
     def __init__(self, in_ch: int = 32, scale_max: float = 0.002) -> None:
         super().__init__()
         self.scale_max = scale_max
 
-        self.rot_head = nn.Conv2d(in_ch, 4, 1)
-        self.scale_head = nn.Conv2d(in_ch, 3, 1)
+        self.rot_head     = nn.Conv2d(in_ch, 4, 1)
+        self.scale_head   = nn.Conv2d(in_ch, 3, 1)
         self.opacity_head = nn.Conv2d(in_ch, 1, 1)
-        self.depth_head = nn.Conv2d(in_ch, 1, 1)
-        self.uncertainty_head = nn.Conv2d(in_ch, 1, 1)
+        self.depth_head   = nn.Conv2d(in_ch, 1, 1)
 
-        # 小初始化: 让初始预测接近合理先验
-        for head in [self.rot_head, self.scale_head, self.opacity_head,
-                     self.depth_head, self.uncertainty_head]:
+        for head in [self.rot_head, self.scale_head, self.opacity_head, self.depth_head]:
             nn.init.xavier_uniform_(head.weight, gain=0.1)
             nn.init.zeros_(head.bias)
 
     def forward(self, feat: torch.Tensor) -> dict[str, torch.Tensor]:
-        rot_raw = self.rot_head(feat)
-        # L2 归一化四元数 (防止零向量除零)
-        rot = F.normalize(rot_raw, p=2, dim=1, eps=1e-6)
-
-        scale = F.softplus(self.scale_head(feat))
-        scale = scale.clamp(max=self.scale_max)
-
+        rot = F.normalize(self.rot_head(feat), p=2, dim=1, eps=1e-6)
+        scale = F.softplus(self.scale_head(feat)).clamp(max=self.scale_max)
         opacity = torch.sigmoid(self.opacity_head(feat))
-
-        delta_depth = torch.tanh(self.depth_head(feat)) * 0.5
-
-        uncertainty = torch.sigmoid(self.uncertainty_head(feat))
+        delta_depth = torch.tanh(self.depth_head(feat)) * 1.0
 
         return {
-            "rot": rot,              # (B, 4, H, W)
-            "scale": scale,          # (B, 3, H, W)
-            "opacity": opacity,      # (B, 1, H, W)
-            "delta_depth": delta_depth,   # (B, 1, H, W)
-            "uncertainty": uncertainty,   # (B, 1, H, W)
+            "rot":         rot,          # (B, 4, H, W)
+            "scale":       scale,        # (B, 3, H, W)
+            "opacity":     opacity,      # (B, 1, H, W)
+            "delta_depth": delta_depth,  # (B, 1, H, W)
         }
 
 
@@ -239,17 +237,29 @@ class GaussianDecoder(nn.Module):
         # ──── Prediction Heads ────
         self.heads = GaussianHeads(head_ch, scale_max=scale_max)
 
+        # ──── 颜色融合头 (双视图加权融合 + 残差，参考 Splat-SAP Eq.11-15) ────
+        # color_blend_head: 预测 img1 与 warped img2 的混合权重 (softmax)
+        self.color_blend_head    = nn.Conv2d(head_ch, 2, 1)
+        # color_residual_head: 小幅颜色残差修正 (tanh × 0.3)
+        self.color_residual_head = nn.Conv2d(head_ch, 3, 1)
+        nn.init.zeros_(self.color_blend_head.weight)
+        nn.init.zeros_(self.color_blend_head.bias)
+        nn.init.zeros_(self.color_residual_head.weight)
+        nn.init.zeros_(self.color_residual_head.bias)
+
     def forward(
         self,
         delta_f: torch.Tensor,
         img1: torch.Tensor,
+        img2_warped_feat: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
-        解码高斯参数图。
+        解码高斯参数图，可选预测双视图融合颜色图。
 
         Args:
-            delta_f: (B, 3C, Hf, Wf)  来自 Module 2 的交互特征
-            img1:    (B, 3, H,  W )   视图1 原始 RGB（归一化 [-1,1]）
+            delta_f:          (B, 3C, Hf, Wf)  Module 2 的交互特征
+            img1:             (B, 3, H,  W )   视图1 原始 RGB [-1,1]
+            img2_warped_feat: (B, 3, Hf, Wf)   扭曲到视图1 的 img2（可为 None）
 
         Returns:
             dict 包含:
@@ -258,6 +268,7 @@ class GaussianDecoder(nn.Module):
               "opacity"     (B, 1, H, W)
               "delta_depth" (B, 1, H, W)
               "uncertainty" (B, 1, H, W)
+              "color_map"   (B, 3, H, W)  [0,1] （若 img2_warped_feat 非 None）
         """
         B, _, H, W = img1.shape
         Hf, Wf = delta_f.shape[-2:]
@@ -269,30 +280,54 @@ class GaussianDecoder(nn.Module):
 
         # ── Encoder ──
         x0 = self.enc0(torch.cat([delta_f, img1_feat], dim=1))  # (B, enc_dims[0], Hf, Wf)
-        x1 = self.enc1(x0)                                       # (B, enc_dims[1], Hf/2, Wf/2)
-        x2 = self.enc2(x1)                                       # (B, enc_dims[2], Hf/4, Wf/4)
+        x1 = self.enc1(x0)                                       # (B, enc_dims[1], Hf/2)
+        x2 = self.enc2(x1)                                       # (B, enc_dims[2], Hf/4)
 
         # ── Bottleneck ──
         x2 = self.bottleneck(x2)
 
         # ── Decoder ──
-        d2 = self.dec2(x2, skip=x1)   # → (B, dec_dims[2], Hf/2, Wf/2)
-        d1 = self.dec1(d2, skip=x0)   # → (B, dec_dims[1], Hf,   Wf  )
+        d2 = self.dec2(x2, skip=x1)
+        d1 = self.dec1(d2, skip=x0)
+        d0 = self.dec0(d1, skip=img1)  # ×2 → 全分辨率 (B, dec_dims[0], H, W)
 
-        # 最后上采样到全分辨率，拼接全分辨率 RGB
-        # dec0 内部 ×2 后对齐到 img1 的 (H, W)，skip 必须是全分辨率 img1
-        # 若传 img1_feat (H/4) 会让 UpBlock 把 x 从 H/2 缩回 H/4，
-        # 导致最终强行 4× 插值放大，产生波浪纹拉伸 —— 已修复
-        d0 = self.dec0(d1, skip=img1)  # ×2 后对齐到 img1: (B, dec_dims[0], H, W)
-
-        # 额外上采样（feat_stride > 4 时）
         if self.extra_up is not None:
             d0 = self.extra_up(d0)
-
-        # 精确对齐到原始分辨率 (防止 odd-size 误差)
         if d0.shape[-2:] != (H, W):
             d0 = F.interpolate(d0, size=(H, W), mode="bilinear", align_corners=False)
 
-        # ── Output ──
-        feat_out = self.out_conv(d0)      # (B, head_ch, H, W)
-        return self.heads(feat_out)
+        # ── 高斯参数预测 ──
+        feat_out = self.out_conv(d0)
+        out = self.heads(feat_out)
+
+        # ── 颜色融合预测（双视图加权 + 残差）──
+        if img2_warped_feat is not None:
+            # 上采样 warped img2 到全分辨率（img2_warped_feat 中非重叠区已被 valid_mask 置零）
+            img2_w = F.interpolate(
+                img2_warped_feat, size=(H, W), mode="bilinear", align_corners=False
+            )  # (B, 3, H, W)  [-1,1]，非重叠区≈0
+
+            # 检测非重叠区（img2_warped 因 zeros-padding 全为 0）
+            # cover2: (B, 1, H, W) 1=img2 有有效颜色, 0=无重叠
+            cover2 = (img2_w.abs().sum(dim=1, keepdim=True) > 1e-4).float()
+
+            # [-1,1] → [0,1]
+            img1_01  = img1   * 0.5 + 0.5
+            img2_w01 = img2_w * 0.5 + 0.5
+
+            # 融合权重 (softmax 保证和为 1)
+            blend_w = torch.softmax(
+                self.color_blend_head(feat_out), dim=1
+            )  # (B, 2, H, W)  sum=1
+
+            # 非重叠区强制 w2=0, w1=1，避免 img2 零值污染颜色
+            w1 = blend_w[:, 0:1] + blend_w[:, 1:2] * (1.0 - cover2)
+            w2 = blend_w[:, 1:2] * cover2
+
+            # 颜色残差（小幅修正，非重叠区残差也应贡献更少 → 乘 cover2 的 smooth 版本）
+            residual = torch.tanh(self.color_residual_head(feat_out)) * 0.3
+
+            color_map = w1 * img1_01 + w2 * img2_w01 + residual
+            out["color_map"] = color_map.clamp(0.0, 1.0)  # (B, 3, H, W)
+
+        return out

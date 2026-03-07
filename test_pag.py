@@ -16,8 +16,14 @@ PAG-Splat 测试脚本
 from __future__ import print_function, division
 
 import argparse
+import atexit
+import glob
 import logging
 import os
+import re
+import signal
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -38,6 +44,82 @@ from pag_splat.render import pag_pts2render, move_data_to_cuda
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# ──────────────────────────────────────────────────────────
+#  视频生成工具
+# ──────────────────────────────────────────────────────────
+
+_videos_generated = False
+_show_path_global: str = ''
+_video_dir_global: str = ''
+
+
+def get_iter_label(ckpt_path: str) -> str:
+    """从 checkpoint 文件名中提取 'latest' 或 iter 步数标签。"""
+    stem = Path(ckpt_path).stem
+    if 'latest' in stem.lower():
+        return 'latest'
+    m = re.search(r'(\d{5,8})$', stem)
+    if m:
+        return f'iter_{int(m.group(1))}'
+    return stem
+
+
+def make_videos(show_path: str, video_dir: str) -> None:
+    """用 ffmpeg concat 方式将帧序列合成 RGB 视频和深度视频。"""
+    # RGB: 所有 .jpg，排除 _cmp.jpg
+    rgb_files = sorted([
+        f for f in glob.glob(os.path.join(show_path, '*.jpg'))
+        if not f.endswith('_cmp.jpg')
+    ])
+    cmp_files   = sorted(glob.glob(os.path.join(show_path, '*_cmp.jpg')))
+    depth_files = sorted(glob.glob(os.path.join(show_path, '*_depth.png')))
+
+    tasks = [
+        ('RGB',   rgb_files,   os.path.join(video_dir, 'rgb.mp4')),
+        ('cmp',   cmp_files,   os.path.join(video_dir, 'cmp.mp4')),
+        ('depth', depth_files, os.path.join(video_dir, 'depth.mp4')),
+    ]
+    for label, files, out_mp4 in tasks:
+        if not files:
+            logging.info(f'无 {label} 帧文件，跳过视频生成')
+            continue
+
+        os.makedirs(video_dir, exist_ok=True)
+        concat_txt = os.path.join(video_dir, f'_concat_{label}.txt')
+        with open(concat_txt, 'w') as f:
+            for fp in files:
+                f.write(f"file '{os.path.abspath(fp)}'\n")
+        cmd = [
+            'ffmpeg', '-y',
+            '-r', '30',
+            '-f', 'concat', '-safe', '0',
+            '-i', concat_txt,
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            out_mp4,
+        ]
+        logging.info(f'生成 {label} 视频（共 {len(files)} 帧）: {out_mp4}')
+        ret = subprocess.run(cmd, capture_output=True)
+        if ret.returncode != 0:
+            logging.warning(f'{label} 视频生成失败:\n{ret.stderr.decode(errors="replace")}')
+        else:
+            logging.info(f'{label} 视频已保存至: {out_mp4}')
+
+
+def _finalize_videos() -> None:
+    global _videos_generated
+    if _videos_generated or not _show_path_global:
+        return
+    _videos_generated = True
+    logging.info('正在生成渲染结果视频...')
+    make_videos(_show_path_global, _video_dir_global)
+
+
+def _signal_handler(sig, frame) -> None:
+    logging.info(f'收到中断信号 ({sig})，先生成视频再退出...')
+    _finalize_videos()
+    sys.exit(0)
 
 
 # ──────────────────────────────────────────────────────────
@@ -165,12 +247,14 @@ class PAGSplatTester:
             cv2.imwrite(f"{prefix}_cmp.jpg", compare)
 
             # 度量深度彩色图
-            cv2.imwrite(f"{prefix}_depth.png",
-                        depth_to_colormap(data["metric_depth_l"]))
+            if "metric_depth_l" in data:
+                cv2.imwrite(f"{prefix}_depth.png",
+                            depth_to_colormap(data["metric_depth_l"]))
 
             # 不确定性彩色图
-            cv2.imwrite(f"{prefix}_uncertainty.png",
-                        uncertainty_to_colormap(data["lmain"]["uncertainty"], H, W))
+            if "uncertainty" in data["lmain"]:
+                cv2.imwrite(f"{prefix}_uncertainty.png",
+                            uncertainty_to_colormap(data["lmain"]["uncertainty"], H, W))
 
         val_psnr = float(np.mean(psnr_list))
         val_ssim = float(np.mean(ssim_list))
@@ -232,11 +316,13 @@ class PAGSplatTester:
                 prefix = (f"{self.cfg.record.show_path}/"
                           f"{s_name.split('_')[0]}_{frame_idx:04d}_v{vid:02d}")
                 save_render(data["novel_view"]["img_pred"], f"{prefix}.jpg")
-                cv2.imwrite(f"{prefix}_depth.png",
-                            depth_to_colormap(data["metric_depth_l"]))
-                cv2.imwrite(f"{prefix}_uncertainty.png",
-                            uncertainty_to_colormap(
-                                data["lmain"]["uncertainty"], H, W))
+                if "metric_depth_l" in data:
+                    cv2.imwrite(f"{prefix}_depth.png",
+                                depth_to_colormap(data["metric_depth_l"]))
+                if "uncertainty" in data["lmain"]:
+                    cv2.imwrite(f"{prefix}_uncertainty.png",
+                                uncertainty_to_colormap(
+                                    data["lmain"]["uncertainty"], H, W))
                 frame_idx += 1
 
         logging.info(f"多视角测试完成，共 {frame_idx} 帧")
@@ -491,6 +577,10 @@ if __name__ == "__main__":
     cfg_obj.load(arg.config)
     cfg = cfg_obj.get_cfg()
 
+    # ── 推导输出目录：ckpt 上级目录 / test_result / show_<seq>_<suffix>_<iter> ──
+    iter_label  = get_iter_label(arg.ckpt)
+    ckpt_parent = Path(arg.ckpt).parent.parent   # e.g. experiments/pag_splat_0307
+
     cfg.defrost()
     if arg.dynamic:
         suffix = "dynamic"
@@ -499,14 +589,26 @@ if __name__ == "__main__":
     else:
         suffix = f"v{arg.view}"
 
-    cfg.exp_name        = "pag_splat"
-    cfg.record.show_path = f"experiments/pag_splat/show_{seq_name}_{suffix}"
-    cfg.seq_name         = seq_name
+    result_name = f'show_{seq_name}_{suffix}_{iter_label}'
+    show_path   = str(ckpt_parent / 'test_result' / result_name)
+    video_dir   = os.path.join(show_path, 'video')
+
+    cfg.exp_name             = "pag_splat"
+    cfg.record.show_path     = show_path
+    cfg.seq_name             = seq_name
     cfg.dataset.val_novel_id = [arg.view]
-    cfg.restore_ckpt     = arg.ckpt
+    cfg.restore_ckpt         = arg.ckpt
     cfg.freeze()
 
     Path(cfg.record.show_path).mkdir(exist_ok=True, parents=True)
+    Path(video_dir).mkdir(exist_ok=True, parents=True)
+
+    # ── 注册退出时自动生成视频（正常结束或 Ctrl+C 均触发）──
+    _show_path_global = cfg.record.show_path
+    _video_dir_global = video_dir
+    atexit.register(_finalize_videos)
+    signal.signal(signal.SIGINT,  _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     print("=" * 55)
     print("PAG-Splat 测试")
@@ -514,6 +616,7 @@ if __name__ == "__main__":
     print(f"  序列:      {seq_name}")
     print(f"  Checkpoint:{arg.ckpt}")
     print(f"  输出目录:  {cfg.record.show_path}")
+    print(f"  视频目录:  {video_dir}")
     if arg.dynamic:
         print(f"  模式: 动态视角  views={arg.views}  interp={arg.interp}  loop={arg.loop}")
     elif arg.all_views:
@@ -530,3 +633,5 @@ if __name__ == "__main__":
         tester.val_all_views(views=views_list)
     else:
         tester.val()
+
+    _finalize_videos()

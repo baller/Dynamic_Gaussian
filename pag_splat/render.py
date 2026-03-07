@@ -56,19 +56,23 @@ def pag_pts2render(
             B, HW, _ = v["xyz"].shape
             H, W = v["img"].shape[-2], v["img"].shape[-1]
 
-            xyz_i  = v["xyz"][i]          # (HW, 3)
-            rot_i  = v["rot"][i]          # (HW, 4)
-            sc_i   = v["scale"][i]        # (HW, 3)
-            opa_i  = v["opacity"][i]      # (HW, 1)
-            unc_i  = v["uncertainty"][i]  # (HW, 1)
+            xyz_i  = v["xyz"][i]      # (HW, 3)
+            rot_i  = v["rot"][i]      # (HW, 4)
+            sc_i   = v["scale"][i]    # (HW, 3)
+            opa_i  = v["opacity"][i]  # (HW, 1)
 
-            # 不确定性感知的有效不透明度
-            eff_opa = opa_i * (1.0 - unc_i)  # (HW, 1)
+            # uncertainty_head 已移除（避免梯度消失陷阱）
+            # 可靠性控制由 opacity_head + valid_mask 直接承担
+            eff_opa = opa_i  # (HW, 1)
 
-            # RGB 颜色来自输入像素 ([-1,1] → [0,1])
-            rgb_i = (
-                v["img"][i].permute(1, 2, 0).reshape(HW, 3) * 0.5 + 0.5
-            )  # (HW, 3)
+            # RGB 颜色: 优先用解码器预测的融合颜色图，退回原始像素
+            # color_map (B,3,H,W) [0,1] 来自 GaussianDecoder 的双视图颜色融合头
+            if "color_map" in v:
+                rgb_i = v["color_map"][i].permute(1, 2, 0).reshape(HW, 3)
+            else:
+                rgb_i = (
+                    v["img"][i].permute(1, 2, 0).reshape(HW, 3) * 0.5 + 0.5
+                )  # (HW, 3)
 
             # --- 有效点筛选 ---
             keep = torch.ones(HW, dtype=torch.bool, device=xyz_i.device)
