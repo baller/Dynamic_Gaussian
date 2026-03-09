@@ -297,6 +297,167 @@ class PAGSplatModel(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────
+#  Mini 格式（cameras.json）相机插值 & 渲染器
+# ──────────────────────────────────────────────────────────
+
+def _read_cameras_json(data_root: str, split: str = 'val') -> dict:
+    """读取该 split 下任意一帧的 cameras.json，返回相机参数字典。
+    mini 格式中所有帧共用相同相机内外参，取第一帧即可。"""
+    param_dir = os.path.join(data_root, split, 'parameter')
+    frames = sorted(os.listdir(param_dir))
+    assert frames, f'parameter 目录为空: {param_dir}'
+    cam_path = os.path.join(param_dir, frames[0], 'cameras.json')
+    with open(cam_path) as f:
+        return json.load(f)
+
+
+def extr_interpolate_mini(cam_ids: list, data_root: str, tar_n: str,
+                           loop_num: int = 20, split: str = 'val'):
+    """从 cameras.json 读取两台相机的内外参，进行插值生成 novel 相机路径。"""
+    cams = _read_cameras_json(data_root, split)
+    # cam_ids 可能是字符串数字索引，也可能是 original_cam_id
+    def _find_cam(cid):
+        if cid in cams:
+            return cams[cid]
+        # 尝试按 original_cam_id 匹配
+        for v in cams.values():
+            if str(v.get('original_cam_id', '')) == str(cid):
+                return v
+        raise KeyError(f'cameras.json 中未找到相机 {cid}')
+
+    cam0 = _find_cam(cam_ids[0])
+    cam1 = _find_cam(cam_ids[1])
+
+    extr0 = np.array(cam0['extrinsic'], dtype=np.float32).reshape(3, 4)
+    extr1 = np.array(cam1['extrinsic'], dtype=np.float32).reshape(3, 4)
+    intr0 = np.array(cam0['intrinsic'], dtype=np.float32).reshape(3, 3)
+    intr1 = np.array(cam1['intrinsic'], dtype=np.float32).reshape(3, 3)
+
+    # 转为 4×4 world-to-cam，然后取逆得 cam-to-world
+    def _to4x4(e34):
+        m = np.eye(4, dtype=np.float32)
+        m[:3] = e34
+        return m
+
+    pose0 = np.linalg.inv(_to4x4(extr0))
+    pose1 = np.linalg.inv(_to4x4(extr1))
+
+    novel_extrs = []
+    novel_intrs = []
+    for ratio in np.linspace(0., 0.95, loop_num):
+        rot_0 = pose0[:3, :3]
+        rot_1 = pose1[:3, :3]
+        rots  = Rot.from_matrix(np.stack([rot_0, rot_1]))
+        slerp = Slerp([0, 1], rots)
+        rot   = slerp(ratio)
+        pose  = np.eye(4, dtype=np.float32)
+        pose[:3, :3] = rot.as_matrix()
+        pose[:3, 3]  = ((1.0 - ratio) * pose0 + ratio * pose1)[:3, 3]
+        novel_extrs.append(np.linalg.inv(pose)[:3])   # back to world-to-cam (3×4)
+        novel_intrs.append((1.0 - ratio) * intr0 + ratio * intr1)
+
+    return [novel_extrs], [novel_intrs]
+
+
+class PAGSplatModelMini(nn.Module):
+    """Mini 格式（cameras.json）的 PAGSplat 渲染器，对齐 PAGSplatModel 接口。"""
+
+    def __init__(self, cfg, model, novel_extrs, novel_intrs,
+                 data_root: str, tar_n: str, cam_ids: list, split: str = 'val'):
+        super().__init__()
+        self.cfg         = cfg
+        self.model       = model
+        self.novel_extrs = novel_extrs
+        self.novel_intrs = novel_intrs
+        self.data_root   = data_root
+        self.split       = split
+
+        # 排序后的帧目录列表
+        img_root = os.path.join(data_root, split, 'img')
+        self.frames = sorted(os.listdir(img_root))
+        self.img_root = img_root
+
+        # 读取输入相机内外参（cameras.json 中的 cam_ids[0], cam_ids[1]）
+        cams = _read_cameras_json(data_root, split)
+        def _find(cid):
+            if cid in cams:
+                return cams[cid]
+            for v in cams.values():
+                if str(v.get('original_cam_id', '')) == str(cid):
+                    return v
+            raise KeyError(f'cameras.json 中未找到相机 {cid}')
+
+        c0 = _find(cam_ids[0])
+        c1 = _find(cam_ids[1])
+        self.intr0 = torch.FloatTensor(np.array(c0['intrinsic'], dtype=np.float32).reshape(3, 3))
+        self.intr1 = torch.FloatTensor(np.array(c1['intrinsic'], dtype=np.float32).reshape(3, 3))
+        self.extr0 = torch.FloatTensor(np.array(c0['extrinsic'], dtype=np.float32).reshape(3, 4))
+        self.extr1 = torch.FloatTensor(np.array(c1['extrinsic'], dtype=np.float32).reshape(3, 4))
+        self.cam_ids = cam_ids
+
+    def _load_img(self, frame_idx: int, cam_id: str) -> torch.Tensor:
+        frame_name = self.frames[frame_idx % len(self.frames)]
+        path = os.path.join(self.img_root, frame_name, f'{cam_id}.jpg')
+        img = np.array(Image.open(path)).astype(np.float32)
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+        t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).cuda()
+        return 2.0 * (t / 255.0) - 1.0
+
+    def get_item_free(self, frame_id: int, view_id: int) -> dict:
+        img0 = self._load_img(frame_id, self.cam_ids[0])
+        img1 = self._load_img(frame_id, self.cam_ids[1])
+
+        # 全白 mask（mini 格式不强制使用 mask）
+        msk0 = torch.ones_like(img0)
+        msk1 = torch.ones_like(img1)
+
+        intr0 = self.intr0.unsqueeze(0).cuda()
+        intr1 = self.intr1.unsqueeze(0).cuda()
+        extr0 = self.extr0.unsqueeze(0).cuda()
+        extr1 = self.extr1.unsqueeze(0).cuda()
+
+        novel_intr = self.novel_intrs[0][view_id]
+        novel_extr = self.novel_extrs[0][view_id]
+
+        # 使用图像原始尺寸
+        _, _, H, W = img0.shape
+
+        R = np.array(novel_extr[:3, :3], np.float32).reshape(3, 3).transpose(1, 0)
+        T = np.array(novel_extr[:3, 3],  np.float32)
+
+        FovX = focal2fov(float(novel_intr[0, 0]), W)
+        FovY = focal2fov(float(novel_intr[1, 1]), H)
+        projection_matrix = getProjectionMatrix(
+            znear=0.01, zfar=100.0, fovX=FovX, fovY=FovY,
+            K=novel_intr, h=H, w=W
+        ).transpose(0, 1)
+        world_view_transform = torch.tensor(
+            getWorld2View2(R, T, np.array([0.0, 0.0, 0.0]), 1.0)
+        ).transpose(0, 1)
+        full_proj_transform = (
+            world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
+        ).squeeze(0)
+        camera_center = world_view_transform.inverse()[3, :3]
+
+        novel_view = {
+            'height': [H],
+            'width':  [W],
+            'FovX':   [torch.FloatTensor(np.array(FovX)).cuda()],
+            'FovY':   [torch.FloatTensor(np.array(FovY)).cuda()],
+            'world_view_transform': [world_view_transform.cuda()],
+            'full_proj_transform':  [full_proj_transform.cuda()],
+            'camera_center':        [camera_center.cuda()],
+        }
+
+        return {
+            'lmain': {'img': img0, 'mask': msk0, 'intr': intr0, 'extr': extr0},
+            'rmain': {'img': img1, 'mask': msk1, 'intr': intr1, 'extr': extr1},
+            'novel_view': novel_view,
+        }
+
+
+# ──────────────────────────────────────────────────────────
 #  入口（结构对齐 run_interpolation.py）
 # ──────────────────────────────────────────────────────────
 
@@ -311,6 +472,12 @@ if __name__ == '__main__':
     parser.add_argument('--start',  type=int, default=0,   help='起始帧 ID')
     parser.add_argument('--sid',    type=int, default=1,   help='序列 s_id')
     parser.add_argument('--crop',   type=int, default=0,   help='四边裁剪像素数')
+    parser.add_argument('--mini',      action='store_true',
+                        help='使用 processed_mini 格式（cameras.json），需配合 --data-root')
+    parser.add_argument('--data-root', dest='data_root', type=str, default=None,
+                        help='mini 模式下的场景根目录，如 /data/sifang/GPS_plus_data/processed_mini/mobile_stage/dance3')
+    parser.add_argument('--split',     type=str, default='val',
+                        help='mini 模式下使用的数据集分割（train/val/test），默认 val')
     arg = parser.parse_args()
 
     tar_n   = arg.input
@@ -401,11 +568,17 @@ if __name__ == '__main__':
             m.eval()
     logging.info('模型加载完成')
 
-    # ── 插值相机路径（完全对齐 run_interpolation.py）──
-    novel_extrs, novel_intrs = extr_interpolate(RS, cam_ids)
+    # ── 插值相机路径 & 构建渲染器 ──
+    if arg.mini:
+        assert arg.data_root, '--mini 模式需要指定 --data-root'
+        novel_extrs, novel_intrs = extr_interpolate_mini(
+            cam_ids, arg.data_root, tar_n, loop_num=LOOP_NUM, split=arg.split)
+        render = PAGSplatModelMini(cfg, model, novel_extrs, novel_intrs,
+                                   arg.data_root, tar_n, cam_ids, split=arg.split)
+    else:
+        novel_extrs, novel_intrs = extr_interpolate(RS, cam_ids)
+        render = PAGSplatModel(cfg, model, [novel_extrs[0]], novel_intrs, arg.sid)
     print(len(novel_extrs[0]))
-
-    render = PAGSplatModel(cfg, model, [novel_extrs[0]], novel_intrs, arg.sid)
 
     start_frame = arg.start
     end_frame   = arg.start + arg.frames

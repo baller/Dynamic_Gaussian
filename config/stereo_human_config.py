@@ -32,6 +32,23 @@ class ConfigStereoHuman:
         self.cfg.dataset.trans = [0.0, 0.0, 0.0]
         self.cfg.dataset.scale = 1.0
         self.cfg.dataset.inverse_depth_init = 1.0
+        # ── 多数据集混合训练 ──────────────────────────────────────────────────
+        # 训练数据根目录列表（与 multi_formats 一一对应）
+        # 示例: multi_train_roots: ["/…/enerf_outdoor/actor1_4/train", "/…/processed_data/train"]
+        self.cfg.dataset.multi_train_roots   = ()   # tuple[str]
+        self.cfg.dataset.multi_val_roots     = ()   # tuple[str]，可为空则各 train root 对应 val 目录
+        # 每个 root 的数据格式："mini"（cameras.json）或 "legacy"（0_1.json + npy）
+        self.cfg.dataset.multi_formats       = ()   # tuple[str]，默认全为 "mini"
+        # 目标输出分辨率 (H, W)；None 表示不 resize
+        self.cfg.dataset.target_hw           = None
+        # __len__ 放大倍数
+        self.cfg.dataset.train_boost         = 50
+        self.cfg.dataset.val_boost           = 200
+        # 随机选输入视角的相机间隔约束（mini 格式）
+        self.cfg.dataset.min_cam_gap         = 2
+        self.cfg.dataset.max_cam_gap         = 12
+        # legacy 格式的 novel view id 列表
+        self.cfg.dataset.legacy_novel_ids    = (2, 3, 4, 5)
 
         self.cfg.raft = CN()
         self.cfg.raft.mixed_precision = None
@@ -91,7 +108,6 @@ class ConfigStereoHuman:
         # 辅助损失权重
         self.cfg.pagsplat.loss_smooth  = 0.001  # 边缘感知深度平滑
         self.cfg.pagsplat.loss_warp    = 0.010  # 扭曲一致性 (无效区域高 opacity 惩罚)
-        self.cfg.pagsplat.loss_unc     = 0.010  # 不确定性稀疏正则
         # P0: 几何先验损失 (G3Splat 风格)
         self.cfg.pagsplat.loss_scale   = 0.05   # Scale 各向同性惩罚 (抑制蚯蚓状浮块)
         self.cfg.pagsplat.loss_normal  = 0.01   # 方向一致性 (Gaussian 短轴 ≈ 表面法线)

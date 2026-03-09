@@ -17,19 +17,23 @@ from __future__ import print_function, division
 
 import argparse
 import atexit
+import csv
 import glob
+import json
 import logging
 import os
 import re
 import signal
 import subprocess
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 from torch.utils.data import DataLoader
@@ -44,6 +48,13 @@ from pag_splat.render import pag_pts2render, move_data_to_cuda
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+try:
+    import lpips as lpips_lib
+    _LPIPS_AVAILABLE = True
+except ImportError:
+    _LPIPS_AVAILABLE = False
+    logging.warning("lpips 未安装，LPIPS 指标将跳过。安装: pip install lpips")
 
 
 # ──────────────────────────────────────────────────────────
@@ -196,6 +207,12 @@ class PAGSplatTester:
         self.model.prior_extractor.da3_net.eval()
         logging.info("模型加载完成")
 
+        # ── LPIPS (AlexNet，与 GPS-Gaussian 系列论文保持一致) ──
+        if _LPIPS_AVAILABLE:
+            self.lpips_fn = lpips_lib.LPIPS(net="alex").cuda().eval()
+        else:
+            self.lpips_fn = None
+
         # ── 数据集 ──
         self.val_set = StereoHumanDataset(cfg.dataset, phase=cfg.seq_name)
         self.val_loader = DataLoader(
@@ -209,56 +226,177 @@ class PAGSplatTester:
     #  单视角测试
     # ──────────────────────────────────────────────
 
-    def val(self):
-        """对指定单一视角渲染，保存渲染图 + 深度图 + 不确定性图。"""
+    def val(self, n_samples: int = 0):
+        """
+        对指定单一视角渲染，计算 PSNR / SSIM / LPIPS 指标（full + masked），
+        保存渲染图 + 深度图，最终输出汇总表并写 metrics.json / metrics.csv。
+
+        Args:
+            n_samples: 最多评测的样本数，0 表示全部。
+        """
         logging.info("=== 单视角测试 ===")
         torch.cuda.empty_cache()
-        psnr_list, ssim_list = [], []
-        bg = self.cfg.dataset.bg_color
+        bg      = self.cfg.dataset.bg_color
+        bg_t    = torch.tensor(bg, device="cuda").view(1, 3, 1, 1)
 
-        for idx in tqdm(range(self.len_val), desc="渲染"):
-            data = self.fetch_data()
-            view_id  = data["novel_view"]["view_id"][0, 0].item()
-            s_name   = data["novel_view"]["sample_name"][0]
+        total = self.len_val if n_samples <= 0 else min(n_samples, self.len_val)
+        logging.info(f"评测样本数: {total}")
+
+        # 逐样本指标记录
+        rows = []   # list of dict，每行对应一个样本
+
+        # 表头（实时打印用）
+        hdr = (f"{'#':>4}  {'样本':<28}  "
+               f"{'PSNR_f':>7} {'SSIM_f':>7} {'LPIPS_f':>8}  "
+               f"{'PSNR_m':>7} {'SSIM_m':>7} {'LPIPS_m':>8}  "
+               f"{'Cover':>6}")
+        print(f"\n{hdr}")
+        print("─" * len(hdr))
+
+        for idx in tqdm(range(total), desc="渲染", ncols=80):
+            data    = self.fetch_data()
+            view_id = data["novel_view"]["view_id"][0, 0].item()
+            s_name  = data["novel_view"]["sample_name"][0]
             _, _, H, W = data["lmain"]["img"].shape
 
             with torch.no_grad():
-                data = self.model(data, is_train=False)
-                data = pag_pts2render(
+                data         = self.model(data, is_train=False)
+                data         = pag_pts2render(
                     data, bg_color=bg,
                     min_opacity=self.cfg.pagsplat.min_opacity,
                 )
 
-            render_novel = data["novel_view"]["img_pred"]
-            gt_novel     = data["novel_view"]["img"]
+            render = data["novel_view"]["img_pred"].clamp(0, 1)   # (1,3,H,W) [0,1]
+            gt     = data["novel_view"]["img"].clamp(0, 1)        # (1,3,H,W) [0,1]
 
-            psnr_list.append(psnr(render_novel, gt_novel).mean().item())
-            ssim_list.append(ssim(render_novel, gt_novel).item())
+            # ── 有效覆盖区域掩码 ──
+            cover_mask = ((render - bg_t).abs().sum(dim=1, keepdim=True) > 1e-3)  # (1,1,H,W)
+            cover_ratio = cover_mask.float().mean().item() * 100.0
 
+            # ── Full 指标（整幅图）──
+            psnr_f  = psnr(render, gt).mean().item()
+            ssim_f  = ssim(render, gt).item()
+            lpips_f = self._calc_lpips(render, gt)
+
+            # ── Masked 指标（覆盖区白底）──
+            white    = torch.ones_like(render)
+            cm_float = cover_mask.float()
+            render_m = render * cm_float + white * (1 - cm_float)
+            gt_m     = gt     * cm_float + white * (1 - cm_float)
+            psnr_m   = psnr(render_m, gt_m).mean().item()
+            ssim_m   = ssim(render_m, gt_m).item()
+            lpips_m  = self._calc_lpips(render_m, gt_m)
+
+            rows.append({
+                "sample":       s_name,
+                "view_id":      int(view_id),
+                "psnr_full":    psnr_f,
+                "ssim_full":    ssim_f,
+                "lpips_full":   lpips_f,
+                "psnr_mask":    psnr_m,
+                "ssim_mask":    ssim_m,
+                "lpips_mask":   lpips_m,
+                "cover_ratio":  cover_ratio,
+            })
+
+            # ── 实时打印当前样本指标 + 滚动均值 ──
+            n = len(rows)
+            avg_pf  = np.mean([r["psnr_full"]   for r in rows])
+            avg_sf  = np.mean([r["ssim_full"]   for r in rows])
+            avg_lf  = np.mean([r["lpips_full"]  for r in rows])
+            avg_pm  = np.mean([r["psnr_mask"]   for r in rows])
+            avg_sm  = np.mean([r["ssim_mask"]   for r in rows])
+            avg_lm  = np.mean([r["lpips_mask"]  for r in rows])
+            sample_label = f"{s_name}_v{view_id:02d}"[:28]
+            tqdm.write(
+                f"{n:>4}  {sample_label:<28}  "
+                f"{psnr_f:>7.3f} {ssim_f:>7.4f} {lpips_f:>8.4f}  "
+                f"{psnr_m:>7.3f} {ssim_m:>7.4f} {lpips_m:>8.4f}  "
+                f"{cover_ratio:>5.1f}%"
+            )
+            # 每 5 个样本打印一次滚动均值
+            if n % 5 == 0 or n == total:
+                tqdm.write(
+                    f"{'[avg]':>4}  {f'({n} samples)':28}  "
+                    f"{avg_pf:>7.3f} {avg_sf:>7.4f} {avg_lf:>8.4f}  "
+                    f"{avg_pm:>7.3f} {avg_sm:>7.4f} {avg_lm:>8.4f}"
+                )
+
+            # ── 保存可视化 ──
             prefix = f"{self.cfg.record.show_path}/{s_name}_{view_id:02d}"
+            save_render(render, f"{prefix}.jpg")
 
-            # 渲染图
-            save_render(render_novel, f"{prefix}.jpg")
-
-            # GT 对比图 (拼接)
-            gt_np  = (gt_novel[0].permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
-            ren_np = (render_novel[0].detach().clamp(0,1).permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
+            gt_np  = (gt[0].permute(1,2,0).cpu().numpy()  * 255).astype(np.uint8)
+            ren_np = (render[0].permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
             compare = np.concatenate([ren_np[:,:,::-1], gt_np[:,:,::-1]], axis=1)
             cv2.imwrite(f"{prefix}_cmp.jpg", compare)
 
-            # 度量深度彩色图
             if "metric_depth_l" in data:
                 cv2.imwrite(f"{prefix}_depth.png",
                             depth_to_colormap(data["metric_depth_l"]))
 
-            # 不确定性彩色图
-            if "uncertainty" in data["lmain"]:
-                cv2.imwrite(f"{prefix}_uncertainty.png",
-                            uncertainty_to_colormap(data["lmain"]["uncertainty"], H, W))
+        # ── 汇总并打印 ──
+        self._print_and_save_metrics(rows)
 
-        val_psnr = float(np.mean(psnr_list))
-        val_ssim = float(np.mean(ssim_list))
-        logging.info(f"结果: PSNR={val_psnr:.4f}  SSIM={val_ssim:.4f}")
+    def _calc_lpips(self, img: torch.Tensor, ref: torch.Tensor) -> float:
+        """计算单对图像的 LPIPS（需 [0,1] 输入，内部转为 [-1,1]）。"""
+        if self.lpips_fn is None:
+            return float("nan")
+        with torch.no_grad():
+            val = self.lpips_fn(img * 2 - 1, ref * 2 - 1)
+        return val.mean().item()
+
+    def _print_and_save_metrics(self, rows: list) -> None:
+        """计算均值、打印汇总表、写 metrics.json 和 metrics.csv。"""
+        if not rows:
+            logging.warning("无评测样本，跳过指标输出")
+            return
+
+        keys = ["psnr_full", "ssim_full", "lpips_full",
+                "psnr_mask", "ssim_mask", "lpips_mask", "cover_ratio"]
+
+        # 整体均值
+        overall = {k: float(np.mean([r[k] for r in rows])) for k in keys}
+        overall["n_samples"] = len(rows)
+
+        # 打印汇总
+        sep = "─" * 70
+        print(f"\n{sep}")
+        print(f"  评测汇总   共 {len(rows)} 个样本")
+        print(sep)
+        print(f"  {'指标':<20} {'Full (全图)':>14} {'Masked (有效区)':>16}")
+        print(sep)
+        lpips_tag = "" if self.lpips_fn else " (N/A)"
+        print(f"  {'PSNR (↑)':<20} {overall['psnr_full']:>14.4f} {overall['psnr_mask']:>16.4f}")
+        print(f"  {'SSIM (↑)':<20} {overall['ssim_full']:>14.4f} {overall['ssim_mask']:>16.4f}")
+        print(f"  {'LPIPS (↓)' + lpips_tag:<20} {overall['lpips_full']:>14.4f} {overall['lpips_mask']:>16.4f}")
+        print(f"  {'Cover Ratio':<20} {overall['cover_ratio']:>14.2f}%")
+        print(sep)
+
+        # 写文件
+        out_dir = self.cfg.record.show_path
+        os.makedirs(out_dir, exist_ok=True)
+
+        # metrics.json
+        result = {
+            "ckpt":    self.cfg.restore_ckpt,
+            "overall": overall,
+            "samples": rows,
+        }
+        json_path = os.path.join(out_dir, "metrics.json")
+        with open(json_path, "w") as f:
+            json.dump(result, f, indent=2)
+
+        # metrics.csv
+        csv_path = os.path.join(out_dir, "metrics.csv")
+        with open(csv_path, "w", newline="") as f:
+            fieldnames = ["sample", "view_id"] + keys
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+
+        logging.info(f"指标已保存: {json_path}")
+        logging.info(f"           {csv_path}")
 
     # ──────────────────────────────────────────────
     #  多视角测试
@@ -566,6 +704,8 @@ if __name__ == "__main__":
                         help="PAGSplat checkpoint 路径")
     parser.add_argument("--config", type=str, default="pag_splat/pag_stage.yaml",
                         help="配置文件路径 (默认: pag_splat/pag_stage.yaml)")
+    parser.add_argument("--n-samples", type=int, default=0,
+                        help="最多评测的样本数，0=全部 (默认: 0)")
     arg = parser.parse_args()
 
     views_list = (None if arg.views.lower() == "auto"
@@ -632,6 +772,6 @@ if __name__ == "__main__":
     elif arg.all_views:
         tester.val_all_views(views=views_list)
     else:
-        tester.val()
+        tester.val(n_samples=arg.n_samples)
 
     _finalize_videos()
