@@ -168,13 +168,18 @@ class PAGMiniSceneDataset(Dataset):
         )
         with open(path) as f:
             raw = json.load(f)
-        cams = {
-            int(k): {
-                "intrinsic": np.array(v["intrinsic"], dtype=np.float32),
-                "extrinsic": np.array(v["extrinsic"], dtype=np.float32),
+        cams = {}
+        for k, v in raw.items():
+            try:
+                cam_id = int(k)
+            except (ValueError, TypeError):
+                continue   # 跳过非整数 key（如 processed_data 中的 'Tf_x'）
+            if not isinstance(v, dict) or "intrinsic" not in v or "extrinsic" not in v:
+                continue   # 跳过不含 intrinsic/extrinsic 的条目
+            cams[cam_id] = {
+                "intrinsic": np.array(v["intrinsic"], dtype=np.float32).reshape(3, 3),
+                "extrinsic": np.array(v["extrinsic"], dtype=np.float32).reshape(3, 4),
             }
-            for k, v in raw.items()
-        }
         return cams   # {int_id: {"intrinsic": (3,3), "extrinsic": (3,4)}}
 
     def _pick_cam_triple(self, n_cams: int) -> tuple[int, int, int]:

@@ -237,13 +237,14 @@ class GaussianDecoder(nn.Module):
         # ──── Prediction Heads ────
         self.heads = GaussianHeads(head_ch, scale_max=scale_max)
 
-        # ──── 颜色融合头 (双视图加权融合 + 残差，参考 Splat-SAP Eq.11-15) ────
-        # color_blend_head: 预测 img1 与 warped img2 的混合权重 (softmax)
-        self.color_blend_head    = nn.Conv2d(head_ch, 2, 1)
-        # color_residual_head: 小幅颜色残差修正 (tanh × 0.3)
+        # ──── 球谐颜色头 (DC 直接绑定像素，预测高阶 SH + 遮挡残差) ────
+        # sh_rest_head: 预测 1 阶球谐的 rest 系数 (3 系数 × 3 RGB = 9ch)
+        # 初始化为 0 → 训练开始时完全依赖 DC（像素颜色）
+        self.sh_rest_head = nn.Conv2d(head_ch, 9, 1)
+        nn.init.zeros_(self.sh_rest_head.weight)
+        nn.init.zeros_(self.sh_rest_head.bias)
+        # color_residual_head: 遮挡区域的极小颜色修正 (tanh × 0.1)
         self.color_residual_head = nn.Conv2d(head_ch, 3, 1)
-        nn.init.zeros_(self.color_blend_head.weight)
-        nn.init.zeros_(self.color_blend_head.bias)
         nn.init.zeros_(self.color_residual_head.weight)
         nn.init.zeros_(self.color_residual_head.bias)
 
@@ -251,24 +252,27 @@ class GaussianDecoder(nn.Module):
         self,
         delta_f: torch.Tensor,
         img1: torch.Tensor,
-        img2_warped_feat: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
-        解码高斯参数图，可选预测双视图融合颜色图。
+        解码高斯参数图 + 球谐颜色系数。
+
+        核心设计：
+          DC 分量（SH₀）= 输入像素 I1（100% 信任原始颜色，无损失）
+          SH rest（1阶，9ch）= 网络预测的视角相关高阶系数
+          color_residual（3ch）= 极小修补残差（遮挡/边缘修正）
 
         Args:
-            delta_f:          (B, 3C, Hf, Wf)  Module 2 的交互特征
-            img1:             (B, 3, H,  W )   视图1 原始 RGB [-1,1]
-            img2_warped_feat: (B, 3, Hf, Wf)   扭曲到视图1 的 img2（可为 None）
+            delta_f:  (B, 3C, Hf, Wf)  Module 2 的交互特征
+            img1:     (B, 3, H,  W )   视图1 原始 RGB [-1,1]
 
         Returns:
             dict 包含:
-              "rot"         (B, 4, H, W)
-              "scale"       (B, 3, H, W)
-              "opacity"     (B, 1, H, W)
-              "delta_depth" (B, 1, H, W)
-              "uncertainty" (B, 1, H, W)
-              "color_map"   (B, 3, H, W)  [0,1] （若 img2_warped_feat 非 None）
+              "rot"              (B, 4, H, W)
+              "scale"            (B, 3, H, W)
+              "opacity"          (B, 1, H, W)
+              "delta_depth"      (B, 1, H, W)
+              "sh_rest"          (B, 9, H, W)   1阶 SH rest 系数
+              "color_residual"   (B, 3, H, W)   遮挡区颜色残差 tanh×0.1
         """
         B, _, H, W = img1.shape
         Hf, Wf = delta_f.shape[-2:]
@@ -300,34 +304,13 @@ class GaussianDecoder(nn.Module):
         feat_out = self.out_conv(d0)
         out = self.heads(feat_out)
 
-        # ── 颜色融合预测（双视图加权 + 残差）──
-        if img2_warped_feat is not None:
-            # 上采样 warped img2 到全分辨率（img2_warped_feat 中非重叠区已被 valid_mask 置零）
-            img2_w = F.interpolate(
-                img2_warped_feat, size=(H, W), mode="bilinear", align_corners=False
-            )  # (B, 3, H, W)  [-1,1]，非重叠区≈0
-
-            # 检测非重叠区（img2_warped 因 zeros-padding 全为 0）
-            # cover2: (B, 1, H, W) 1=img2 有有效颜色, 0=无重叠
-            cover2 = (img2_w.abs().sum(dim=1, keepdim=True) > 1e-4).float()
-
-            # [-1,1] → [0,1]
-            img1_01  = img1   * 0.5 + 0.5
-            img2_w01 = img2_w * 0.5 + 0.5
-
-            # 融合权重 (softmax 保证和为 1)
-            blend_w = torch.softmax(
-                self.color_blend_head(feat_out), dim=1
-            )  # (B, 2, H, W)  sum=1
-
-            # 非重叠区强制 w2=0, w1=1，避免 img2 零值污染颜色
-            w1 = blend_w[:, 0:1] + blend_w[:, 1:2] * (1.0 - cover2)
-            w2 = blend_w[:, 1:2] * cover2
-
-            # 颜色残差（小幅修正，非重叠区残差也应贡献更少 → 乘 cover2 的 smooth 版本）
-            residual = torch.tanh(self.color_residual_head(feat_out)) * 0.3
-
-            color_map = w1 * img1_01 + w2 * img2_w01 + residual
-            out["color_map"] = color_map.clamp(0.0, 1.0)  # (B, 3, H, W)
+        # ── 球谐 rest 系数 + 遮挡残差预测 ──
+        # sh_rest: 1阶 SH 的 3 个系数 × 3 RGB = 9 channels
+        # 初始化为 0，训练初期完全依赖 DC（像素颜色），逐渐学习视角相关效果
+        out["sh_rest"] = self.sh_rest_head(feat_out)            # (B, 9, H, W)
+        # color_residual: 极小修补残差，缩放因子 0.1 保证微小修正
+        out["color_residual"] = torch.tanh(
+            self.color_residual_head(feat_out)
+        ) * 0.1   # (B, 3, H, W)
 
         return out

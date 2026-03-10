@@ -47,67 +47,58 @@ def pag_pts2render(
     render_list = []
 
     for i in range(bs):
-        pts_xyz_all, pts_rgb_all, pts_rot_all, pts_scale_all, pts_opa_all = (
+        pts_xyz_all, pts_shs_all, pts_rot_all, pts_scale_all, pts_opa_all = (
             [], [], [], [], []
         )
 
         for view in ["lmain", "rmain"]:
             v = data[view]
-            B, HW, _ = v["xyz"].shape
-            H, W = v["img"].shape[-2], v["img"].shape[-1]
+            HW = v["xyz"].shape[1]
 
-            xyz_i  = v["xyz"][i]      # (HW, 3)
-            rot_i  = v["rot"][i]      # (HW, 4)
-            sc_i   = v["scale"][i]    # (HW, 3)
-            opa_i  = v["opacity"][i]  # (HW, 1)
+            xyz_i   = v["xyz"][i]       # (HW, 3)
+            rot_i   = v["rot"][i]       # (HW, 4)
+            sc_i    = v["scale"][i]     # (HW, 3)
+            opa_i   = v["opacity"][i]   # (HW, 1)
+            sh_dc_i   = v["sh_dc"][i]   # (HW, 3)  DC 系数
+            sh_rest_i = v["sh_rest"][i] # (HW, 9)  1阶 SH rest 系数
 
-            # uncertainty_head 已移除（避免梯度消失陷阱）
-            # 可靠性控制由 opacity_head + valid_mask 直接承担
-            eff_opa = opa_i  # (HW, 1)
-
-            # RGB 颜色: 优先用解码器预测的融合颜色图，退回原始像素
-            # color_map (B,3,H,W) [0,1] 来自 GaussianDecoder 的双视图颜色融合头
-            if "color_map" in v:
-                rgb_i = v["color_map"][i].permute(1, 2, 0).reshape(HW, 3)
-            else:
-                rgb_i = (
-                    v["img"][i].permute(1, 2, 0).reshape(HW, 3) * 0.5 + 0.5
-                )  # (HW, 3)
+            # 构建 SH 张量：(HW, 4, 3)
+            # shs[:, 0, :] = DC 系数 (来自输入像素，100% 锁定)
+            # shs[:, 1:4, :] = 1阶 SH rest 系数
+            shs_i = torch.cat([
+                sh_dc_i.unsqueeze(1),                     # (HW, 1, 3)
+                sh_rest_i.reshape(HW, 3, 3),              # (HW, 3, 3)
+            ], dim=1)  # (HW, 4, 3)
 
             # --- 有效点筛选 ---
             keep = torch.ones(HW, dtype=torch.bool, device=xyz_i.device)
-
-            # (1) 前景掩码过滤 (若数据中有 mask)
             if use_mask and "mask" in v:
-                mask_i = v["mask"][i]  # (3, H, W) 或 (1, H, W)
+                mask_i = v["mask"][i]
                 if mask_i.shape[0] == 3:
                     mask_i = mask_i.mean(dim=0, keepdim=True)
-                # 下采样到 H*W 展平
-                fg = mask_i.reshape(-1) > 0.5
-                keep = keep & fg
-
-            # (2) 低不透明度裁剪
+                keep = keep & (mask_i.reshape(-1) > 0.5)
             if min_opacity > 0:
-                keep = keep & (eff_opa[:, 0] > min_opacity)
+                keep = keep & (opa_i[:, 0] > min_opacity)
 
             pts_xyz_all.append(xyz_i[keep])
-            pts_rgb_all.append(rgb_i[keep])
+            pts_shs_all.append(shs_i[keep])
             pts_rot_all.append(rot_i[keep])
             pts_scale_all.append(sc_i[keep])
-            pts_opa_all.append(eff_opa[keep])
+            pts_opa_all.append(opa_i[keep])
 
         # 合并两视图点云
         pts_xyz   = torch.cat(pts_xyz_all,   dim=0)  # (N_total, 3)
-        pts_rgb   = torch.cat(pts_rgb_all,   dim=0)
-        pts_rot   = torch.cat(pts_rot_all,   dim=0)  # (N_total, 4)
+        pts_shs   = torch.cat(pts_shs_all,   dim=0)  # (N_total, 4, 3)
+        pts_rot   = torch.cat(pts_rot_all,   dim=0)
         pts_scale = torch.cat(pts_scale_all, dim=0)
-        pts_opa   = torch.cat(pts_opa_all,   dim=0)  # (N_total, 1)
+        pts_opa   = torch.cat(pts_opa_all,   dim=0)
 
-        # 调用 GPS+ 低层渲染函数
+        # 调用渲染函数（SH 模式：degree=1）
         rendered = render(
             data, i,
-            pts_xyz, pts_rgb, pts_rot, pts_scale, pts_opa,
+            pts_xyz, pts_shs, pts_rot, pts_scale, pts_opa,
             bg_color=bg_color,
+            sh_degree=1,
         )  # (3, H_novel, W_novel)
         render_list.append(rendered.unsqueeze(0))
 

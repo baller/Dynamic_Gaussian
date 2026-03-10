@@ -293,10 +293,10 @@ class PAGSplat(nn.Module):
                 d_curr, size=(Hf, Wf), mode="bilinear", align_corners=False
             )
             # 最后一次迭代同步扭曲 img_other，复用同一次 warp 输出
-            delta_f_i, valid_mask, img_other_warped = self.warping(
+            delta_f_i, valid_mask, _ = self.warping(
                 f_mono_self, f_mono_other, d_curr,
                 intr_self, intr_other, extr_self, extr_other,
-                img2=(img_other if is_last else None),
+                img2=None,   # SH 方案不再做 2D 颜色 warp
             )
             f_2to1_i = delta_f_i[:, self.feat_channels: 2 * self.feat_channels]
             h, delta_d_feat = self.depth_gru(f_mono_self, f_2to1_i, d_feat, h)
@@ -310,15 +310,22 @@ class PAGSplat(nn.Module):
 
         d_gru = d_curr
 
-        # ── 3. 高斯解码（含颜色融合头，delta_f 来自最后一次 GRU 迭代）──
-        gs_params = self.gaussian_decoder(
-            delta_f, img_self,
-            img2_warped_feat=img_other_warped,
-        )
+        # ── 3. 高斯解码（SH 方案：不传 img2_warped，DC 由像素直接绑定）──
+        gs_params = self.gaussian_decoder(delta_f, img_self)
 
-        # ── 4. 最终深度细化（pixel-level delta_depth on top of GRU result）──
+        # ── 4. 最终深度细化 ──
         d_final = d_gru + gs_params["delta_depth"]
         d_final = F.softplus(d_final) + 1e-3
+
+        # ── 5. 绑定 DC 颜色（SH₀ = 输入像素，100% 无损） ──
+        # img_self: (B,3,H,W)  [-1,1]  →  dc_color: (B,3,H,W)  [0,1]
+        SH_C0 = 0.28209479177387814
+        dc_color = img_self * 0.5 + 0.5                           # [0,1]
+        # SH DC 系数: c = SH_C0 * sh_dc + 0.5  →  sh_dc = (c - 0.5) / SH_C0
+        sh_dc  = (dc_color - 0.5) / SH_C0                         # (B,3,H,W)
+        gs_params["sh_dc"]  = sh_dc
+        # color_map 供可视化用：DC + 遮挡残差
+        gs_params["color_map"] = (dc_color + gs_params["color_residual"]).clamp(0, 1)
 
         return gs_params, d_final, d_metric, valid_mask, log_s
 
@@ -374,12 +381,13 @@ class PAGSplat(nn.Module):
             return t.permute(0, 2, 3, 1).reshape(B, H * W, -1)
 
         xyz1 = depth_to_pointcloud(d_final, intr1, extr1)
-        lm["xyz"]     = xyz1
-        lm["rot"]     = flatten_map(gs_params["rot"])
-        lm["scale"]   = flatten_map(gs_params["scale"])
-        lm["opacity"] = flatten_map(gs_params["opacity"])
-        if "color_map" in gs_params:
-            lm["color_map"] = gs_params["color_map"]   # (B, 3, H, W) [0,1]
+        lm["xyz"]      = xyz1
+        lm["rot"]      = flatten_map(gs_params["rot"])
+        lm["scale"]    = flatten_map(gs_params["scale"])
+        lm["opacity"]  = flatten_map(gs_params["opacity"])
+        lm["sh_dc"]    = flatten_map(gs_params["sh_dc"])        # (B, H*W, 3)
+        lm["sh_rest"]  = flatten_map(gs_params["sh_rest"])      # (B, H*W, 9)
+        lm["color_map"] = gs_params["color_map"]                # (B, 3, H, W) [0,1]
 
         # ═══════════════════════════════════════
         # 视图 2: 深度精化 + 高斯解码 (对称)
@@ -390,12 +398,13 @@ class PAGSplat(nn.Module):
         )
 
         xyz2 = depth_to_pointcloud(d_final2, intr2, extr2)
-        rm["xyz"]     = xyz2
-        rm["rot"]     = flatten_map(gs_params2["rot"])
-        rm["scale"]   = flatten_map(gs_params2["scale"])
-        rm["opacity"] = flatten_map(gs_params2["opacity"])
-        if "color_map" in gs_params2:
-            rm["color_map"] = gs_params2["color_map"]
+        rm["xyz"]      = xyz2
+        rm["rot"]      = flatten_map(gs_params2["rot"])
+        rm["scale"]    = flatten_map(gs_params2["scale"])
+        rm["opacity"]  = flatten_map(gs_params2["opacity"])
+        rm["sh_dc"]    = flatten_map(gs_params2["sh_dc"])
+        rm["sh_rest"]  = flatten_map(gs_params2["sh_rest"])
+        rm["color_map"] = gs_params2["color_map"]
 
         # ── 保存中间结果供 loss 计算 ──
         data["metric_depth_l"]   = d_metric1

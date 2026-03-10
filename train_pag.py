@@ -509,7 +509,8 @@ class PAGSplatTrainer:
                 loss = loss + pag_cfg.loss_normal * Lnormal
 
                 # ── P1 损失 6: Chamfer Distance 6D (左右点云几何+颜色一致性) ──
-                # 使用 color_map（模型预测融合色）作为颜色维度；若无则用原始像素
+                # SH 方案中 color_map = DC(像素颜色) + color_residual(极小)
+                # 直接用 color_map 作为颜色维度，退回用原始像素
                 H_, W_ = data["lmain"]["img"].shape[-2], data["lmain"]["img"].shape[-1]
                 def _get_rgb(view_key):
                     v = data[view_key]
