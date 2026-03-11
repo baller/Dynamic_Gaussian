@@ -69,7 +69,7 @@ dataset:
 
   # 目标分辨率 (H, W)；null = 不 resize，保持原始尺寸
   # processed_mini 图片已经是 1024×1024，可设为 null 或调小加速训练
-  target_hw: [512, 512]
+  target_hw: [1024, 1024]
 
   # __len__ 放大倍数
   train_boost: 5
@@ -194,5 +194,5 @@ pagsplat:
 # ───────────────────────────────────────────────
 record:
   loss_freq: 50      # 每 100 步打印一次 loss
-  eval_freq: 500     # 每 3000 步做一次验证
+  eval_freq: 1000     # 每 3000 步做一次验证
   save_iter: 10000    # 每 10000 步保存一次 checkpoint
