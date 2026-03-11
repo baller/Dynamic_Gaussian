@@ -104,7 +104,7 @@ raft:
 # DA3 配置 (schema 兼容占位)
 # ───────────────────────────────────────────────
 da3:
-  model_name: 'depth-anything/DA3-LARGE'
+  model_name: 'depth-anything/DA3-SMALL'
   mode: 'single'
   use_loftr: False
   finetune: False
@@ -125,14 +125,14 @@ gsnet:
 # ───────────────────────────────────────────────
 pagsplat:
   # DA3 预训练权重: HuggingFace repo id 或本地 .safetensors 路径
-  # 示例: 'depth-anything/DA3-LARGE'
-  #       '/data/sifang/Depth-Anything-3/checkpoints/da3-large.safetensors'
-  da3_checkpoint: 'depth-anything/DA3-LARGE'
+  # 示例: 'depth-anything/DA3-SMALL'
+  #       '/data/sifang/Depth-Anything-3/checkpoints/da3-small.safetensors'
+  da3_checkpoint: 'depth-anything/DA3-SMALL'
 
   # DINOv2 backbone embed_dim (由 build_pag_splat 自动从权重检测，此处仅作文档参考)
-  # ViT-B: 768 | ViT-L: 1024 | ViT-G: 1536
-  # DA3-LARGE 使用 ViT-L，embed_dim = 1024
-  embed_dim: 1024
+  # ViT-S: 384 | ViT-B: 768 | ViT-L: 1024 | ViT-G: 1536
+  # DA3-SMALL 使用 ViT-S，embed_dim = 384
+  embed_dim: 384
 
   # 内部统一特征通道数 (越大越强但更占显存)
   feat_channels: 256
@@ -140,7 +140,7 @@ pagsplat:
   # 特征图下采样倍数 (推荐 4 → H/4 分辨率)
   feat_stride: 4
 
-  # 从 DINOv2 第几层提取特征 (ViT-B 共 12 层，推荐 6~9)
+  # 从 DINOv2 第几层提取特征 (ViT-S 共 12 层，推荐 6~9)
   feat_layer: 8
 
   # ScaleAlignmentMLP 隐藏层维度

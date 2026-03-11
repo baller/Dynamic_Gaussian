@@ -7,3 +7,6 @@ experiments/
 runs/
 *.jpg
 *.png
+*.onnx
+*.pth
+*.trt

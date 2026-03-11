@@ -66,7 +66,7 @@ class ConfigStereoHuman:
         
         # DA3配置
         self.cfg.da3 = CN()
-        self.cfg.da3.model_name = 'depth-anything/DA3-LARGE'
+        self.cfg.da3.model_name = 'depth-anything/DA3-SMALL'
         self.cfg.da3.mode = 'single'  # 'single' 或 'dual'
         self.cfg.da3.use_loftr = True
         self.cfg.da3.finetune = False
@@ -85,14 +85,14 @@ class ConfigStereoHuman:
         # PAGSplat 专属配置
         self.cfg.pagsplat = CN()
         # DA3 模型: HF repo id 或本地 checkpoint 路径
-        self.cfg.pagsplat.da3_checkpoint = 'depth-anything/DA3-LARGE'
-        # DINOv2 backbone embed_dim (ViT-B=768, ViT-L=1024, ViT-G=1536)
-        self.cfg.pagsplat.embed_dim = 768
+        self.cfg.pagsplat.da3_checkpoint = 'depth-anything/DA3-SMALL'
+        # DINOv2 backbone embed_dim (ViT-S=384, ViT-B=768, ViT-L=1024, ViT-G=1536)
+        self.cfg.pagsplat.embed_dim = 384
         # 内部统一特征通道数
         self.cfg.pagsplat.feat_channels = 256
         # 特征图相对原图的下采样倍数
         self.cfg.pagsplat.feat_stride = 4
-        # 从 DINOv2 哪一层提取中间特征 (ViT-B 共12层)
+        # 从 DINOv2 哪一层提取中间特征 (ViT-S 共12层)
         self.cfg.pagsplat.feat_layer = 8
         # ScaleAlignmentMLP 隐藏层维度
         self.cfg.pagsplat.mlp_hidden = 256
