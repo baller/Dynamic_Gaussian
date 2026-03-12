@@ -74,6 +74,16 @@ class ConfigStereoHuman:
         self.cfg.da3.scale_factor = 1.0
         self.cfg.da3.use_metric = False
 
+        # Fast-FoundationStereo 配置
+        self.cfg.ffs = CN()
+        self.cfg.ffs.ffs_root = ''           # FFS 仓库根目录路径
+        self.cfg.ffs.model_path = ''         # FFS 模型权重路径 (.pth)
+        self.cfg.ffs.valid_iters = 8         # GRU 迭代次数 (4=快, 8=准)
+        self.cfg.ffs.max_disp = 320          # 最大视差搜索范围（需 > |Tf_x|/Z_min）
+        self.cfg.ffs.use_hiera = False       # 是否使用层级推理
+        self.cfg.ffs.use_loftr = True        # 是否用 LoFTR 增强图像特征
+        self.cfg.ffs.finetune = False        # 是否微调 FFS 模型
+
         self.cfg.gsnet = CN()
         self.cfg.gsnet.use_pe = None
         self.cfg.gsnet.use_depth_net = None

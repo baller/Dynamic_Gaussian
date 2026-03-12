@@ -5,8 +5,8 @@ wdecay: 1e-5
 batch_size: 1
 num_steps: 100000
 
-# 深度估计模式: 'raft' 或 'da3'
-depth_mode: 'raft'
+# 深度估计模式: 'raft', 'da3' 或 'ffs'
+depth_mode: 'ffs'
 
 dataset:
   source_id: [0, 1]
@@ -68,6 +68,29 @@ da3:
   
   # 是否使用metric深度模型
   use_metric: False
+
+# Fast-FoundationStereo配置（当depth_mode='ffs'时使用）
+ffs:
+  # FFS 仓库根目录
+  ffs_root: '/data/sifang/Fast-FoundationStereo'
+  
+  # FFS 模型权重路径
+  model_path: '/data/sifang/Fast-FoundationStereo/weights/23-36-37/model_best_bp2_serialize.pth'
+  
+  # GRU 迭代次数: 4 更快, 8 更准
+  valid_iters: 8
+  
+  # 最大视差搜索范围（主点对齐后纯几何视差范围：|Tf_x|/Z_min ≈ 371/1.5 ≈ 247）
+  max_disp: 320
+  
+  # 是否使用层级推理（适合大分辨率图像）
+  use_hiera: False
+  
+  # 是否使用 LoFTR 增强图像特征（用于高斯参数预测）
+  use_loftr: True
+  
+  # 是否微调 FFS 模型（False = 冻结，仅训练 GSRegresser）
+  finetune: False
 
 # 高斯网络配置
 gsnet:

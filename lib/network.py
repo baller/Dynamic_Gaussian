@@ -1,9 +1,10 @@
 """
 GPS_plus 网络架构
 
-支持两种深度估计模式:
+支持三种深度估计模式:
 1. RAFT-Stereo: 原始的立体匹配深度估计
 2. DA3: 使用Depth-Anything-3进行深度估计
+3. FFS: 使用Fast-FoundationStereo进行立体匹配深度估计
 """
 
 import torch
@@ -23,9 +24,10 @@ class RtStereoHumanModel(nn.Module):
     """
     GPS_plus主网络模型
     
-    支持两种深度估计模式:
+    支持三种深度估计模式:
     - 'raft': 使用RAFT-Stereo进行立体匹配深度估计
     - 'da3': 使用Depth-Anything-3进行深度估计
+    - 'ffs': 使用Fast-FoundationStereo进行立体匹配深度估计
     """
     
     def __init__(self, cfg, with_gs_render=False):
@@ -58,6 +60,14 @@ class RtStereoHumanModel(nn.Module):
             self.loftr_coarse = None
             # DA3模式下仍需要特征匹配用于高斯参数预测
             if getattr(self.cfg.da3, 'use_loftr', True):
+                self.loftr_coarse = LocalFeatureTransformer()
+        elif self.depth_mode == 'ffs':
+            # Fast-FoundationStereo 深度估计模式
+            from lib.ffs_depth import FFSDepthEstimator
+            self.depth_model = FFSDepthEstimator(self.cfg)
+            self.raft_stereo = None
+            self.loftr_coarse = None
+            if getattr(self.cfg.ffs, 'use_loftr', True):
                 self.loftr_coarse = LocalFeatureTransformer()
         else:
             raise ValueError(f"未知的深度估计模式: {self.depth_mode}")
@@ -93,6 +103,8 @@ class RtStereoHumanModel(nn.Module):
             return self._forward_raft(data, image, img_feat, bs, is_train)
         elif self.depth_mode == 'da3':
             return self._forward_da3(data, image, img_feat, bs, is_train)
+        elif self.depth_mode == 'ffs':
+            return self._forward_ffs(data, image, img_feat, bs, is_train)
         else:
             raise ValueError(f"未知的深度估计模式: {self.depth_mode}")
     
@@ -162,6 +174,28 @@ class RtStereoHumanModel(nn.Module):
         
         return data, depth_loss, metrics
 
+    def _forward_ffs(self, data, image, img_feat, bs, is_train):
+        """
+        Fast-FoundationStereo 模式前向传播
+
+        FFS 提供高质量立体视差 → 转换为逆深度 → 复用原版 GSRegresser 预测高斯参数。
+        """
+        data, depth_loss, metrics = self.depth_model(data, is_train=is_train)
+
+        if self.loftr_coarse is not None:
+            (feat_c0, feat_c1) = img_feat[2].split(bs)
+            mask_c0 = mask_c1 = None
+            feat_c0, feat_c1 = self.loftr_coarse(feat_c0, feat_c1, mask_c0, mask_c1)
+            feat_cs = torch.cat((feat_c0, feat_c1), 0)
+            img_feat = img_feat[0], img_feat[1], feat_cs
+
+        if not self.with_gs_render:
+            return data, depth_loss, metrics
+
+        data = self.depth2gsparms(image, img_feat, data, bs)
+
+        return data, depth_loss, metrics
+
     def flow2gsparms(self, lr_img, lr_img_feat, data, bs):
         """
         从光流计算高斯参数（RAFT模式使用）
@@ -208,23 +242,17 @@ class RtStereoHumanModel(nn.Module):
     
     def depth2gsparms(self, lr_img, lr_img_feat, data, bs):
         """
-        从深度计算高斯参数（DA3模式使用）
+        从深度计算高斯参数（DA3/FFS模式使用）
         
-        与flow2gsparms类似，但深度已经由DA3直接提供。
-        
-        Args:
-            lr_img: 左右图像
-            lr_img_feat: 图像特征
-            data: 数据字典
-            bs: batch size
-            
-        Returns:
-            data: 更新后的数据字典
+        与flow2gsparms类似，但深度已经由外部模型直接提供。
         """
-        # DA3已经提供了深度，直接使用
         l_depth = data['lmain']['depth']  
         r_depth = data['rmain']['depth'] 
         lr_depth = torch.concat([l_depth, r_depth], dim=0)
+
+        # 保存初始深度用于可视化对比
+        data['lmain']['depth_init'] = l_depth.detach().clone()
+        data['rmain']['depth_init'] = r_depth.detach().clone()
         
         # 回归高斯参数
         rot_maps, scale_maps, opacity_maps, depth_maps = self.gs_parm_regresser(lr_img, lr_depth, lr_img_feat)

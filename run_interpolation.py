@@ -162,7 +162,7 @@ class StereoHumanModel(nn.Module):
         if self.depth_mode == 'raft':
             if hasattr(self.model, 'raft_stereo') and self.model.raft_stereo is not None:
                 self.model.raft_stereo.freeze_bn()
-        elif self.depth_mode == 'da3':
+        elif self.depth_mode in ('da3', 'ffs'):
             if hasattr(self.model, 'depth_model') and self.model.depth_model is not None:
                 self.model.depth_model.freeze_bn()
         

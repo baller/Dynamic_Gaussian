@@ -1,6 +1,7 @@
 from __future__ import print_function, division
 
 import argparse
+import io
 import logging
 
 import numpy as np
@@ -17,7 +18,6 @@ from lib.train_recoder import Logger, file_backup
 from lib.GaussianRender import pts2render
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
-# from pytorch3d.loss import chamfer_distance
 
 import trimesh 
 import torch
@@ -69,15 +69,17 @@ class Trainer:
     def _freeze_bn(self):
         """根据深度模式冻结BatchNorm层"""
         if self.depth_mode == 'raft':
-            # RAFT模式：冻结RAFT-Stereo的BN
             if hasattr(self.model, 'raft_stereo') and self.model.raft_stereo is not None:
                 self.model.raft_stereo.freeze_bn()
                 logging.info("已冻结RAFT-Stereo的BatchNorm层")
         elif self.depth_mode == 'da3':
-            # DA3模式：冻结DA3的BN（如果不微调的话）
             if hasattr(self.model, 'depth_model') and self.model.depth_model is not None:
                 self.model.depth_model.freeze_bn()
                 logging.info("已冻结DA3的BatchNorm层")
+        elif self.depth_mode == 'ffs':
+            if hasattr(self.model, 'depth_model') and self.model.depth_model is not None:
+                self.model.depth_model.freeze_bn()
+                logging.info("已冻结FFS的BatchNorm层")
 
     def train(self):
         log_l1 = 0
@@ -179,6 +181,7 @@ class Trainer:
         logging.info(f"Doing validation ...")
         torch.cuda.empty_cache()
         psnr_list = []
+        ssim_list = []
         show_idx = np.random.choice(list(range(self.len_val)), 1)
  
         for idx in range(self.len_val):
@@ -190,23 +193,240 @@ class Trainer:
                 render_novel = data['novel_view']['img_pred']
                 gt_novel = data['novel_view']['img'].cuda()
                 psnr_value = psnr(render_novel, gt_novel).mean().double()
+                ssim_value = ssim(render_novel, gt_novel)
                 psnr_list.append(psnr_value.item())
+                ssim_list.append(ssim_value.item())
 
                 if idx == show_idx:
-                    tmp_novel = data['novel_view']['img_pred'][0].detach()
-                    tmp_novel *= 255
-                    tmp_novel = tmp_novel.permute(1, 2, 0).cpu().numpy()
-                    tmp_img_name = '%s/%s.jpg' % (cfg.record.show_path, self.total_steps)
-                    cv2.imwrite(tmp_img_name, tmp_novel[:, :, ::-1].astype(np.uint8))
+                    self._save_eval_visuals(data)
 
         val_psnr = np.round(np.mean(np.array(psnr_list)), 4)
+        val_ssim = np.round(np.mean(np.array(ssim_list)), 4)
         if val_psnr < 10:
             print('something wrong during training, please change random seed and re-train')
             exit()
 
-        logging.info(f"Validation Metrics ({self.total_steps}): psnr {val_psnr}")
-        self.logger.write_dict({'val_psnr': val_psnr}, write_step=self.total_steps)
+        logging.info(f"Validation ({self.total_steps}): PSNR={val_psnr}  SSIM={val_ssim}")
+        self.logger.write_dict({'val_psnr': val_psnr, 'val_ssim': val_ssim},
+                               write_step=self.total_steps)
         torch.cuda.empty_cache()
+
+    # ──────────────────────────────────────────────
+    #  可视化辅助
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _t2np(t):
+        """(B,3,H,W) [0,1] → (H,W,3) uint8 RGB"""
+        return (t[0].detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255
+                ).astype(np.uint8)
+
+    @staticmethod
+    def _depth_to_color(depth, label=""):
+        """
+        逆深度 (B,1,H,W) → 彩色 (H,W,3) uint8。
+        先转真实深度 z=1/(inv+eps)，再 inferno colormap。
+        """
+        import matplotlib.cm as cm
+        d = depth[0, 0].float().cpu().numpy()
+        z = 1.0 / (d + 1e-8)
+        z = np.clip(z, 0, np.percentile(z[z > 0], 98) if (z > 0).any() else 10)
+        z_min, z_max = float(z.min()), float(z.max())
+        if z_max - z_min < 1e-6:
+            d_norm = np.zeros_like(z)
+        else:
+            d_norm = (z - z_min) / (z_max - z_min)
+        rgba = cm.inferno(d_norm)
+        img = (rgba[:, :, :3] * 255).astype(np.uint8)
+        text = f"{label} {z_min:.2f}~{z_max:.2f}m".strip()
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    @staticmethod
+    def _diff_to_color(img_a, img_b, label="Diff"):
+        """两张 [0,1] 图像差值 → hot colormap (H,W,3) uint8"""
+        import matplotlib.cm as cm
+        diff = (img_a - img_b)[0].float().abs().mean(dim=0).cpu().numpy()
+        d_max = float(diff.max())
+        d_norm = np.clip(diff / (d_max + 1e-6), 0, 1)
+        rgba = cm.hot(d_norm)
+        img = (rgba[:, :, :3] * 255).astype(np.uint8)
+        text = f"{label} max={d_max:.3f}"
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    @staticmethod
+    def _opacity_to_color(opa_map, label="Opacity"):
+        """opacity_maps (B,1,H,W) → viridis colormap (H,W,3) uint8"""
+        import matplotlib.cm as cm
+        o = opa_map[0, 0].float().cpu().numpy()
+        rgba = cm.viridis(np.clip(o, 0, 1))
+        img = (rgba[:, :, :3] * 255).astype(np.uint8)
+        cv2.putText(img, label, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, label, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    @staticmethod
+    def _pts_scatter(xyz, H, W, title="", max_pts=80000):
+        """
+        世界坐标点云 (B,N,3) → XY 散点图 (H,W,3) uint8。
+        turbo colormap 按 Z 深度着色，白色背景。
+        """
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as mcm
+
+        pts = xyz[0].float().detach().cpu().numpy()
+        finite = np.all(np.isfinite(pts), axis=1)
+        pts = pts[finite]
+        if len(pts) < 10:
+            return np.ones((H, W, 3), dtype=np.uint8) * 255
+
+        n_total = len(pts)
+        z_vals = pts[:, 2]
+        z_lo, z_hi = np.percentile(z_vals, [2, 98])
+        z_norm = np.clip((z_vals - z_lo) / (z_hi - z_lo + 1e-8), 0, 1)
+        colors = mcm.turbo(z_norm)[:, :3]
+
+        x_lo, x_hi = np.percentile(pts[:, 0], [1, 99])
+        y_lo, y_hi = np.percentile(pts[:, 1], [1, 99])
+        in_range = ((pts[:, 0] >= x_lo) & (pts[:, 0] <= x_hi) &
+                    (pts[:, 1] >= y_lo) & (pts[:, 1] <= y_hi))
+        pts_r, colors_r = pts[in_range], colors[in_range]
+
+        if len(pts_r) > max_pts:
+            idx = np.random.choice(len(pts_r), max_pts, replace=False)
+            pts_r, colors_r = pts_r[idx], colors_r[idx]
+
+        pt_size = max(1.5, min(8.0, H * W * 0.35 / max(len(pts_r), 1)))
+        dpi = 150
+        fig, ax = plt.subplots(figsize=(W / dpi, H / dpi), dpi=dpi)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
+        ax.scatter(pts_r[:, 0], pts_r[:, 1], c=colors_r, s=pt_size,
+                   alpha=0.7, linewidths=0, rasterized=True)
+        ax.set_title(f"{title} ({n_total:,}pts)" if title else f"({n_total:,}pts)",
+                     fontsize=8)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        fig.tight_layout(pad=0.1)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        buf.seek(0)
+        arr = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return bgr[:, :, ::-1]
+
+    @staticmethod
+    def _label(img, text, pos="bottom"):
+        """在图像底部/顶部叠加标签"""
+        out = img.copy()
+        H = out.shape[0]
+        y = H - 10 if pos == "bottom" else 22
+        cv2.putText(out, text, (6, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(out, text, (6, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 255, 255), 1, cv2.LINE_AA)
+        return out
+
+    def _save_eval_visuals(self, data):
+        """
+        保存完整 eval 可视化到 show/{step}/ 目录:
+
+          overview.jpg      — Input_L | Input_R (上行)  Render | GT | Diff (下行)
+          depth.jpg         — Depth_init_L | Depth_final_L | Depth_init_R | Depth_final_R
+          pts.jpg           — Pts_L | Pts_R | Pts_Merged
+          opacity.jpg       — Opacity_L | Opacity_R
+        """
+        step = self.total_steps
+        out_dir = os.path.join(cfg.record.show_path, str(step))
+        os.makedirs(out_dir, exist_ok=True)
+
+        lm, rm, nv = data['lmain'], data['rmain'], data['novel_view']
+        render_novel = nv['img_pred']
+        gt_novel = nv['img'].cuda() if not nv['img'].is_cuda else nv['img']
+        H, W = render_novel.shape[-2], render_novel.shape[-1]
+
+        def _resize(img_np, h, w):
+            if img_np.shape[0] == h and img_np.shape[1] == w:
+                return img_np
+            return cv2.resize(img_np, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        def _pad_w(row, target_w):
+            pad = target_w - row.shape[1]
+            if pad <= 0:
+                return row
+            left = pad // 2
+            return np.pad(row, ((0, 0), (left, pad - left), (0, 0)),
+                          mode='constant', constant_values=255)
+
+        # ── 输入图像 ──
+        img_l = self._t2np(lm['img'] * 0.5 + 0.5)
+        img_r = self._t2np(rm['img'] * 0.5 + 0.5)
+        render_np = self._t2np(render_novel)
+        gt_np = self._t2np(gt_novel)
+        diff_np = self._diff_to_color(render_novel, gt_novel)
+        diff_np = _resize(diff_np, H, W)
+
+        # ── overview.jpg: 上行=输入, 下行=渲染/GT/差值 ──
+        row_top = np.concatenate([
+            self._label(img_l, "Input L"),
+            self._label(img_r, "Input R"),
+        ], axis=1)
+        row_bot = np.concatenate([
+            self._label(render_np, "Render"),
+            self._label(gt_np, "GT"),
+            self._label(diff_np, "Diff"),
+        ], axis=1)
+        tw = max(row_top.shape[1], row_bot.shape[1])
+        row_top = _pad_w(row_top, tw)
+        row_bot = _pad_w(row_bot, tw)
+        overview = np.concatenate([row_top, row_bot], axis=0)
+        cv2.imwrite(os.path.join(out_dir, "overview.jpg"), overview[:, :, ::-1])
+
+        # ── depth.jpg ──
+        panels = []
+        if 'depth_init' in lm:
+            panels.append(_resize(self._depth_to_color(lm['depth_init'], "Init L"), H, W))
+        panels.append(_resize(self._depth_to_color(lm['depth'], "Final L"), H, W))
+        if 'depth_init' in rm:
+            panels.append(_resize(self._depth_to_color(rm['depth_init'], "Init R"), H, W))
+        panels.append(_resize(self._depth_to_color(rm['depth'], "Final R"), H, W))
+        depth_vis = np.concatenate(panels, axis=1)
+        cv2.imwrite(os.path.join(out_dir, "depth.jpg"), depth_vis[:, :, ::-1])
+
+        # ── pts.jpg: 点云散点图 ──
+        pts_l = self._pts_scatter(lm['xyz'], H, W, title="Left")
+        pts_r = self._pts_scatter(rm['xyz'], H, W, title="Right")
+        xyz_merged = torch.cat([lm['xyz'], rm['xyz']], dim=1)
+        pts_m = self._pts_scatter(xyz_merged, H, W, title="Merged")
+        pts_l = _resize(pts_l, H, W)
+        pts_r = _resize(pts_r, H, W)
+        pts_m = _resize(pts_m, H, W)
+        pts_vis = np.concatenate([pts_l, pts_r, pts_m], axis=1)
+        cv2.imwrite(os.path.join(out_dir, "pts.jpg"), pts_vis[:, :, ::-1])
+
+        # ── opacity.jpg ──
+        if 'opacity_maps' in lm:
+            opa_l = _resize(self._opacity_to_color(lm['opacity_maps'], "Opacity L"), H, W)
+            opa_r = _resize(self._opacity_to_color(rm['opacity_maps'], "Opacity R"), H, W)
+            opa_vis = np.concatenate([opa_l, opa_r], axis=1)
+            cv2.imwrite(os.path.join(out_dir, "opacity.jpg"), opa_vis[:, :, ::-1])
+
+        # 快速预览：渲染+GT 横向拼接
+        cv2.imwrite(os.path.join(cfg.record.show_path, f"{step}.jpg"),
+                    np.concatenate([render_np, gt_np], axis=1)[:, :, ::-1])
 
     def fetch_data(self, phase):
         if phase == 'train':
