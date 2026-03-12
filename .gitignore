@@ -7,3 +7,15 @@ experiments/
 runs/
 *.jpg
 *.png
+*.onnx
+*.pth
+*.trt
+*.log
+*.log.json
+*.log.json.gz
+*.log.json.gz.part
+*.log.json.gz.part.1
+*.log.json.gz.part.2
+*.log.json.gz.part.3
+*.log.json.gz.part.4
+*.log.json.gz.part.5
