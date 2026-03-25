@@ -1,0 +1,71 @@
+name: 'stereo_gs_abl_sr_split'
+lr: 0.0001
+wdecay: 1e-5
+batch_size: 1
+num_steps: 100000
+depth_mode: 'stereo_gs'
+
+dataset:
+  source_id: [0, 1]
+  train_novel_id: [2, 3, 4, 5]
+  val_novel_id: [2, 3]
+  use_hr_img: False
+  use_depth_init: True
+  use_local_data: True
+  inverse_depth_init: 0.11468429026724969
+  local_data_root: '/data/sifang/GPS_plus_data/processed_data'
+  train_data_root: '/data/sifang/GPS_plus_data/processed_data/train'
+  val_data_root: '/data/sifang/GPS_plus_data/processed_data/val'
+  bg_color: [0, 0, 0]
+  znear: 0.01
+  zfar: 100.0
+  trans: [0.0, 0.0, 0.0]
+  scale: 1.0
+
+raft:
+  mixed_precision: False
+  train_iters: 3
+  val_iters: 3
+  encoder_dims: [32, 48, 96]
+  hidden_dims: [96, 96, 96]
+  n_downsample: 3
+  n_gru_layers: 1
+  slow_fast_gru: False
+  corr_implementation: 'reg'
+  corr_radius: 4
+  corr_levels: 4
+  context_norm: 'group'
+
+ffs:
+  ffs_root: '/data/sifang/Fast-FoundationStereo'
+  model_path: '/data/sifang/Fast-FoundationStereo/weights/23-36-37/model_best_bp2_serialize.pth'
+  valid_iters: 8
+  max_disp: 320
+  use_hiera: False
+  use_loftr: False
+  finetune: False
+
+stereo_gs:
+  adapt_dims: [96, 96, 128]
+  use_context: True
+  use_gru: True
+  fusion_mode: 'occlusion_aware'
+  confidence_mode: 'learned'
+  head_dim: 64
+  confidence_alpha: 0.3
+  confidence_beta: 0.3
+  max_scale: 0.003
+  sr_mode: 'split'
+  use_post_refine: True
+  refine_hidden: 32
+  refine_layers: 3
+
+gsnet:
+  encoder_dims: [32, 48, 96]
+  decoder_dims: [48, 64, 96]
+  parm_head_dim: 32
+
+record:
+  loss_freq: 100
+  eval_freq: 1000
+  save_iter: 10000

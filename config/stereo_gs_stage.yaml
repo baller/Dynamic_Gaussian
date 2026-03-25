@@ -1,0 +1,90 @@
+name: 'stereo_gs'
+
+lr: 0.0001
+wdecay: 1e-5
+batch_size: 1
+num_steps: 100000
+
+depth_mode: 'stereo_gs'
+
+dataset:
+  source_id: [0, 1]
+  train_novel_id: [2, 3, 4, 5]
+  val_novel_id: [2, 3]
+  use_hr_img: False
+  use_depth_init: True
+  use_local_data: True
+  inverse_depth_init: 0.11468429026724969
+  local_data_root: '/data/sifang/GPS_plus_data/processed_data'
+  train_data_root: '/data/sifang/GPS_plus_data/processed_data/train'
+  val_data_root: '/data/sifang/GPS_plus_data/processed_data/val'
+  bg_color: [0, 0, 0]
+  znear: 0.01
+  zfar: 100.0
+  trans: [0.0, 0.0, 0.0]
+  scale: 1.0
+
+# RAFT 配置（仅用于保持 ConfigStereoHuman 兼容性）
+raft:
+  mixed_precision: False
+  train_iters: 3
+  val_iters: 3
+  encoder_dims: [32, 48, 96]
+  hidden_dims: [96, 96, 96]
+  n_downsample: 3
+  n_gru_layers: 1
+  slow_fast_gru: False
+  corr_implementation: 'reg'
+  corr_radius: 4
+  corr_levels: 4
+  context_norm: 'group'
+
+# Fast-FoundationStereo 配置 (冻结)
+ffs:
+  ffs_root: '/data/sifang/Fast-FoundationStereo'
+  model_path: '/data/sifang/Fast-FoundationStereo/weights/23-36-37/model_best_bp2_serialize.pth'
+  valid_iters: 8
+  max_disp: 320
+  use_hiera: False
+  use_loftr: False
+  finetune: False
+
+# StereoGS 特有配置
+stereo_gs:
+  # Stage 2: 特征适配
+  adapt_dims: [96, 96, 128]
+  use_context: True
+  use_gru: True
+
+  # Stage 3: 跨视图融合
+  # 可选: 'none' | 'warp_attention' | 'occlusion_aware'
+  fusion_mode: 'occlusion_aware'
+
+  # Stage 4: 置信度 + 高斯解码
+  # 可选: 'peak' | 'entropy' | 'learned'
+  confidence_mode: 'learned'
+  head_dim: 64
+  confidence_alpha: 0.3
+  confidence_beta: 0.3
+  max_scale: 0.003
+
+  # Stage 5: 高斯超分
+  # 可选: 'convex' | 'split'
+  sr_mode: 'convex'
+
+  # Stage 7: 渲染后精化
+  use_post_refine: True
+  refine_hidden: 32
+  refine_layers: 3
+
+# gsnet 配置 (StereoGS 模式下不使用，但保持兼容)
+gsnet:
+  encoder_dims: [32, 48, 96]
+  decoder_dims: [48, 64, 96]
+  parm_head_dim: 32
+
+# 记录配置
+record:
+  loss_freq: 100
+  eval_freq: 500
+  save_iter: 10000

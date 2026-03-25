@@ -130,6 +130,22 @@ class ConfigStereoHuman:
         self.cfg.pagsplat.gru_iters     = 3    # GRU 迭代次数 (0=不使用 GRU)
         self.cfg.pagsplat.gru_hidden_ch = 64   # GRU 隐藏状态通道数
 
+        # StereoGS 配置
+        self.cfg.stereo_gs = CN()
+        self.cfg.stereo_gs.adapt_dims = [96, 96, 128]
+        self.cfg.stereo_gs.use_context = True
+        self.cfg.stereo_gs.use_gru = True
+        self.cfg.stereo_gs.fusion_mode = 'occlusion_aware'
+        self.cfg.stereo_gs.confidence_mode = 'learned'
+        self.cfg.stereo_gs.head_dim = 64
+        self.cfg.stereo_gs.confidence_alpha = 0.3
+        self.cfg.stereo_gs.confidence_beta = 0.3
+        self.cfg.stereo_gs.max_scale = 0.003
+        self.cfg.stereo_gs.sr_mode = 'convex'
+        self.cfg.stereo_gs.use_post_refine = True
+        self.cfg.stereo_gs.refine_hidden = 32
+        self.cfg.stereo_gs.refine_layers = 3
+
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
         self.cfg.record.show_path = None

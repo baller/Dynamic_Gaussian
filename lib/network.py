@@ -42,8 +42,9 @@ class RtStereoHumanModel(nn.Module):
         self.depth_mode = getattr(self.cfg, 'depth_mode', 'raft')
         print(f"[Network] 深度估计模式: {self.depth_mode}")
         
-        # 图像编码器（两种模式都需要）
-        self.img_encoder = UnetExtractor(in_channel=3, encoder_dim=self.cfg.raft.encoder_dims)
+        # 图像编码器 (stereo_gs 模式使用 FFS 特征，不需要独立编码器)
+        if self.depth_mode != 'stereo_gs':
+            self.img_encoder = UnetExtractor(in_channel=3, encoder_dim=self.cfg.raft.encoder_dims)
         
         # 根据模式初始化深度估计模块
         if self.depth_mode == 'raft':
@@ -69,11 +70,17 @@ class RtStereoHumanModel(nn.Module):
             self.loftr_coarse = None
             if getattr(self.cfg.ffs, 'use_loftr', True):
                 self.loftr_coarse = LocalFeatureTransformer()
+        elif self.depth_mode == 'stereo_gs':
+            from lib.stereo_gs import StereoGSModel
+            self.stereo_gs_model = StereoGSModel(self.cfg)
+            self.depth_model = None
+            self.raft_stereo = None
+            self.loftr_coarse = None
         else:
             raise ValueError(f"未知的深度估计模式: {self.depth_mode}")
         
-        # 高斯参数回归器
-        if self.with_gs_render:
+        # 高斯参数回归器 (stereo_gs 模式内置解码器，不需要 GSRegresser)
+        if self.with_gs_render and self.depth_mode != 'stereo_gs':
             self.gs_parm_regresser = GSRegresser(self.cfg, rgb_dim=3, depth_dim=1)
 
     def forward(self, data, is_train=True):
@@ -90,6 +97,9 @@ class RtStereoHumanModel(nn.Module):
             metrics: 指标字典
         """
         bs = data['lmain']['img'].shape[0]
+
+        if self.depth_mode == 'stereo_gs':
+            return self._forward_stereo_gs(data, bs, is_train)
         
         # 合并左右图像用于批量处理
         image = torch.cat([data['lmain']['img'], data['rmain']['img']], dim=0)
@@ -195,6 +205,15 @@ class RtStereoHumanModel(nn.Module):
         data = self.depth2gsparms(image, img_feat, data, bs)
 
         return data, depth_loss, metrics
+
+    def _forward_stereo_gs(self, data, bs, is_train):
+        """
+        StereoGS 模式: FFS 特征驱动的端到端高斯预测。
+
+        不使用 img_encoder / GSRegresser，完全由 StereoGSModel 内部处理。
+        """
+        data, loss, metrics = self.stereo_gs_model(data, is_train=is_train)
+        return data, loss, metrics or {}
 
     def flow2gsparms(self, lr_img, lr_img_feat, data, bs):
         """

@@ -19,3 +19,4 @@ runs/
 *.log.json.gz.part.3
 *.log.json.gz.part.4
 *.log.json.gz.part.5
+*.engine
