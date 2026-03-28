@@ -3,7 +3,7 @@ name: 'stereo_gs'
 lr: 0.0001
 wdecay: 1e-5
 batch_size: 1
-num_steps: 100000
+num_steps: 200000
 
 depth_mode: 'stereo_gs'
 
@@ -68,12 +68,22 @@ stereo_gs:
   confidence_beta: 0.3
   max_scale: 0.003
 
-  # Stage 5: 高斯超分
+  # Stage 5: 高斯超分 (Legacy 模式)
   # 可选: 'convex' | 'split'
   sr_mode: 'convex'
 
+  # CAGS: 自适应高斯分裂
+  use_cags: true
+  # 分裂判定: 'gradient' | 'learned'
+  cags_split_mode: 'learned'
+  cags_k_max: 4
+  cags_split_hidden: 32
+  cags_max_pos_offset: 0.002
+  cags_sparsity_weight: 0.01
+  cags_split_threshold: 0.1
+
   # Stage 7: 渲染后精化
-  use_post_refine: True
+  use_post_refine: False
   refine_hidden: 32
   refine_layers: 3
 

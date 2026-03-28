@@ -36,7 +36,7 @@ from config.stereo_human_config import ConfigStereoHuman
 from lib.human_loader import StereoHumanDataset
 from lib.network import RtStereoHumanModel
 from lib.train_recoder import Logger
-from lib.GaussianRender import pts2render
+from lib.GaussianRender import pts2render, pts2render_cags
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
 
@@ -124,7 +124,12 @@ class StereoGSTrainer:
 
     def train(self):
         use_post_refine = getattr(self.cfg.stereo_gs, 'use_post_refine', False)
+        use_cags = getattr(self.cfg.stereo_gs, 'use_cags', False)
+        sparsity_weight = getattr(self.cfg.stereo_gs, 'cags_sparsity_weight', 0.01)
+        render_fn = pts2render_cags if use_cags else pts2render
         log = dict(l1=0.0, ssim=0.0)
+        if use_cags:
+            log['sparse'] = 0.0
         LOG_PERIOD = 100
 
         for itr in tqdm(range(self.total_steps, self.cfg.num_steps)):
@@ -132,7 +137,7 @@ class StereoGSTrainer:
             data = self.fetch_data('train')
 
             data, _, metrics = self.model(data, is_train=True)
-            data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
+            data = render_fn(data, bg_color=self.cfg.dataset.bg_color)
 
             if use_post_refine:
                 data = self.model.stereo_gs_model.refine_rendered(data)
@@ -143,6 +148,15 @@ class StereoGSTrainer:
             Ll1 = l1_loss(render_novel, gt_novel)
             Lssim = 1.0 - ssim(render_novel, gt_novel)
             loss = 0.8 * Ll1 + 0.2 * Lssim
+
+            if use_cags:
+                extras = data.get('_stereo_gs_extras', {})
+                wl = extras.get('split_weights_left')
+                wr = extras.get('split_weights_right')
+                if wl is not None and wr is not None:
+                    L_sparse = (wl.mean() + wr.mean()) * 0.5
+                    loss = loss + sparsity_weight * L_sparse
+                    log['sparse'] += sparsity_weight * L_sparse.item()
 
             log['l1'] += 0.8 * Ll1.item()
             log['ssim'] += 0.2 * Lssim.item()
@@ -190,6 +204,8 @@ class StereoGSTrainer:
 
     def run_eval(self):
         use_post_refine = getattr(self.cfg.stereo_gs, 'use_post_refine', False)
+        use_cags = getattr(self.cfg.stereo_gs, 'use_cags', False)
+        render_fn = pts2render_cags if use_cags else pts2render
         logging.info(f"[step {self.total_steps}] 开始验证 ...")
         torch.cuda.empty_cache()
         psnr_list, ssim_list = [], []
@@ -199,7 +215,7 @@ class StereoGSTrainer:
             data = self.fetch_data('val')
             with torch.no_grad():
                 data, _, _ = self.model(data, is_train=False)
-                data = pts2render(data, bg_color=self.cfg.dataset.bg_color)
+                data = render_fn(data, bg_color=self.cfg.dataset.bg_color)
                 if use_post_refine:
                     data = self.model.stereo_gs_model.refine_rendered(data)
 
@@ -267,6 +283,72 @@ class StereoGSTrainer:
                     0.6, (255, 255, 255), 1, cv2.LINE_AA)
         return out
 
+    @staticmethod
+    def _split_weights_to_color(weights_tensor, label="Split Weights"):
+        """分裂权重 (B, K_sub, H_lr, W_lr) → 求和后可视化为热力图。"""
+        import matplotlib.cm as cm
+        w_sum = weights_tensor[0].sum(dim=0).float().cpu().numpy()  # (H_lr, W_lr)
+        hi = max(w_sum.max(), 1e-6)
+        w_norm = np.clip(w_sum / hi, 0, 1)
+        rgba = cm.hot(w_norm)
+        img = (rgba[:, :, :3] * 255).astype(np.uint8)
+        cv2.putText(img, f"{label} max={hi:.3f}", (6, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, f"{label} max={hi:.3f}", (6, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    @staticmethod
+    def _density_map_to_color(data_view, k_sub, label="Density"):
+        """高斯密度图: base(1) + active sub-Gaussians per pixel → 伪彩色。"""
+        import matplotlib.cm as cm
+        mask = data_view['pts_valid'][0].float().cpu()       # (H*W,)
+        if 'sub_valid' not in data_view:
+            return None
+        sub_valid = data_view['sub_valid'][0].float().cpu()  # (k_sub*H*W,)
+        sub_opacity = data_view['sub_opacity'][0, :, 0].float().cpu()  # (k_sub*H*W,)
+        N = mask.shape[0]
+        sub_active = (sub_valid * (sub_opacity > 0.05).float()).view(k_sub, N).sum(dim=0)
+        density = mask + sub_active                            # 1 + active subs
+        H = W = int(N ** 0.5)
+        d_map = density.view(H, W).numpy()
+        k_max = k_sub + 1
+        d_norm = np.clip(d_map / k_max, 0, 1)
+        rgba = cm.turbo(d_norm)
+        img = (rgba[:, :, :3] * 255).astype(np.uint8)
+        n_base = int(mask.sum().item())
+        n_sub = int(sub_active.sum().item())
+        text = f"{label}: base={n_base} sub={n_sub} total={n_base + n_sub}"
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    def _save_cags_visuals(self, data, extras, out_dir, H, W):
+        """保存 CAGS 专属可视化: 分裂权重 + 高斯密度。"""
+        k_sub = extras['split_weights_left'].shape[1]
+
+        def _resize(img_np, h, w):
+            if img_np.shape[0] == h and img_np.shape[1] == w:
+                return img_np
+            return cv2.resize(img_np, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        sw_l = _resize(self._split_weights_to_color(
+            extras['split_weights_left'], "SplitW L"), H, W)
+        sw_r = _resize(self._split_weights_to_color(
+            extras['split_weights_right'], "SplitW R"), H, W)
+        cv2.imwrite(os.path.join(out_dir, "split_weights.jpg"),
+                    np.concatenate([sw_l, sw_r], axis=1)[:, :, ::-1])
+
+        dens_l = self._density_map_to_color(data['lmain'], k_sub, "Density L")
+        dens_r = self._density_map_to_color(data['rmain'], k_sub, "Density R")
+        if dens_l is not None and dens_r is not None:
+            dens_l = _resize(dens_l, H, W)
+            dens_r = _resize(dens_r, H, W)
+            cv2.imwrite(os.path.join(out_dir, "density.jpg"),
+                        np.concatenate([dens_l, dens_r], axis=1)[:, :, ::-1])
+
     def _save_eval_visuals(self, data):
         step = self.total_steps
         out_dir = os.path.join(self.cfg.record.show_path, str(step))
@@ -320,6 +402,10 @@ class StereoGSTrainer:
             ]
             cv2.imwrite(os.path.join(out_dir, "confidence.jpg"),
                         np.concatenate(conf_panels, axis=1)[:, :, ::-1])
+
+        # ── CAGS 可视化: 分裂权重图 + 高斯密度图 ──
+        if 'split_weights_left' in extras:
+            self._save_cags_visuals(data, extras, out_dir, H, W)
 
         cv2.imwrite(os.path.join(self.cfg.record.show_path, f"{step}.jpg"),
                     np.concatenate([render_np, gt_np], axis=1)[:, :, ::-1])
@@ -467,10 +553,15 @@ if __name__ == '__main__':
     np.random.seed(1314)
 
     logging.info(f"实验名: {cfg.exp_name}")
+    use_cags = getattr(cfg.stereo_gs, 'use_cags', False)
     logging.info(f"配置: fusion={cfg.stereo_gs.fusion_mode}, "
                  f"confidence={cfg.stereo_gs.confidence_mode}, "
-                 f"sr={cfg.stereo_gs.sr_mode}, "
+                 f"cags={use_cags}, "
                  f"refine={cfg.stereo_gs.use_post_refine}")
+    if use_cags:
+        logging.info(f"  CAGS: split_mode={cfg.stereo_gs.cags_split_mode}, "
+                     f"k_max={cfg.stereo_gs.cags_k_max}, "
+                     f"sparsity_w={cfg.stereo_gs.cags_sparsity_weight}")
 
     trainer = StereoGSTrainer(cfg)
     trainer.train()

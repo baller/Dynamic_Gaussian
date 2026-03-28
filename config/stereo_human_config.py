@@ -145,6 +145,13 @@ class ConfigStereoHuman:
         self.cfg.stereo_gs.use_post_refine = True
         self.cfg.stereo_gs.refine_hidden = 32
         self.cfg.stereo_gs.refine_layers = 3
+        self.cfg.stereo_gs.use_cags = False
+        self.cfg.stereo_gs.cags_split_mode = 'learned'
+        self.cfg.stereo_gs.cags_k_max = 4
+        self.cfg.stereo_gs.cags_split_hidden = 32
+        self.cfg.stereo_gs.cags_max_pos_offset = 0.002
+        self.cfg.stereo_gs.cags_sparsity_weight = 0.01
+        self.cfg.stereo_gs.cags_split_threshold = 0.1
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
