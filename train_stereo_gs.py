@@ -299,6 +299,116 @@ class StereoGSTrainer:
         return img
 
     @staticmethod
+    def _project_xyz_to_screen(
+        xyz: torch.Tensor,
+        extr: torch.Tensor,
+        FovX: float,
+        FovY: float,
+        H: int,
+        W: int,
+    ):
+        """将世界坐标系 3D 点投影到图像像素坐标。
+
+        Args:
+            xyz:  (N, 3) 世界空间点云
+            extr: (4, 4) world-to-camera 外参矩阵 [R|t]
+            FovX, FovY: 水平/垂直视场角 (radians)
+            H, W: 图像高宽
+
+        Returns:
+            u (N,) int64, v (N,) int64, valid (N,) bool
+        """
+        import math
+        fx = W / (2.0 * math.tan(FovX * 0.5))
+        fy = H / (2.0 * math.tan(FovY * 0.5))
+        cx, cy = W / 2.0, H / 2.0
+
+        R = extr[:3, :3].float()   # (3, 3)
+        t = extr[:3, 3].float()    # (3,)
+        pts_cam = (R @ xyz.float().T).T + t    # (N, 3)
+
+        z = pts_cam[:, 2]
+        front = z > 0.1
+        z_s = z.clamp(min=1e-6)
+        u = (fx * pts_cam[:, 0] / z_s + cx).long()
+        v = (fy * pts_cam[:, 1] / z_s + cy).long()
+        valid = front & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        return u, v, valid
+
+    @staticmethod
+    def _gs_density_image(
+        u: torch.Tensor,
+        v: torch.Tensor,
+        valid: torch.Tensor,
+        H: int,
+        W: int,
+        label: str = "GS Density",
+    ) -> np.ndarray:
+        """把投影到屏幕的高斯中心做像素级计数，返回 log 尺度 plasma 热力图。"""
+        import matplotlib.cm as cm
+        density = np.zeros((H, W), dtype=np.float32)
+        vu = u[valid].cpu().numpy()
+        vv = v[valid].cpu().numpy()
+        np.add.at(density, (vv, vu), 1.0)
+        density = np.log1p(density)
+        d_max = density.max()
+        d_norm = density / (d_max + 1e-6)
+        rgba = cm.plasma(d_norm)
+        img = (rgba[:, :, :3] * 255).astype(np.uint8)
+        n_total = int(valid.sum().item())
+        text = f"{label}  N={n_total}"
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    @staticmethod
+    def _pcl_proj_image(
+        xyz_list: list,
+        color_list: list,
+        extr: torch.Tensor,
+        FovX: float,
+        FovY: float,
+        H: int,
+        W: int,
+        label: str = "",
+    ) -> np.ndarray:
+        """将多组点云用不同颜色投影到同一张图上（黑底彩点）。
+
+        Args:
+            xyz_list:   list of (N_i, 3) tensors
+            color_list: list of (R, G, B) tuples in [0, 255]
+            extr:       (4, 4) world-to-camera 外参
+        """
+        import math
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+        fx = W / (2.0 * math.tan(FovX * 0.5))
+        fy = H / (2.0 * math.tan(FovY * 0.5))
+        cx, cy = W / 2.0, H / 2.0
+        R = extr[:3, :3].float()
+        t = extr[:3, 3].float()
+
+        for xyz, color in zip(xyz_list, color_list):
+            if xyz is None or xyz.shape[0] == 0:
+                continue
+            pts_cam = (R @ xyz.float().T).T + t
+            z = pts_cam[:, 2]
+            fv = (z > 0.1).cpu().numpy()
+            z_s = z.clamp(min=1e-6)
+            u = (fx * pts_cam[:, 0] / z_s + cx).long().cpu().numpy()
+            v = (fy * pts_cam[:, 1] / z_s + cy).long().cpu().numpy()
+            mask = fv & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            canvas[v[mask], u[mask]] = color
+
+        if label:
+            cv2.putText(canvas, label, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(canvas, label, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        return canvas
+
+    @staticmethod
     def _density_map_to_color(data_view, k_sub, label="Density"):
         """高斯密度图: base(1) + active sub-Gaussians per pixel → 伪彩色。"""
         import matplotlib.cm as cm
@@ -324,6 +434,94 @@ class StereoGSTrainer:
         cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
                     0.4, (0, 0, 0), 1, cv2.LINE_AA)
         return img
+
+    def _save_pcl_density_visuals(self, data, out_dir: str, H: int, W: int):
+        """保存高斯密度投影图 + 每视图 / 合并点云投影图（投影到 novel view）。
+
+        输出文件:
+          gs_density.jpg   — 所有高斯中心投影到 novel view 的像素密度热力图
+          pcl_per_view.jpg — 左视图(蓝)、右视图(橙红) 分别投影的拼图
+          pcl_merged.jpg   — 左右（含子高斯）合并投影
+        """
+        nv = data['novel_view']
+        idx = 0
+        extr = nv['extr'][idx].cuda()                   # (4, 4)
+        FovX = float(nv['FovX'][idx])
+        FovY = float(nv['FovY'][idx])
+        use_cags = getattr(self.cfg.stereo_gs, 'use_cags', False)
+
+        def _get_base_xyz(view_key):
+            xyz = data[view_key]['xyz'][idx]              # (N, 3)
+            valid = data[view_key]['pts_valid'][idx]      # (N,) bool
+            return xyz[valid]
+
+        xyz_l = _get_base_xyz('lmain')
+        xyz_r = _get_base_xyz('rmain')
+        xyz_groups = [xyz_l, xyz_r]
+
+        # CAGS 子高斯
+        if use_cags and 'sub_xyz' in data.get('lmain', {}):
+            def _get_sub_xyz(view_key):
+                s_xyz = data[view_key]['sub_xyz'][idx]    # (N_sub, 3)
+                s_valid = data[view_key]['sub_valid'][idx]
+                return s_xyz[s_valid]
+            sub_l = _get_sub_xyz('lmain')
+            sub_r = _get_sub_xyz('rmain')
+            xyz_groups_all = [xyz_l, xyz_r, sub_l, sub_r]
+        else:
+            xyz_groups_all = xyz_groups
+
+        xyz_combined = torch.cat(xyz_groups_all, dim=0)  # (N_total, 3)
+
+        # ── 1. 高斯密度图 ──
+        u_all, v_all, valid_all = self._project_xyz_to_screen(
+            xyz_combined, extr, FovX, FovY, H, W)
+        dens_img = self._gs_density_image(u_all, v_all, valid_all, H, W,
+                                          label="GS Density")
+        cv2.imwrite(os.path.join(out_dir, "gs_density.jpg"),
+                    dens_img[:, :, ::-1])
+
+        # ── 2. 每视图点云投影图 ──
+        COLOR_L   = (100, 160, 255)   # 左基础: 蓝
+        COLOR_R   = (255, 110,  70)   # 右基础: 橙红
+        COLOR_SL  = (170, 220, 255)   # 左子高斯: 浅蓝
+        COLOR_SR  = (255, 200, 130)   # 右子高斯: 浅橙
+
+        pcl_l = self._pcl_proj_image(
+            [xyz_l], [COLOR_L], extr, FovX, FovY, H, W,
+            label=f"Left  base N={xyz_l.shape[0]}")
+        pcl_r = self._pcl_proj_image(
+            [xyz_r], [COLOR_R], extr, FovX, FovY, H, W,
+            label=f"Right base N={xyz_r.shape[0]}")
+
+        if use_cags and 'sub_xyz' in data.get('lmain', {}):
+            n_sub_l = sub_l.shape[0]
+            n_sub_r = sub_r.shape[0]
+            pcl_l_sub = self._pcl_proj_image(
+                [sub_l], [COLOR_SL], extr, FovX, FovY, H, W,
+                label=f"Left  sub  N={n_sub_l}")
+            pcl_r_sub = self._pcl_proj_image(
+                [sub_r], [COLOR_SR], extr, FovX, FovY, H, W,
+                label=f"Right sub  N={n_sub_r}")
+            per_view_row = np.concatenate(
+                [pcl_l, pcl_l_sub, pcl_r, pcl_r_sub], axis=1)
+        else:
+            per_view_row = np.concatenate([pcl_l, pcl_r], axis=1)
+
+        cv2.imwrite(os.path.join(out_dir, "pcl_per_view.jpg"),
+                    per_view_row[:, :, ::-1])
+
+        # ── 3. 合并点云投影图 ──
+        if use_cags and 'sub_xyz' in data.get('lmain', {}):
+            color_groups = [COLOR_L, COLOR_R, COLOR_SL, COLOR_SR]
+        else:
+            color_groups = [COLOR_L, COLOR_R]
+
+        pcl_merged = self._pcl_proj_image(
+            xyz_groups_all, color_groups, extr, FovX, FovY, H, W,
+            label=f"Merged N={xyz_combined.shape[0]}")
+        cv2.imwrite(os.path.join(out_dir, "pcl_merged.jpg"),
+                    pcl_merged[:, :, ::-1])
 
     def _save_cags_visuals(self, data, extras, out_dir, H, W):
         """保存 CAGS 专属可视化: 分裂权重 + 高斯密度。"""
@@ -406,6 +604,12 @@ class StereoGSTrainer:
         # ── CAGS 可视化: 分裂权重图 + 高斯密度图 ──
         if 'split_weights_left' in extras:
             self._save_cags_visuals(data, extras, out_dir, H, W)
+
+        # ── 高斯密度投影图 + 点云投影图 ──
+        try:
+            self._save_pcl_density_visuals(data, out_dir, H, W)
+        except Exception as e:
+            logging.warning(f"[pcl_density] 可视化失败: {e}")
 
         cv2.imwrite(os.path.join(self.cfg.record.show_path, f"{step}.jpg"),
                     np.concatenate([render_np, gt_np], axis=1)[:, :, ::-1])
