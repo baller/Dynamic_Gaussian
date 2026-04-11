@@ -17,7 +17,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def disparity_warp(feat: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
+def disparity_warp(
+    feat: torch.Tensor,
+    disp: torch.Tensor,
+    padding_mode: str = 'zeros',
+) -> torch.Tensor:
     """
     用视差将**右**视图特征 warp 到**左**视图坐标系。
 
@@ -26,6 +30,7 @@ def disparity_warp(feat: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
     Args:
         feat: (B, C, H, W) 右视图特征
         disp: (B, 1, H, W) 左视图处的视差 (正值)
+        padding_mode: grid_sample 越界填充策略 ('zeros' | 'border' | 'reflection')
 
     Returns:
         warped: (B, C, H, W) warp 后的右视图特征
@@ -43,7 +48,7 @@ def disparity_warp(feat: torch.Tensor, disp: torch.Tensor) -> torch.Tensor:
     norm_y = 2.0 * grid_y / (H - 1) - 1.0
     grid = torch.stack([norm_x, norm_y], dim=-1)
 
-    warped = F.grid_sample(feat, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    warped = F.grid_sample(feat, grid, mode='bilinear', padding_mode=padding_mode, align_corners=True)
     return warped
 
 
@@ -72,9 +77,10 @@ class WarpAttentionFusion(nn.Module):
     学习注意力权重来控制两侧特征的混合比例。
     """
 
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int, warp_padding_mode: str = 'zeros'):
         super().__init__()
         self.out_channels = in_channels
+        self.warp_padding_mode = warp_padding_mode
         self.gate = nn.Sequential(
             nn.Conv2d(in_channels * 3, in_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(in_channels),
@@ -104,7 +110,7 @@ class WarpAttentionFusion(nn.Module):
             disp, size=feat_main.shape[-2:], mode='bilinear', align_corners=True,
         ) * (feat_main.shape[-1] / disp.shape[-1])
 
-        warped = disparity_warp(feat_other, disp_scaled)
+        warped = disparity_warp(feat_other, disp_scaled, padding_mode=self.warp_padding_mode)
         diff = torch.abs(feat_main - warped)
         weight = self.gate(torch.cat([feat_main, warped, diff], dim=1))
         fused = weight * feat_main + (1 - weight) * warped
@@ -120,10 +126,11 @@ class OcclusionAwareFusion(nn.Module):
     - 遮挡区域: 仅使用当前视图特征，经自增强模块处理
     """
 
-    def __init__(self, in_channels: int, occlusion_threshold: float = 0.3):
+    def __init__(self, in_channels: int, occlusion_threshold: float = 0.3, warp_padding_mode: str = 'zeros'):
         super().__init__()
         self.out_channels = in_channels
         self.occlusion_threshold = occlusion_threshold
+        self.warp_padding_mode = warp_padding_mode
 
         self.cross_fuse = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, 3, padding=1, bias=False),
@@ -162,7 +169,7 @@ class OcclusionAwareFusion(nn.Module):
             disp, size=(H, W), mode='bilinear', align_corners=True,
         ) * (W / disp.shape[-1])
 
-        warped = disparity_warp(feat_other, disp_scaled)
+        warped = disparity_warp(feat_other, disp_scaled, padding_mode=self.warp_padding_mode)
         diff = torch.abs(feat_main - warped)
         diff_norm = diff.mean(dim=1, keepdim=True)
 
@@ -181,13 +188,13 @@ class OcclusionAwareFusion(nn.Module):
         return fused
 
 
-def build_fusion_module(mode: str, in_channels: int, **kwargs) -> nn.Module:
+def build_fusion_module(mode: str, in_channels: int, warp_padding_mode: str = 'zeros', **kwargs) -> nn.Module:
     """工厂函数：根据配置字符串构建融合模块。"""
     if mode == 'none':
         return NoFusion(in_channels)
     elif mode == 'warp_attention':
-        return WarpAttentionFusion(in_channels)
+        return WarpAttentionFusion(in_channels, warp_padding_mode=warp_padding_mode)
     elif mode == 'occlusion_aware':
-        return OcclusionAwareFusion(in_channels, **kwargs)
+        return OcclusionAwareFusion(in_channels, warp_padding_mode=warp_padding_mode, **kwargs)
     else:
         raise ValueError(f"Unknown fusion mode: {mode}")

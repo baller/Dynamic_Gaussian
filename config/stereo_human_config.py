@@ -152,6 +152,9 @@ class ConfigStereoHuman:
         self.cfg.stereo_gs.cags_max_pos_offset = 0.002
         self.cfg.stereo_gs.cags_sparsity_weight = 0.01
         self.cfg.stereo_gs.cags_split_threshold = 0.1
+        self.cfg.stereo_gs.chamfer_weight = 0.0
+        self.cfg.stereo_gs.chamfer_n_samples = 10000
+        self.cfg.stereo_gs.warp_padding_mode = 'zeros'
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None

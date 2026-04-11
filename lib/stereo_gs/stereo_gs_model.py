@@ -80,8 +80,9 @@ class StereoGSModel(nn.Module):
 
         # ── Stage 3: 跨视图融合 ──
         fusion_mode = stereo_gs_cfg.fusion_mode
-        self.fusion = build_fusion_module(fusion_mode, adapt_dims[0])
-        logging.info(f"[StereoGS] Fusion mode: {fusion_mode}")
+        warp_padding_mode = getattr(stereo_gs_cfg, 'warp_padding_mode', 'zeros')
+        self.fusion = build_fusion_module(fusion_mode, adapt_dims[0], warp_padding_mode=warp_padding_mode)
+        logging.info(f"[StereoGS] Fusion mode: {fusion_mode}, warp_padding: {warp_padding_mode}")
 
         # ── Stage 4: 置信度提取 ──
         conf_mode = getattr(stereo_gs_cfg, 'confidence_mode', 'peak')

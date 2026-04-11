@@ -39,6 +39,7 @@ from lib.train_recoder import Logger
 from lib.GaussianRender import pts2render, pts2render_cags
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
+from pytorch3d.loss import chamfer_distance
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -126,10 +127,14 @@ class StereoGSTrainer:
         use_post_refine = getattr(self.cfg.stereo_gs, 'use_post_refine', False)
         use_cags = getattr(self.cfg.stereo_gs, 'use_cags', False)
         sparsity_weight = getattr(self.cfg.stereo_gs, 'cags_sparsity_weight', 0.01)
+        chamfer_weight = getattr(self.cfg.stereo_gs, 'chamfer_weight', 0.0)
+        n_chamfer = getattr(self.cfg.stereo_gs, 'chamfer_n_samples', 10000)
         render_fn = pts2render_cags if use_cags else pts2render
         log = dict(l1=0.0, ssim=0.0)
         if use_cags:
             log['sparse'] = 0.0
+        if chamfer_weight > 0:
+            log['chamfer'] = 0.0
         LOG_PERIOD = 100
 
         for itr in tqdm(range(self.total_steps, self.cfg.num_steps)):
@@ -158,12 +163,31 @@ class StereoGSTrainer:
                     loss = loss + sparsity_weight * L_sparse
                     log['sparse'] += sparsity_weight * L_sparse.item()
 
+            Lcd = torch.tensor(0.0, device='cuda')
+            if chamfer_weight > 0:
+                for b_i in range(self.bs):
+                    l_valid = data['lmain']['pts_valid'][b_i]
+                    r_valid = data['rmain']['pts_valid'][b_i]
+                    l_xyz_v = data['lmain']['xyz'][b_i][l_valid].unsqueeze(0).contiguous()
+                    r_xyz_v = data['rmain']['xyz'][b_i][r_valid].unsqueeze(0).contiguous()
+                    n_sample = min(n_chamfer, l_xyz_v.shape[1], r_xyz_v.shape[1])
+                    if n_sample < 100:
+                        continue
+                    idx_l = np.random.choice(l_xyz_v.shape[1], n_sample, replace=False)
+                    idx_r = np.random.choice(r_xyz_v.shape[1], n_sample, replace=False)
+                    cd_i, _ = chamfer_distance(l_xyz_v[:, idx_l], r_xyz_v[:, idx_r])
+                    Lcd = Lcd + cd_i
+                Lcd = Lcd / self.bs
+                loss = loss + chamfer_weight * Lcd
+                log['chamfer'] += chamfer_weight * Lcd.item()
+
             log['l1'] += 0.8 * Ll1.item()
             log['ssim'] += 0.2 * Lssim.item()
 
             if metrics is None:
                 metrics = {}
-            metrics.update({'l1': Ll1.item(), 'ssim': Lssim.item()})
+            metrics.update({'l1': Ll1.item(), 'ssim': Lssim.item(),
+                            'chamfer': Lcd.item()})
             self.logger.push(metrics)
 
             self.scaler.scale(loss).backward()
@@ -269,6 +293,21 @@ class StereoGSTrainer:
         cv2.putText(img, label, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(img, label, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        return img
+
+    @staticmethod
+    def _opacity_to_color(opacity_map, label="Opacity"):
+        """将不透明度图 (B,1,H,W) 可视化为热力图，范围 [0, 1]。"""
+        import matplotlib.cm as cm
+        o = opacity_map[0, 0].float().cpu().numpy()
+        o_min, o_max = float(o.min()), float(o.max())
+        rgba = cm.plasma(np.clip(o, 0, 1))
+        img = (rgba[:, :, :3] * 255).astype(np.uint8)
+        text = f"{label} [{o_min:.2f}, {o_max:.2f}]"
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (6, 22), cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (0, 0, 0), 1, cv2.LINE_AA)
         return img
 
@@ -523,6 +562,166 @@ class StereoGSTrainer:
         cv2.imwrite(os.path.join(out_dir, "pcl_merged.jpg"),
                     pcl_merged[:, :, ::-1])
 
+        # ── 4. 保存点云 PLY 文件 ──
+        def _get_rgb(view_key):
+            img = data[view_key]['img'][idx]           # (3, H, W) in [-1, 1]
+            valid = data[view_key]['pts_valid'][idx]   # (H*W,)
+            rgb = (img * 0.5 + 0.5).clamp(0, 1).permute(1, 2, 0).reshape(-1, 3)
+            return rgb[valid]
+
+        rgb_l = _get_rgb('lmain')
+        rgb_r = _get_rgb('rmain')
+
+        self._save_ply(xyz_l, rgb_l, os.path.join(out_dir, "pcl_left.ply"))
+        self._save_ply(xyz_r, rgb_r, os.path.join(out_dir, "pcl_right.ply"))
+
+        merged_xyz_list = [xyz_l, xyz_r]
+        merged_rgb_list = [rgb_l, rgb_r]
+
+        if use_cags and 'sub_xyz' in data.get('lmain', {}):
+            def _get_sub_rgb(view_key):
+                s_rgb = data[view_key]['sub_rgb'][idx]
+                s_valid = data[view_key]['sub_valid'][idx]
+                return (s_rgb[s_valid] * 0.5 + 0.5).clamp(0, 1)
+            sub_rgb_l = _get_sub_rgb('lmain')
+            sub_rgb_r = _get_sub_rgb('rmain')
+            merged_xyz_list.extend([sub_l, sub_r])
+            merged_rgb_list.extend([sub_rgb_l, sub_rgb_r])
+
+        self._save_ply(
+            torch.cat(merged_xyz_list, dim=0),
+            torch.cat(merged_rgb_list, dim=0),
+            os.path.join(out_dir, "pcl_merged.ply"),
+        )
+
+        # ── 5. 保存完整高斯属性 PLY (3DGS 标准格式) ──
+        def _get_gaussian_attrs(view_key):
+            valid = data[view_key]['pts_valid'][idx]
+            rot = data[view_key]['rot_maps'][idx].permute(1, 2, 0).reshape(-1, 4)
+            scl = data[view_key]['scale_maps'][idx].permute(1, 2, 0).reshape(-1, 3)
+            opa = data[view_key]['opacity_maps'][idx].permute(1, 2, 0).reshape(-1, 1)
+            return rot[valid], scl[valid], opa[valid]
+
+        rot_l, scl_l, opa_l = _get_gaussian_attrs('lmain')
+        rot_r, scl_r, opa_r = _get_gaussian_attrs('rmain')
+
+        merged_rot = [rot_l, rot_r]
+        merged_scl = [scl_l, scl_r]
+        merged_opa = [opa_l, opa_r]
+
+        if use_cags and 'sub_xyz' in data.get('lmain', {}):
+            def _get_sub_attrs(view_key):
+                s_valid = data[view_key]['sub_valid'][idx]
+                s_rot = data[view_key]['sub_rot'][idx][s_valid]
+                s_scl = data[view_key]['sub_scale'][idx][s_valid]
+                s_opa = data[view_key]['sub_opacity'][idx][s_valid]
+                return s_rot, s_scl, s_opa
+
+            s_rot_l, s_scl_l, s_opa_l = _get_sub_attrs('lmain')
+            s_rot_r, s_scl_r, s_opa_r = _get_sub_attrs('rmain')
+            merged_rot.extend([s_rot_l, s_rot_r])
+            merged_scl.extend([s_scl_l, s_scl_r])
+            merged_opa.extend([s_opa_l, s_opa_r])
+
+        self._save_gaussian_ply(
+            torch.cat(merged_xyz_list, dim=0),
+            torch.cat(merged_rgb_list, dim=0),
+            torch.cat(merged_rot, dim=0),
+            torch.cat(merged_scl, dim=0),
+            torch.cat(merged_opa, dim=0),
+            os.path.join(out_dir, "gaussians.ply"),
+        )
+
+    @staticmethod
+    def _save_ply(xyz: torch.Tensor, rgb: torch.Tensor, path: str):
+        """保存带颜色的点云为 PLY 文件。
+
+        Args:
+            xyz: (N, 3) float, 世界坐标
+            rgb: (N, 3) float in [0, 1]
+            path: 输出路径
+        """
+        pts = xyz.detach().cpu().numpy()
+        colors = (rgb.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        n = pts.shape[0]
+        with open(path, 'w') as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {n}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            for i in range(n):
+                f.write(f"{pts[i,0]:.6f} {pts[i,1]:.6f} {pts[i,2]:.6f} "
+                        f"{colors[i,0]} {colors[i,1]} {colors[i,2]}\n")
+
+    @staticmethod
+    def _save_gaussian_ply(
+        xyz: torch.Tensor,
+        rgb: torch.Tensor,
+        rot: torch.Tensor,
+        scale: torch.Tensor,
+        opacity: torch.Tensor,
+        path: str,
+    ):
+        """保存完整 3DGS 高斯属性为 PLY 文件（兼容 SuperSplat / antimatter15 等查看器）。
+
+        Args:
+            xyz:     (N, 3) 世界坐标
+            rgb:     (N, 3) in [0, 1]
+            rot:     (N, 4) 四元数 (wxyz or xyzw 取决于光栅化器)
+            scale:   (N, 3) 缩放
+            opacity: (N, 1) 不透明度 (sigmoid 后的值)
+        """
+        import struct
+        xyz_np = xyz.detach().cpu().float().numpy()
+        rgb_np = rgb.detach().cpu().float().numpy()
+        rot_np = rot.detach().cpu().float().numpy()
+        scale_np = scale.detach().cpu().float().numpy()
+        op_np = opacity.detach().cpu().float().numpy().reshape(-1, 1)
+        n = xyz_np.shape[0]
+
+        log_scale = np.log(np.clip(scale_np, 1e-8, None))
+        logit_op = np.log(np.clip(op_np, 1e-7, 1 - 1e-7) / (1 - np.clip(op_np, 1e-7, 1 - 1e-7)))
+        sh_dc = (rgb_np - 0.5) / 0.2820947917738781
+
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {n}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "property float nx\n"
+            "property float ny\n"
+            "property float nz\n"
+            "property float f_dc_0\n"
+            "property float f_dc_1\n"
+            "property float f_dc_2\n"
+            "property float opacity\n"
+            "property float scale_0\n"
+            "property float scale_1\n"
+            "property float scale_2\n"
+            "property float rot_0\n"
+            "property float rot_1\n"
+            "property float rot_2\n"
+            "property float rot_3\n"
+            "end_header\n"
+        )
+        with open(path, 'wb') as f:
+            f.write(header.encode('ascii'))
+            for i in range(n):
+                f.write(struct.pack('<3f', *xyz_np[i]))
+                f.write(struct.pack('<3f', 0.0, 0.0, 0.0))
+                f.write(struct.pack('<3f', *sh_dc[i]))
+                f.write(struct.pack('<f', logit_op[i, 0]))
+                f.write(struct.pack('<3f', *log_scale[i]))
+                f.write(struct.pack('<4f', *rot_np[i]))
+
     def _save_cags_visuals(self, data, extras, out_dir, H, W):
         """保存 CAGS 专属可视化: 分裂权重 + 高斯密度。"""
         k_sub = extras['split_weights_left'].shape[1]
@@ -575,11 +774,15 @@ class StereoGSTrainer:
         render_np = self._t2np(render_novel)
         gt_np = self._t2np(gt_novel)
 
+        diff_np = np.abs(render_np.astype(np.float32) - gt_np.astype(np.float32))
+        diff_np = np.clip(diff_np * 3, 0, 255).astype(np.uint8)
+
         row_top = np.concatenate([
             self._label(img_l, "Input L"), self._label(img_r, "Input R"),
         ], axis=1)
         row_bot = np.concatenate([
             self._label(render_np, "Render"), self._label(gt_np, "GT"),
+            self._label(diff_np, "Diff x3"),
         ], axis=1)
         tw = max(row_top.shape[1], row_bot.shape[1])
         overview = np.concatenate([_pad_w(row_top, tw), _pad_w(row_bot, tw)], axis=0)
@@ -591,6 +794,14 @@ class StereoGSTrainer:
         ]
         cv2.imwrite(os.path.join(out_dir, "depth.jpg"),
                     np.concatenate(panels, axis=1)[:, :, ::-1])
+
+        if 'opacity_maps' in lm and 'opacity_maps' in rm:
+            opa_panels = [
+                _resize(self._opacity_to_color(lm['opacity_maps'], "Opacity L"), H, W),
+                _resize(self._opacity_to_color(rm['opacity_maps'], "Opacity R"), H, W),
+            ]
+            cv2.imwrite(os.path.join(out_dir, "opacity.jpg"),
+                        np.concatenate(opa_panels, axis=1)[:, :, ::-1])
 
         extras = data.get('_stereo_gs_extras', {})
         if 'confidence_left' in extras:

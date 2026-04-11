@@ -1,9 +1,9 @@
-name: 'stereo_gs'
+name: 'stereo_gs_abl_edge_post_refine'
 
 lr: 0.0001
 wdecay: 1e-5
 batch_size: 1
-num_steps: 200000
+num_steps: 20000
 
 depth_mode: 'stereo_gs'
 
@@ -24,7 +24,6 @@ dataset:
   trans: [0.0, 0.0, 0.0]
   scale: 1.0
 
-# RAFT 配置（仅用于保持 ConfigStereoHuman 兼容性）
 raft:
   mixed_precision: False
   train_iters: 3
@@ -39,7 +38,6 @@ raft:
   corr_levels: 4
   context_norm: 'group'
 
-# Fast-FoundationStereo 配置 (冻结)
 ffs:
   ffs_root: '/data/sifang/Fast-FoundationStereo'
   model_path: '/data/sifang/Fast-FoundationStereo/weights/23-36-37/model_best_bp2_serialize.pth'
@@ -49,55 +47,36 @@ ffs:
   use_loftr: False
   finetune: False
 
-# StereoGS 特有配置
 stereo_gs:
-  # Stage 2: 特征适配
   adapt_dims: [96, 96, 128]
   use_context: True
   use_gru: True
-
-  # Stage 3: 跨视图融合
-  # 可选: 'none' | 'warp_attention' | 'occlusion_aware'
   fusion_mode: 'occlusion_aware'
-
-  # Stage 4: 置信度 + 高斯解码
-  # 可选: 'peak' | 'entropy' | 'learned'
   confidence_mode: 'learned'
   head_dim: 64
   confidence_alpha: 0.3
   confidence_beta: 0.3
   max_scale: 0.003
-
-  # Stage 5: 高斯超分 (Legacy 模式)
-  # 可选: 'convex' | 'split'
   sr_mode: 'convex'
-
-  # CAGS: 自适应高斯分裂
   use_cags: true
-  # 分裂判定: 'gradient' | 'learned'
   cags_split_mode: 'learned'
   cags_k_max: 4
   cags_split_hidden: 32
   cags_max_pos_offset: 0.002
   cags_sparsity_weight: 0.01
   cags_split_threshold: 0.1
-
-  # Chamfer Distance (左右点云对齐)
   chamfer_weight: 0.5
   chamfer_n_samples: 10000
-
-  # Stage 7: 渲染后精化
-  use_post_refine: False
+  # ABLATION: use_post_refine False -> True
+  use_post_refine: True
   refine_hidden: 32
   refine_layers: 3
 
-# gsnet 配置 (StereoGS 模式下不使用，但保持兼容)
 gsnet:
   encoder_dims: [32, 48, 96]
   decoder_dims: [48, 64, 96]
   parm_head_dim: 32
 
-# 记录配置
 record:
   loss_freq: 100
   eval_freq: 1000
