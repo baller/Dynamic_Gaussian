@@ -1,109 +1,91 @@
+from __future__ import annotations
 
-import os
-import cv2
-import glob
-import json
-from tqdm import tqdm
+import argparse
 from pathlib import Path
+
+import cv2
 import numpy as np
-import argparse 
-from step_0rect_custom import load_cam_param
-# python step_1_custom.py -t val
+from tqdm import tqdm
 
-data_root = '/home/user_3/3DGS/GPS_plus/custom_data' # TODO
-processed_data_root = '/home/user_3/3DGS/GPS_plus/processed_custom_data/' # TODO
-
-parser = argparse.ArgumentParser()
-parser.add_argument('-t', '--trainval', type=str, default='train',required=False, help='train or val')
-parser.add_argument('-n', '--setsize', type=int, default=4, required=False, help='number of cameras for each work set')
-arg = parser.parse_args()
-
-ori_dir = data_root
-processed_data_root += arg.trainval
-s_set = arg.setsize
-
-intr, extrs, names, img_size = load_cam_param(ori_dir)
-cam_names = [n_i.split('.')[0].split('_')[1] for n_i in names]
-
-Path(processed_data_root).mkdir(exist_ok=True, parents=True)
+from step_0rect_custom import (
+    DEFAULT_DATA_ROOT,
+    DEFAULT_PROCESSED_ROOT,
+    NOVEL_RAW_ORDER,
+    build_crop_resize,
+    build_dataset_context,
+    ensure_split_dirs,
+    get_split_samples,
+    load_raw_image,
+    make_sample_name,
+    process_single_view_image,
+    transform_intrinsic_for_output,
+)
 
 
-file_list = sorted(os.listdir(ori_dir))
-used_time_id_list = []
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-t", "--trainval", required=True, choices=("train", "val"))
+    parser.add_argument(
+        "-d",
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="Raw custom sequence root that contains sparse/0 and 0000_camXX.jpg files.",
+    )
+    parser.add_argument(
+        "-o",
+        "--processed-root",
+        type=Path,
+        default=DEFAULT_PROCESSED_ROOT,
+        help="Processed GPS_plus legacy root. The script writes into train/ or val/ under this root.",
+    )
+    parser.add_argument(
+        "-s",
+        "--size",
+        type=int,
+        default=1024,
+        help="Square output resolution after center crop.",
+    )
+    parser.add_argument(
+        "-n",
+        "--setsize",
+        type=int,
+        default=4,
+        help="Compatibility flag. This implementation expects the 4-camera hias_man1_s3 rig.",
+    )
+    return parser.parse_args()
 
-file_extension = None 
-for file in tqdm(file_list):
-    if file[-3:] != 'jpg' and file[-3:] != 'png' and file[-3:] != 'jpeg':
-        continue
-    
-    time_id = file.split('/')[-1].split('_')[1]
-    if time_id not in used_time_id_list:
-        drop_flag = False
 
-        if not drop_flag:
-            used_time_id_list.append(time_id)
-    if file_extension == None:
-        file_extension = file[-3:]
-        
-'''
-save new image
-'''
+def main() -> None:
+    args = parse_args()
+    context = build_dataset_context(args.data_root, setsize=args.setsize)
+    crop_resize = build_crop_resize(context["image_size"], args.size)
+    split_samples = get_split_samples(context["samples"], args.trainval)
+    _, img_dir, _, param_dir = ensure_split_dirs(args.processed_root, args.trainval)
 
-total_length = len(used_time_id_list)
-if arg.trainval == 'train':
-    # using the first 7/8 frames
-    used_time_id_list = sorted(used_time_id_list)[:(-total_length//8)]
-elif arg.trainval == 'val':
-    # using the last 1/8 frames
-    used_time_id_list = sorted(used_time_id_list)[(-total_length//8):]
-else:
-    exit()
+    processed_intrinsics = {
+        raw_cam: transform_intrinsic_for_output(context["camera_models"][raw_cam]["K"], crop_resize)
+        for raw_cam in NOVEL_RAW_ORDER
+    }
+    rig_extrinsics = {raw_cam: context["rig_extrinsics"][raw_cam] for raw_cam in NOVEL_RAW_ORDER}
 
-img_dir = os.path.join(processed_data_root, 'img')
-Path(img_dir).mkdir(exist_ok=True, parents=True)
+    for raw_frame, _ in tqdm(split_samples, desc=f"export novel views {args.trainval}"):
+        sample_name = make_sample_name(raw_frame)
+        sample_img_dir = img_dir / sample_name
+        sample_param_dir = param_dir / sample_name
+        sample_img_dir.mkdir(exist_ok=True)
+        sample_param_dir.mkdir(exist_ok=True)
 
-par_dir = os.path.join(processed_data_root, 'parameter')
-Path(par_dir).mkdir(exist_ok=True, parents=True)
+        for view_offset, raw_cam in enumerate(NOVEL_RAW_ORDER, start=2):
+            img = load_raw_image(context, raw_frame, raw_cam)
+            model = context["camera_models"][raw_cam]
+            img_out = process_single_view_image(img, model["K"], model["dist"], crop_resize)
+            cv2.imwrite(str(sample_img_dir / f"{view_offset}.jpg"), img_out.astype(np.uint8))
+            np.save(str(sample_param_dir / f"{view_offset}_intrinsic.npy"), processed_intrinsics[raw_cam])
+            np.save(str(sample_param_dir / f"{view_offset}_extrinsic.npy"), rig_extrinsics[raw_cam])
 
-n_set = (len(cam_names)-1)//(s_set-1) 
-# make sure that you have the minimum number of cameras for at least one work set
-cam_id_list_s = []
-for set_i in range(n_set):
-    cam_id_list_s.append(list(range(set_i*(s_set-1)+1, (set_i+1)*(s_set-1)))+[set_i*(s_set-1), (set_i+1)*(s_set-1)])
+    print(f"Wrote {len(split_samples)} {args.trainval} novel-view samples to {args.processed_root / args.trainval}")
 
-for set_i, cam_id_list in enumerate(cam_id_list_s):
-    scene_n = 's%d'%(set_i+1)
-        
-    for cam_i, cam in enumerate(cam_id_list):
-        w, h = img_size[0], img_size[1]
-        
-        tmp = intr.copy()
-        extr = extrs[cam].copy()
-        
 
-        for t in tqdm(used_time_id_list):
-            t_dir = os.path.join(img_dir, '%s_%04d'%(scene_n, int(t)))
-            t_par_dir = os.path.join(par_dir, '%s_%04d'%(scene_n, int(t)))
-            if not os.path.exists(t_dir):
-                os.mkdir(t_dir)
-            if not os.path.exists(t_par_dir):
-                os.mkdir(t_par_dir)
-            
-            np.save(t_par_dir+'/%d_extrinsic.npy' % int(cam_i+2), extr)
-            np.save(t_par_dir+'/%d_intrinsic.npy' % int(cam_i+2), tmp)
-
-            t_cam_name = '%s_%s.%s' % (t, cam_names[cam], file_extension)
-            file_name = os.path.join(ori_dir, t_cam_name)
-            
-            img = cv2.imread(file_name)
-
-            out_path = os.path.join(t_dir, '%d.jpg' % int(cam_i+2))
-            
-            ######## scene specific ###########
-
-            # img_tmp = dst[(move_t):(w + move_t), :, :] #3000, 3000
-
-            ######## scene specific ###########
-
-            # img_out = cv2.resize(img_tmp, (1024, 1024))
-            cv2.imwrite(out_path, img.astype(np.uint8))
+if __name__ == "__main__":
+    main()

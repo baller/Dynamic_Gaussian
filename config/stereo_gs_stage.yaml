@@ -9,15 +9,15 @@ depth_mode: 'stereo_gs'
 
 dataset:
   source_id: [0, 1]
-  train_novel_id: [2, 3, 4, 5]
+  train_novel_id: [2, 3]
   val_novel_id: [2, 3]
   use_hr_img: False
   use_depth_init: True
   use_local_data: True
-  inverse_depth_init: 0.11468429026724969
-  local_data_root: '/data/sifang/GPS_plus_data/processed_data'
-  train_data_root: '/data/sifang/GPS_plus_data/processed_data/train'
-  val_data_root: '/data/sifang/GPS_plus_data/processed_data/val'
+  inverse_depth_init: 0.3
+  local_data_root: '/data/sifang/GPS_plus_data/hias_sifang_s1_colmap_processed'
+  train_data_root: '/data/sifang/GPS_plus_data/hias_sifang_s1_colmap_processed/train'
+  val_data_root: '/data/sifang/GPS_plus_data/hias_sifang_s1_colmap_processed/val'
   bg_color: [0, 0, 0]
   znear: 0.01
   zfar: 100.0
@@ -100,5 +100,5 @@ gsnet:
 # 记录配置
 record:
   loss_freq: 100
-  eval_freq: 1000
+  eval_freq: 50
   save_iter: 10000

@@ -150,6 +150,62 @@ python train.py
 ```
 If the results are not good, you could modify ```inverse_depth_init``` in [stage.yaml](config/stage.yaml#L15) or crop the processed images along with modifying the intrinsic parameters as in [here](https://github.com/YaourtB/GPS_plus/blob/main/data_process/step_0rect.py#L84-L90).
 
+### hias_man1_s3 Note
+
+The `hias_man1_s3` sequence in this repo uses a COLMAP export with **four different camera intrinsics** stored in `sparse/0/cameras.bin`, plus `custom_frame_mapping.json` to map raw files such as `0000_cam00.jpg` to COLMAP frame ids. For this sequence, use the corrected custom scripts with explicit roots:
+
+```
+cd data_process
+python step_0rect_custom.py -d /data/sifang/GPS_plus_data/hias_man1_s3 -o /data/sifang/GPS_plus_data/hias_man1_s3_processed -t train -n 4 -s 1024
+python step_1_custom.py -d /data/sifang/GPS_plus_data/hias_man1_s3 -o /data/sifang/GPS_plus_data/hias_man1_s3_processed -t train -n 4 -s 1024
+
+python step_0rect_custom.py -d /data/sifang/GPS_plus_data/hias_man1_s3 -o /data/sifang/GPS_plus_data/hias_man1_s3_processed -t val -n 4 -s 1024
+python step_1_custom.py -d /data/sifang/GPS_plus_data/hias_man1_s3 -o /data/sifang/GPS_plus_data/hias_man1_s3_processed -t val -n 4 -s 1024
+```
+
+The scripts export legacy GPS+ `train/` and `val/` trees, use `cam00` and `cam03` as the rectified source pair, export `cam01`, `cam02`, `cam00`, `cam03` as views `2..5`, and write `rectify_verification.json` plus stitched debug images under the processed root so you can verify epipolar alignment directly.
+
+### Generic Single-Script Export
+
+If your raw sequence is organized as
+
+```
+sequence_root/
+├── cam_1/
+│   ├── frame_000001.jpg
+│   └── ...
+├── cam_2/
+├── ...
+├── cam_N/
+├── sparse/
+│   └── 0/
+│       ├── cameras.bin
+│       ├── images.bin
+│       └── points3D.bin
+```
+
+you can export the whole GPS+ legacy dataset with one command:
+
+```
+cd data_process
+python export_legacy_from_colmap.py -d /PATH/TO/sequence_root -o /PATH/TO/sequence_root_processed -n 4 -s 1024 --splits train val
+```
+
+This script will:
+
+- auto-detect the raw layout (`cam_i/frame_xxxxxx.jpg` folders or flat `0000_cam00.jpg` files with `custom_frame_mapping.json`)
+- build a fixed multi-camera rig from COLMAP poses
+- rectify the left-most and right-most cameras of each work set
+- export `0/1` source views, `2..N` supervision views, masks, and camera parameters in legacy GPS+ format
+- write `export_report.json` with rectification metrics and a recommended `inverse_depth_init`
+
+The recommendation in `export_report.json` is data-driven and reports both:
+
+- `baseline_hint = 0.5 / baseline`
+- sparse-point depth hints from `points3D.bin`
+
+The final `recommended_inverse_depth_init` is currently the larger of those two, which is usually safer for human-centered scenes in GPS+.
+
 # Citation
 
 If you find the code or the data is useful for your research, please consider citing:

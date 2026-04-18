@@ -572,8 +572,8 @@ class StereoGSTrainer:
         rgb_l = _get_rgb('lmain')
         rgb_r = _get_rgb('rmain')
 
-        self._save_ply(xyz_l, rgb_l, os.path.join(out_dir, "pcl_left.ply"))
-        self._save_ply(xyz_r, rgb_r, os.path.join(out_dir, "pcl_right.ply"))
+        # self._save_ply(xyz_l, rgb_l, os.path.join(out_dir, "pcl_left.ply"))
+        # self._save_ply(xyz_r, rgb_r, os.path.join(out_dir, "pcl_right.ply"))
 
         merged_xyz_list = [xyz_l, xyz_r]
         merged_rgb_list = [rgb_l, rgb_r]
@@ -588,11 +588,11 @@ class StereoGSTrainer:
             merged_xyz_list.extend([sub_l, sub_r])
             merged_rgb_list.extend([sub_rgb_l, sub_rgb_r])
 
-        self._save_ply(
-            torch.cat(merged_xyz_list, dim=0),
-            torch.cat(merged_rgb_list, dim=0),
-            os.path.join(out_dir, "pcl_merged.ply"),
-        )
+        # self._save_ply(
+        #     torch.cat(merged_xyz_list, dim=0),
+        #     torch.cat(merged_rgb_list, dim=0),
+        #     os.path.join(out_dir, "pcl_merged.ply"),
+        # )
 
         # ── 5. 保存完整高斯属性 PLY (3DGS 标准格式) ──
         def _get_gaussian_attrs(view_key):
@@ -623,14 +623,14 @@ class StereoGSTrainer:
             merged_scl.extend([s_scl_l, s_scl_r])
             merged_opa.extend([s_opa_l, s_opa_r])
 
-        self._save_gaussian_ply(
-            torch.cat(merged_xyz_list, dim=0),
-            torch.cat(merged_rgb_list, dim=0),
-            torch.cat(merged_rot, dim=0),
-            torch.cat(merged_scl, dim=0),
-            torch.cat(merged_opa, dim=0),
-            os.path.join(out_dir, "gaussians.ply"),
-        )
+        # self._save_gaussian_ply(
+        #     torch.cat(merged_xyz_list, dim=0),
+        #     torch.cat(merged_rgb_list, dim=0),
+        #     torch.cat(merged_rot, dim=0),
+        #     torch.cat(merged_scl, dim=0),
+        #     torch.cat(merged_opa, dim=0),
+        #     os.path.join(out_dir, "gaussians.ply"),
+        # )
 
     @staticmethod
     def _save_ply(xyz: torch.Tensor, rgb: torch.Tensor, path: str):
