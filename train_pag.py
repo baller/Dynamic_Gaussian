@@ -1,15 +1,14 @@
 """
-PAG-Splat 训练脚本
+PAG-Splat 简化训练脚本
 
-基于 GPS+ train.py 重构，适配 PAGSplat 三模块架构：
-  - 使用 StereoHumanDataset (与 GPS+ 完全兼容)
-  - DA3 backbone 全程冻结，不参与梯度更新
-  - 损失 = 0.8×L1 + 0.2×(1-SSIM) + λs×Smooth + λw×WarpCons + λu×UncReg
-  - 使用 pag_pts2render 替代 GPS+ 的 pts2render
+保留:
+  - train_pag.py / pag_stage.yaml 入口
+  - DA3 冻结先验 + ScaleAlignmentMLP
 
-用法:
-    python train_pag.py --config pag_splat/pag_stage.yaml
-    python train_pag.py --config pag_splat/pag_stage.yaml --restore_ckpt experiments/xxx/ckpt/latest.pth
+回退:
+  - GS 参数预测改回 GPS+ 风格 GSRegresser
+  - 渲染改回 lib.GaussianRender.pts2render
+  - 训练损失以 GPS+ 风格重建损失为主，辅以 scale_regular + 3D chamfer
 """
 
 from __future__ import print_function, division
@@ -38,209 +37,13 @@ from config.stereo_human_config import ConfigStereoHuman
 from lib.human_loader import StereoHumanDataset
 from lib.pag_multi_loader import build_pag_dataset
 from lib.train_recoder import Logger
+from lib.GaussianRender import pts2render
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
 from pag_splat.model import build_pag_splat
-from pag_splat.render import pag_pts2render, move_data_to_cuda
+from pag_splat.render import move_data_to_cuda
 
 warnings.filterwarnings("ignore", category=UserWarning)
-
-
-# ──────────────────────────────────────────────────────────
-#  辅助损失函数
-# ──────────────────────────────────────────────────────────
-
-def edge_aware_smooth_loss(depth: torch.Tensor, img: torch.Tensor) -> torch.Tensor:
-    """
-    边缘感知深度平滑损失 (Monodepth2 风格)。
-
-    在图像边缘区域不惩罚深度跳变，在平滑区域要求深度也平滑。
-
-    Args:
-        depth: (B, 1, H, W)  度量深度
-        img:   (B, 3, H, W)  对应 RGB 图像
-
-    Returns:
-        标量损失值
-    """
-    # 均值归一化深度 (使损失与深度绝对值无关)
-    mean_d = depth.mean(dim=[2, 3], keepdim=True).clamp(min=1e-5)
-    d_norm = depth / mean_d
-
-    # 深度梯度
-    d_dx = torch.abs(d_norm[:, :, :, :-1] - d_norm[:, :, :, 1:])  # (B,1,H,W-1)
-    d_dy = torch.abs(d_norm[:, :, :-1, :] - d_norm[:, :, 1:, :])  # (B,1,H-1,W)
-
-    # 图像梯度 (取均值通道减少计算量)
-    img_mean = img.mean(dim=1, keepdim=True)
-    i_dx = torch.abs(img_mean[:, :, :, :-1] - img_mean[:, :, :, 1:])
-    i_dy = torch.abs(img_mean[:, :, :-1, :] - img_mean[:, :, 1:, :])
-
-    # 边缘权重: 边缘处权重趋近 0
-    w_x = torch.exp(-i_dx)
-    w_y = torch.exp(-i_dy)
-
-    return (d_dx * w_x).mean() + (d_dy * w_y).mean()
-
-
-def warp_consistency_loss(
-    opacity: torch.Tensor, valid_mask: torch.Tensor
-) -> torch.Tensor:
-    """
-    扭曲一致性损失: 无效扭曲区域（几何越界）应具有低不透明度。
-
-    去掉了 uncertainty 调制——用 opacity 直接约束无效区域，
-    避免 opacity*(1-unc) 形式造成的梯度消失陷阱。
-
-    Args:
-        opacity:    (B, H*W, 1)  不透明度
-        valid_mask: (B, 1, Hf, Wf) 有效扭曲区域掩码 (1=有效)
-
-    Returns:
-        标量损失值
-    """
-    B, _, Hf, Wf = valid_mask.shape
-    BHW = opacity.shape[1]
-    H = W = int(BHW ** 0.5)
-
-    if Hf * Wf != H * W:
-        vm = F.interpolate(valid_mask.float(), size=(H, W), mode="nearest")
-    else:
-        vm = valid_mask.float()
-
-    invalid = (1.0 - vm).reshape(B, H * W, 1)  # (B, HW, 1)
-    return (opacity * invalid).mean()
-
-
-# ──────────────────────────────────────────────────────────
-#  P0: 几何先验损失 (G3Splat 风格)
-# ──────────────────────────────────────────────────────────
-
-def scale_isotropy_loss(scale: torch.Tensor) -> torch.Tensor:
-    """
-    【P0】缩放各向同性惩罚 — 抑制蚯蚓状拉伸浮块，鼓励扁平 surfel 形状。
-
-    惩罚最小轴/最大轴比值过大（球形团块）。比值越接近 1 → 惩罚越大；
-    理想 surfel 的比值趋近 0（法线方向极度压缩）。
-
-    参考: G3Splat "Scale Regularization" (arXiv 2512.17547)
-
-    Args:
-        scale: (B, H*W, 3)  高斯缩放 (均为正值，已经 softplus 处理)
-
-    Returns:
-        标量损失值
-    """
-    if scale.dim() == 4:                               # (B, 3, H, W) 兼容
-        scale = scale.permute(0, 2, 3, 1).reshape(scale.shape[0], -1, 3)
-
-    s_sorted, _ = scale.sort(dim=-1)                   # 升序: [s_min, s_mid, s_max]
-    s_min = s_sorted[..., 0]
-    s_max = s_sorted[..., 2].clamp(min=1e-8)
-    # isotropy ∈ [0, 1]：越接近 1 → 越球形 → 越高惩罚
-    return (s_min / s_max).mean()
-
-
-def _quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
-    """
-    单位四元数 (w, x, y, z) → 3×3 旋转矩阵。
-    旋转矩阵的列向量 = 高斯局部轴在世界坐标系中的方向。
-
-    Args:
-        q: (..., 4)  单位四元数 (w, x, y, z)
-
-    Returns:
-        R: (..., 3, 3)
-    """
-    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
-    r00 = 1 - 2 * (y * y + z * z)
-    r01 = 2 * (x * y - w * z)
-    r02 = 2 * (x * z + w * y)
-    r10 = 2 * (x * y + w * z)
-    r11 = 1 - 2 * (x * x + z * z)
-    r12 = 2 * (y * z - w * x)
-    r20 = 2 * (x * z - w * y)
-    r21 = 2 * (y * z + w * x)
-    r22 = 1 - 2 * (x * x + y * y)
-    row0 = torch.stack([r00, r01, r02], dim=-1)
-    row1 = torch.stack([r10, r11, r12], dim=-1)
-    row2 = torch.stack([r20, r21, r22], dim=-1)
-    return torch.stack([row0, row1, row2], dim=-2)     # (..., 3, 3)
-
-
-def _compute_world_normals(xyz_map: torch.Tensor) -> torch.Tensor:
-    """
-    从世界坐标点云图计算每像素表面法线（世界坐标系）。
-
-    使用前向差分 + 叉积；边界用相邻行/列复制。
-
-    Args:
-        xyz_map: (B, H, W, 3)  世界坐标
-
-    Returns:
-        normals: (B, H, W, 3)  归一化法线，不可靠区域用零向量填充
-    """
-    # 水平切向量 (右 - 当前)，边界复制
-    dx = torch.zeros_like(xyz_map)
-    dx[:, :, :-1] = xyz_map[:, :, 1:] - xyz_map[:, :, :-1]
-    dx[:, :, -1]  = dx[:, :, -2]
-
-    # 垂直切向量 (下 - 当前)，边界复制
-    dy = torch.zeros_like(xyz_map)
-    dy[:, :-1]    = xyz_map[:, 1:] - xyz_map[:, :-1]
-    dy[:, -1]     = dy[:, -2]
-
-    # 叉积：(B, H, W, 3)
-    normals = torch.cross(dx, dy, dim=-1)
-
-    # 仅对叉积长度足够大的区域归一化（排除深度不连续边界）
-    norm_len = normals.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    normals = normals / norm_len
-    return normals
-
-
-def orientation_consistency_loss(
-    rot_map:   torch.Tensor,
-    scale_map: torch.Tensor,
-    xyz_map:   torch.Tensor,
-) -> torch.Tensor:
-    """
-    【P0】方向一致性损失 — 高斯最短轴应与局部表面法线对齐。
-
-    当最短轴（Gaussian 的法线方向）与从深度图估计的表面法线不对齐时施加惩罚，
-    引导高斯基元贴合物体真实曲面，而非在空间中随机朝向。
-
-    参考: G3Splat "Orientation Prior" (arXiv 2512.17547)
-
-    Args:
-        rot_map:   (B, 4, H, W)  单位四元数 (w,x,y,z)
-        scale_map: (B, 3, H, W)  高斯缩放 (正值)
-        xyz_map:   (B, H, W, 3)  世界坐标点云图（用于法线计算）
-
-    Returns:
-        标量损失值
-    """
-    B, _, H, W = rot_map.shape
-
-    # ── 表面法线 (世界坐标系) ──
-    normals = _compute_world_normals(xyz_map)          # (B, H, W, 3)
-
-    # ── 四元数 → 旋转矩阵 ──
-    q = rot_map.permute(0, 2, 3, 1)                    # (B, H, W, 4)
-    R = _quat_to_rotmat(q)                             # (B, H, W, 3, 3)
-
-    # ── 最短轴对应的旋转矩阵列（即该轴在世界坐标系下的方向） ──
-    s = scale_map.permute(0, 2, 3, 1)                  # (B, H, W, 3)
-    min_idx = s.argmin(dim=-1)                         # (B, H, W)  值 ∈ {0,1,2}
-
-    # R 的列 = R[..., :, i]; 用 gather 按 min_idx 取列
-    # expand to (B, H, W, 3, 1) for gather on dim=-1
-    idx_exp = min_idx.unsqueeze(-1).unsqueeze(-1).expand(B, H, W, 3, 1)
-    gaussian_normal = R.gather(dim=-1, index=idx_exp).squeeze(-1)  # (B, H, W, 3)
-
-    # ── 损失: 1 - |cos θ|（完全对齐时为 0） ──
-    alignment = (gaussian_normal * normals).sum(dim=-1).abs()      # (B, H, W)
-    return (1.0 - alignment).mean()
 
 
 # ──────────────────────────────────────────────────────────
@@ -250,61 +53,65 @@ def orientation_consistency_loss(
 def chamfer_distance_loss(
     xyz1: torch.Tensor,
     xyz2: torch.Tensor,
-    rgb1: torch.Tensor | None = None,
-    rgb2: torch.Tensor | None = None,
+    valid1: torch.Tensor | None = None,
+    valid2: torch.Tensor | None = None,
     n_samples: int = 5000,
     chunk: int = 512,
 ) -> torch.Tensor:
     """
-    【P1】双向 6D 倒角距离 — 强制左右视图点云几何与颜色双重一致性。
-
-    当提供 rgb1/rgb2 时，拼接 xyz(3D)+rgb(3D) 形成 6D 点，同时约束几何位置与外观，
-    防止幽灵剪影（同位置不同颜色浮块）。
-    参考: Splat-SAP Eq.(17) "6-dimensional point sets P^l, P^r"
+    双向 3D 倒角距离，仅在有效点上计算。
 
     Args:
         xyz1, xyz2: (B, N, 3)  世界坐标点云
-        rgb1, rgb2: (B, N, 3)  对应 RGB [0,1]（可为 None，退化为 3D Chamfer）
+        valid1, valid2: (B, N) 有效点掩码，可为 None
         n_samples:  每方向随机采样数
         chunk:      分块大小（控制显存）
 
     Returns:
         标量倒角距离（两方向平均）
     """
-    B, N1, _ = xyz1.shape
-    N2       = xyz2.shape[1]
-    n1 = min(n_samples, N1)
-    n2 = min(n_samples, N2)
+    bsz = xyz1.shape[0]
+    losses = []
 
-    idx1 = torch.randperm(N1, device=xyz1.device)[:n1]
-    idx2 = torch.randperm(N2, device=xyz2.device)[:n2]
+    for batch_idx in range(bsz):
+        pts1 = xyz1[batch_idx]
+        pts2 = xyz2[batch_idx]
 
-    if rgb1 is not None and rgb2 is not None:
-        # 颜色权重 0.5：在米级 xyz 空间中给颜色约 0.5 的贡献（与 Splat-SAP 直接拼接等价）
-        COLOR_W = 0.5
-        p1 = torch.cat([xyz1[:, idx1], rgb1[:, idx1] * COLOR_W], dim=-1)  # (B, n1, 6)
-        p2 = torch.cat([xyz2[:, idx2], rgb2[:, idx2] * COLOR_W], dim=-1)  # (B, n2, 6)
-    else:
-        p1 = xyz1[:, idx1]   # (B, n1, 3)
-        p2 = xyz2[:, idx2]   # (B, n2, 3)
+        if valid1 is not None:
+            pts1 = pts1[valid1[batch_idx].bool()]
+        if valid2 is not None:
+            pts2 = pts2[valid2[batch_idx].bool()]
 
-    # p1 → p2 方向
-    min_sq_12 = []
-    for i in range(0, n1, chunk):
-        sub = p1[:, i:i + chunk]
-        d2  = ((sub.unsqueeze(2) - p2.unsqueeze(1)) ** 2).sum(-1)
-        min_sq_12.append(d2.min(dim=2).values)
+        if pts1.shape[0] < 2 or pts2.shape[0] < 2:
+            continue
 
-    # p2 → p1 方向
-    min_sq_21 = []
-    for j in range(0, n2, chunk):
-        sub = p2[:, j:j + chunk]
-        d2  = ((sub.unsqueeze(2) - p1.unsqueeze(1)) ** 2).sum(-1)
-        min_sq_21.append(d2.min(dim=2).values)
+        n1 = min(n_samples, pts1.shape[0])
+        n2 = min(n_samples, pts2.shape[0])
 
-    cd_12 = torch.cat(min_sq_12, dim=1).mean()
-    cd_21 = torch.cat(min_sq_21, dim=1).mean()
-    return (cd_12 + cd_21) * 0.5
+        idx1 = torch.randperm(pts1.shape[0], device=pts1.device)[:n1]
+        idx2 = torch.randperm(pts2.shape[0], device=pts2.device)[:n2]
+        p1 = pts1[idx1].unsqueeze(0)
+        p2 = pts2[idx2].unsqueeze(0)
+
+        min_sq_12 = []
+        for i in range(0, n1, chunk):
+            sub = p1[:, i:i + chunk]
+            d2 = ((sub.unsqueeze(2) - p2.unsqueeze(1)) ** 2).sum(-1)
+            min_sq_12.append(d2.min(dim=2).values)
+
+        min_sq_21 = []
+        for j in range(0, n2, chunk):
+            sub = p2[:, j:j + chunk]
+            d2 = ((sub.unsqueeze(2) - p1.unsqueeze(1)) ** 2).sum(-1)
+            min_sq_21.append(d2.min(dim=2).values)
+
+        cd_12 = torch.cat(min_sq_12, dim=1).mean()
+        cd_21 = torch.cat(min_sq_21, dim=1).mean()
+        losses.append((cd_12 + cd_21) * 0.5)
+
+    if not losses:
+        return xyz1.new_tensor(0.0)
+    return torch.stack(losses).mean()
 
 
 # ──────────────────────────────────────────────────────────
@@ -355,14 +162,13 @@ class PAGSplatTrainer:
             feat_stride=pag_cfg.feat_stride,
             feat_layer=pag_cfg.feat_layer,
             mlp_hidden=pag_cfg.mlp_hidden,
-            enc_dims=list(pag_cfg.enc_dims),
-            dec_dims=list(pag_cfg.dec_dims),
-            head_ch=pag_cfg.head_ch,
+            enc_dims=list(cfg.gsnet.encoder_dims),
+            dec_dims=list(cfg.gsnet.decoder_dims),
+            head_ch=cfg.gsnet.parm_head_dim,
             scale_max=pag_cfg.scale_max,
             device="cuda",
             ckpt_path=_ckpt_for_detect,
-            gru_iters=getattr(pag_cfg, "gru_iters", 3),
-            gru_hidden_ch=getattr(pag_cfg, "gru_hidden_ch", 64),
+            raft_encoder_dims=list(cfg.raft.encoder_dims),
         )
         logging.info("模型构建完成")
 
@@ -426,8 +232,8 @@ class PAGSplatTrainer:
         if cfg.restore_ckpt:
             self.load_ckpt(cfg.restore_ckpt)
         elif cfg.stage1_ckpt:
-            logging.info("从 stage1 checkpoint 加载部分权重")
-            self.load_ckpt(cfg.stage1_ckpt, load_optimizer=False, strict=False)
+            logging.info("从 stage1 checkpoint 加载简化模型权重")
+            self.load_ckpt(cfg.stage1_ckpt, load_optimizer=False, strict=True)
 
         self.model.train()
         # DA3 始终保持 eval 模式 (已在 build_pag_splat 中冻结)
@@ -442,8 +248,7 @@ class PAGSplatTrainer:
         bg = self.cfg.dataset.bg_color
 
         # 累积日志变量
-        log = dict(l1=0.0, ssim=0.0, smooth=0.0, warp=0.0,
-                   scale=0.0, normal=0.0, chamfer=0.0)
+        log = dict(l1=0.0, ssim=0.0, scale=0.0, chamfer=0.0)
         LOG_PERIOD = 100
 
         for itr in tqdm(range(self.total_steps, self.cfg.num_steps)):
@@ -457,77 +262,25 @@ class PAGSplatTrainer:
                 data = self.model(data, is_train=True)
 
                 # ── 渲染 ──
-                data = pag_pts2render(
-                    data, bg_color=bg, min_opacity=pag_cfg.min_opacity
-                )
+                data = pts2render(data, bg_color=bg)
 
                 render_novel = data["novel_view"]["img_pred"]
                 gt_novel = data["novel_view"]["img"]  # 已由 fetch_data 移至 CUDA
 
-                # ── 主重建损失（仅在渲染有覆盖的区域计算，屏蔽无信息的黑色背景）──
-                bg_t  = torch.tensor(bg, device=render_novel.device).view(1, 3, 1, 1)
-                cover = ((render_novel - bg_t).abs().sum(1, keepdim=True) > 1e-3).float()
-                # cover: (B, 1, H, W) 1=有覆盖, 0=纯背景
-                n_cover = cover.sum().clamp(min=1.0)
-                Ll1   = ((render_novel - gt_novel).abs() * cover).sum() / n_cover
-                Lssim = 1.0 - ssim(render_novel * cover, gt_novel * cover)
+                # ── 主重建损失 ──
+                Ll1 = l1_loss(render_novel, gt_novel)
+                Lssim = 1.0 - ssim(render_novel, gt_novel)
                 loss  = 0.8 * Ll1 + 0.2 * Lssim
 
-                # ── 辅助损失 1: 边缘感知深度平滑 ──
-                d_metric_l = data["metric_depth_l"]  # (B, 1, H, W)
-                Lsmooth = edge_aware_smooth_loss(d_metric_l, data["lmain"]["img"])
-                loss = loss + pag_cfg.loss_smooth * Lsmooth
-
-                # ── 辅助损失 2: 扭曲一致性（无效几何区域直接压制 opacity）──
-                opa_l = data["lmain"]["opacity"]   # (B, H*W, 1)
-                vm_l  = data["warp_valid_mask"]    # (B, 1, Hf, Wf)
-                Lwarp = (
-                    warp_consistency_loss(opa_l, vm_l)
-                    + warp_consistency_loss(
-                        data["rmain"]["opacity"], data["warp_valid_mask2"]
-                    )
-                ) * 0.5
-                loss  = loss + pag_cfg.loss_warp * Lwarp
-                Lunc  = torch.tensor(0.0, device=loss.device)  # 已移除，占位用于日志
-
-                # ── P0 损失 4: Scale 各向同性惩罚 (抑制蚯蚓状拉伸浮块) ──
-                Lscale = (
-                    scale_isotropy_loss(data["lmain"]["scale"])
-                    + scale_isotropy_loss(data["rmain"]["scale"])
-                ) * 0.5
+                # ── 轻量几何正则：scale_regular + 3D chamfer ──
+                Lscale = data["novel_view"]["scale_regular"]
                 loss = loss + pag_cfg.loss_scale * Lscale
 
-                # ── P0 损失 5: 方向一致性 (Gaussian 最短轴 ≈ 表面法线) ──
-                Lnormal = (
-                    orientation_consistency_loss(
-                        data["rot_map_l"], data["scale_map_l"], data["xyz_map_l"]
-                    )
-                    + orientation_consistency_loss(
-                        data["rot_map_r"], data["scale_map_r"], data["xyz_map_r"]
-                    )
-                ) * 0.5
-                loss = loss + pag_cfg.loss_normal * Lnormal
-
-                # ── P1 损失 6: Chamfer Distance 6D (左右点云几何+颜色一致性) ──
-                # SH 方案中 color_map = DC(像素颜色) + color_residual(极小)
-                # 直接用 color_map 作为颜色维度，退回用原始像素
-                H_, W_ = data["lmain"]["img"].shape[-2], data["lmain"]["img"].shape[-1]
-                def _get_rgb(view_key):
-                    v = data[view_key]
-                    if "color_map" in v:
-                        return v["color_map"].permute(0, 2, 3, 1).reshape(
-                            v["color_map"].shape[0], -1, 3
-                        )
-                    return (v["img"].permute(0, 2, 3, 1).reshape(
-                        v["img"].shape[0], -1, 3
-                    ) * 0.5 + 0.5)
-                rgb_l = _get_rgb("lmain")
-                rgb_r = _get_rgb("rmain")
                 Lchamfer = chamfer_distance_loss(
                     data["lmain"]["xyz"],
                     data["rmain"]["xyz"],
-                    rgb1=rgb_l,
-                    rgb2=rgb_r,
+                    valid1=data["lmain"]["pts_valid"],
+                    valid2=data["rmain"]["pts_valid"],
                     n_samples=pag_cfg.chamfer_samples,
                 )
                 loss = loss + pag_cfg.loss_chamfer * Lchamfer
@@ -547,19 +300,13 @@ class PAGSplatTrainer:
             # ── 日志 ──
             log["l1"]      += 0.8 * Ll1.item()
             log["ssim"]    += 0.2 * Lssim.item()
-            log["smooth"]  += pag_cfg.loss_smooth  * Lsmooth.item()
-            log["warp"]    += pag_cfg.loss_warp    * Lwarp.item()
             log["scale"]   += pag_cfg.loss_scale   * Lscale.item()
-            log["normal"]  += pag_cfg.loss_normal  * Lnormal.item()
             log["chamfer"] += pag_cfg.loss_chamfer * Lchamfer.item()
 
             metrics = {
                 "l1":      Ll1.item(),
                 "ssim":    Lssim.item(),
-                "smooth":  Lsmooth.item(),
-                "warp":    Lwarp.item(),
                 "scale":   Lscale.item(),
-                "normal":  Lnormal.item(),
                 "chamfer": Lchamfer.item(),
             }
             self.logger.push(metrics)
@@ -628,24 +375,13 @@ class PAGSplatTrainer:
             data = self.fetch_data("val")
             with torch.no_grad():
                 data = self.model(data, is_train=False)
-                data = pag_pts2render(
-                    data, bg_color=bg,
-                    min_opacity=self.cfg.pagsplat.min_opacity,
-                )
+                data = pts2render(data, bg_color=bg)
                 render_novel = data["novel_view"]["img_pred"]
                 gt_novel     = data["novel_view"]["img"]
 
-                # 仅在渲染有覆盖的区域计算指标，排除纯背景黑色区域
-                bg_t = torch.tensor(bg, device=render_novel.device).view(1, 3, 1, 1)
-                cover_mask = ((render_novel - bg_t).abs().sum(dim=1, keepdim=True) > 1e-3)
-                if cover_mask.any():
-                    r_m = render_novel * cover_mask
-                    g_m = gt_novel     * cover_mask
-                    psnr_val = psnr(r_m, g_m).mean().item()
-                    ssim_val = ssim(r_m, g_m).item()
-                else:
-                    psnr_val = psnr(render_novel, gt_novel).mean().item()
-                    ssim_val = ssim(render_novel, gt_novel).item()
+                cover_mask = None
+                psnr_val = psnr(render_novel, gt_novel).mean().item()
+                ssim_val = ssim(render_novel, gt_novel).item()
                 psnr_list.append(psnr_val)
                 ssim_list.append(ssim_val)
 
@@ -735,7 +471,12 @@ class PAGSplatTrainer:
     @staticmethod
     def _mask_to_color(mask: torch.Tensor) -> np.ndarray:
         """二值掩码 → 灰度 uint8 (H,W,3)。"""
-        m = mask[0, 0].float().cpu().numpy()
+        if mask.dim() == 4:
+            m = mask[0, 0].float().cpu().numpy()
+        elif mask.dim() == 3:
+            m = mask[0].float().cpu().numpy()
+        else:
+            m = mask.float().cpu().numpy()
         gray = (m * 255).astype(np.uint8)
         return np.stack([gray, gray, gray], axis=-1)
 
@@ -746,7 +487,10 @@ class PAGSplatTrainer:
         使用 viridis colormap。
         """
         import matplotlib.cm as cm
-        o = opa[0, :, 0].float().cpu().numpy().reshape(H, W)
+        if opa.dim() == 4:
+            o = opa[0, 0].float().cpu().numpy()
+        else:
+            o = opa[0, :, 0].float().cpu().numpy().reshape(H, W)
         rgba = cm.viridis(o)
         return (rgba[:, :, :3] * 255).astype(np.uint8)
 
@@ -867,20 +611,20 @@ class PAGSplatTrainer:
         分开保存各可视化项到 show/{step:06d}/ 子目录，并额外生成对比拼图：
 
         单图：
-          render.jpg / gt.jpg / diff.jpg / color_map.jpg
+          render.jpg / gt.jpg / diff.jpg
           d_metric_l/r.jpg  d_final_l/r.jpg  d_delta_l/r.jpg
-          valid_mask.jpg  opacity_l.jpg
+          pts_valid.jpg  opacity_l.jpg
           pts_lmain/rmain/merged.jpg
 
         对比拼图（横向拼接，已标注内容和数值范围）：
           cmp_render.jpg       — Render | GT | Diff
           cmp_psnr.jpg         — Render(masked) | GT(masked) | Diff(masked) | PSNR_Mask
-          cmp_color.jpg        — ColorMap(fused) | Img_L | Img_R
+          cmp_color.jpg        — Img_L(ref) | Img_L | Img_R
           cmp_depth_l.jpg      — d_metric_l | d_final_l | d_delta_l
           cmp_depth_r.jpg      — d_metric_r | d_final_r | d_delta_r
           cmp_depth_lr.jpg     — d_metric_l | d_metric_r（双视图尺度一致性）
           cmp_pts.jpg          — pts_lmain | pts_rmain | pts_merged
-          cmp_geom.jpg         — valid_mask | opacity_l
+          cmp_geom.jpg         — pts_valid | opacity_l
         """
         step   = self.total_steps
         # 目录结构: show/{step:06d}/{dataset_tag}/
@@ -1018,15 +762,12 @@ class PAGSplatTrainer:
             labeled(mask_vis_np,      "PSNR Mask"),
         )
 
-        # ── 颜色融合 ──
-        if "color_map" in lm:
-            cmap_np = self._img_tensor_to_np(lm["color_map"])
-        else:
-            cmap_np = self._img_tensor_to_np(lm["img"] * 0.5 + 0.5)
+        # ── 输入视图颜色 ──
+        cmap_np = self._img_tensor_to_np(lm["img"] * 0.5 + 0.5)
         img_l_np = self._img_tensor_to_np(lm["img"] * 0.5 + 0.5)
         img_r_np = self._img_tensor_to_np(rm["img"] * 0.5 + 0.5)
         save_cmp("cmp_color.jpg",
-            labeled(cmap_np,  "ColorMap(fused)"),
+            labeled(cmap_np,  "Img_L(ref)"),
             labeled(img_l_np, "Img_L"),
             labeled(img_r_np, "Img_R"),
         )
@@ -1051,10 +792,11 @@ class PAGSplatTrainer:
         save_cmp("cmp_depth_lr.jpg", d_metric_l, d_metric_r)
 
         # ── 几何覆盖 ──
-        mask_np    = self._mask_to_color(data["warp_valid_mask"])
-        opacity_np = self._opacity_to_color(lm["opacity"], H, W)
+        pts_valid_map = lm["pts_valid"][0].view(H, W)
+        mask_np = self._mask_to_color(pts_valid_map)
+        opacity_np = self._opacity_to_color(lm["opacity_maps"], H, W)
         save_cmp("cmp_geom.jpg",
-            labeled(mask_np,    "ValidMask"),
+            labeled(mask_np,    "PtsValid"),
             labeled(opacity_np, "Opacity_L"),
         )
 
@@ -1108,12 +850,15 @@ class PAGSplatTrainer:
         logging.info(f"加载 checkpoint: {load_path}")
         ckpt = torch.load(load_path, map_location="cuda", weights_only=False)
 
-        # ── 模型权重 ──
+        if "network" not in ckpt:
+            raise KeyError("Checkpoint 缺少 'network' 键，无法加载简化模型")
+
         missing, unexpected = self.model.load_state_dict(ckpt["network"], strict=strict)
-        if missing:
-            logging.warning(f"  缺少权重 ({len(missing)} 个): {missing[:5]}...")
-        if unexpected:
-            logging.warning(f"  多余权重 ({len(unexpected)} 个): {unexpected[:5]}...")
+        if missing or unexpected:
+            raise RuntimeError(
+                "Checkpoint 与当前简化模型不兼容："
+                f"missing={missing[:5]} unexpected={unexpected[:5]}"
+            )
 
         if load_optimizer and "optimizer" in ckpt:
             # ── 训练步数 ──

@@ -4,7 +4,7 @@ PAG-Splat 自由视角插值渲染脚本
 结构完全对齐 GPS+ run_interpolation.py，只改变模型加载部分：
   - 使用 build_pag_splat 加载 PAGSplat 模型
   - get_item_free 中去除 GPS+ 专属的 flow_init / Tf_x / ref_intr
-  - 使用 pag_pts2render 完成渲染
+  - 使用原 lib.GaussianRender.pts2render 完成渲染
   - novel_view 字典格式与原版完全一致 (字段用列表包裹)
 
 用法:
@@ -32,9 +32,9 @@ from pathlib import Path
 from tqdm import tqdm
 
 from lib.human_loader import load_json_to_np
+from lib.GaussianRender import pts2render
 from config.stereo_human_config import ConfigStereoHuman as config
 from pag_splat.model import build_pag_splat
-from pag_splat.render import pag_pts2render
 from lib.gs_utils.graphics_utils import getWorld2View2, getProjectionMatrix, focal2fov
 
 from scipy.spatial.transform import Rotation as Rot
@@ -542,12 +542,13 @@ if __name__ == '__main__':
         feat_stride=pag_cfg.feat_stride,
         feat_layer=pag_cfg.feat_layer,
         mlp_hidden=pag_cfg.mlp_hidden,
-        enc_dims=list(pag_cfg.enc_dims),
-        dec_dims=list(pag_cfg.dec_dims),
-        head_ch=pag_cfg.head_ch,
+        enc_dims=list(cfg.gsnet.encoder_dims),
+        dec_dims=list(cfg.gsnet.decoder_dims),
+        head_ch=cfg.gsnet.parm_head_dim,
         scale_max=pag_cfg.scale_max,
         device='cuda',
         ckpt_path=arg.ckpt,   # 自动检测旧/新 checkpoint 的 t12_mode
+        raft_encoder_dims=list(cfg.raft.encoder_dims),
     )
     assert os.path.exists(arg.ckpt), f'Checkpoint 不存在: {arg.ckpt}'
     try:
@@ -555,11 +556,7 @@ if __name__ == '__main__':
     except Exception as e:
         logging.error(f'Checkpoint 加载失败（文件可能损坏或不完整）: {arg.ckpt}\n  {e}')
         sys.exit(1)
-    missing, unexpected = model.load_state_dict(ckpt['network'], strict=False)
-    if len(unexpected) > 0:
-        print(f'[警告] 忽略了 {len(unexpected)} 个不匹配的键')
-    if len(missing) > 0:
-        print(f'[警告] 缺失 {len(missing)} 个键: {missing[:5]}...')
+    model.load_state_dict(ckpt['network'], strict=True)
     model = model.cuda()
     model.eval()
     # 与 GPS+ _freeze_bn 一致：保持 BN 统计量不更新
@@ -601,11 +598,7 @@ if __name__ == '__main__':
                 continue
 
             # 渲染（对齐 run_interpolation.py 调用 pts2render 的位置）
-            data = pag_pts2render(
-                data,
-                bg_color=cfg.dataset.bg_color,
-                min_opacity=pag_cfg.min_opacity,
-            )
+            data = pts2render(data, bg_color=cfg.dataset.bg_color)
 
             # 保存渲染图（与 run_interpolation.py 保存逻辑一致）
             tmp_novel = data['novel_view']['img_pred'][0].detach()

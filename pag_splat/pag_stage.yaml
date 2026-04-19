@@ -14,7 +14,7 @@ depth_mode: 'pagsplat'
 dataset:
   # ── 旧 GPS+ 兼容字段（保留供 StereoHumanDataset 使用，PAGMultiDataset 不依赖）──
   source_id: [0, 1]
-  train_novel_id: [2, 3, 4, 5]
+  train_novel_id: [2, 3]
   val_novel_id: [2, 3]
   use_hr_img: False
   use_depth_init: False
@@ -36,9 +36,9 @@ dataset:
   # 若两个列表均为空，退回使用 train_data_root / val_data_root（legacy 兼容模式）
   multi_train_roots:
     # ── processed_mini 多视角场景（cameras.json，随机3视角）──
-    - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor1_4/train'
-    - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor2_3/train'
-    - '/data/sifang/GPS_plus_data/processed_mini/mobile_stage/dance3/train'
+    # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor1_4/train'
+    # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor2_3/train'
+    # - '/data/sifang/GPS_plus_data/processed_mini/mobile_stage/dance3/train'
     # - '/data/sifang/GPS_plus_data/processed_mini/my_zjumocap/my_313/train'
     # - '/data/sifang/GPS_plus_data/processed_mini/my_zjumocap/my_315/train'
     # - '/data/sifang/GPS_plus_data/processed_mini/NHR/basketball/train'
@@ -48,9 +48,9 @@ dataset:
     # ── processed_data 原始数据集（0_1.json + npy，固定 source=0,1）──
     - '/data/sifang/GPS_plus_data/processed_data/train'
   multi_val_roots:
-    - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor1_4/val'
-    - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor2_3/val'
-    - '/data/sifang/GPS_plus_data/processed_mini/mobile_stage/dance3/val'
+    # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor1_4/val'
+    # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor2_3/val'
+    # - '/data/sifang/GPS_plus_data/processed_mini/mobile_stage/dance3/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/my_zjumocap/my_313/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/my_zjumocap/my_315/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/NHR/basketball/val'
@@ -60,16 +60,16 @@ dataset:
     - '/data/sifang/GPS_plus_data/processed_data/val'
   # 对应格式，与 multi_train_roots 等长
   multi_formats:
-    - 'mini'
-    - 'mini'
-    - 'mini'
-    - 'mini'
     # - 'mini'
-    # - 'legacy'
+    # - 'mini'
+    # - 'mini'
+    # - 'mini'
+    # - 'mini'
+    - 'legacy'
 
   # 目标分辨率 (H, W)；null = 不 resize，保持原始尺寸
   # processed_mini 图片已经是 1024×1024，可设为 null 或调小加速训练
-  target_hw: [1024, 1024]
+  target_hw: [512, 512]
 
   # __len__ 放大倍数
   train_boost: 5
@@ -81,7 +81,7 @@ dataset:
   max_cam_gap: 2
 
   # legacy 格式的 novel view id（fixed source=0,1 时随机选的 novel）
-  legacy_novel_ids: [2, 3, 4, 5]
+  legacy_novel_ids: [2, 3]
 
 # ───────────────────────────────────────────────
 # RAFT 配置 (schema 兼容占位，PAGSplat 不使用)
@@ -194,5 +194,5 @@ pagsplat:
 # ───────────────────────────────────────────────
 record:
   loss_freq: 50      # 每 100 步打印一次 loss
-  eval_freq: 1000     # 每 3000 步做一次验证
+  eval_freq: 50     # 每 3000 步做一次验证
   save_iter: 10000    # 每 10000 步保存一次 checkpoint
