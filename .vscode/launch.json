@@ -10,7 +10,15 @@
             "name": "GPS+ debug",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "python": "/data/sifang/miniconda3/envs/gps_plus_env/bin/python",
+            "program": "${workspaceFolder}/train_stereo_gs.py",
+            "args": [
+                "--config",
+                "config/stereo_gs_stage.yaml",
+                "--exp_name",
+                "hias_data_sifang"
+            ],
+            "cwd": "${workspaceFolder}",
             "console": "integratedTerminal"
         }
     ]

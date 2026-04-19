@@ -14,7 +14,7 @@ dataset:
   use_hr_img: False
   use_depth_init: True
   use_local_data: True
-  inverse_depth_init: 0.3
+  inverse_depth_init: 0.08
   local_data_root: '/data/sifang/GPS_plus_data/hias_sifang_s1_colmap_processed'
   train_data_root: '/data/sifang/GPS_plus_data/hias_sifang_s1_colmap_processed/train'
   val_data_root: '/data/sifang/GPS_plus_data/hias_sifang_s1_colmap_processed/val'
