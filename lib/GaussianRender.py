@@ -22,7 +22,6 @@ def pts2render(data, bg_color):
             valid_i = data[view]['pts_valid'][i, :]
             xyz_i = data[view]['xyz'][i, :, :]  # [S*S, 3]
             rgb_i = data[view]['img'][i, :, :, :].permute(1, 2, 0).view(-1, 3)  # [S*S, 3]
-            # rgb_i = data[view]['color_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 3)  # [S*S, 3]
             rot_i = data[view]['rot_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 4)  # [S*S, 4]
             scale_i = data[view]['scale_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 3)  # [S*S, 3]
             opacity_i = data[view]['opacity_maps'][i, :, :, :].permute(1, 2, 0).view(-1, 1)  # [S*S, 1]
@@ -32,6 +31,21 @@ def pts2render(data, bg_color):
             rot_i_valid.append(rot_i[valid_i].view(-1, 4))
             scale_i_valid.append(scale_i[valid_i].view(-1, 3))
             opacity_i_valid.append(opacity_i[valid_i].view(-1, 1))
+
+            if 'child_xyz' in data[view]:
+                child_valid_i = data[view]['child_valid'][i, :]
+                if bool(child_valid_i.any().item()):
+                    child_xyz_i = data[view]['child_xyz'][i]
+                    child_rgb_i = data[view]['child_rgb'][i]
+                    child_rot_i = data[view]['child_rot'][i]
+                    child_scale_i = data[view]['child_scale'][i]
+                    child_opacity_i = data[view]['child_opacity'][i]
+
+                    xyz_i_valid.append(child_xyz_i[child_valid_i].view(-1, 3))
+                    rgb_i_valid.append(child_rgb_i[child_valid_i].view(-1, 3) * 2.0 - 1.0)
+                    rot_i_valid.append(child_rot_i[child_valid_i].view(-1, 4))
+                    scale_i_valid.append(child_scale_i[child_valid_i].view(-1, 3))
+                    opacity_i_valid.append(child_opacity_i[child_valid_i].view(-1, 1))
 
         pts_xyz_i = torch.concat(xyz_i_valid, dim=0)
         pts_rgb_i = torch.concat(rgb_i_valid, dim=0)

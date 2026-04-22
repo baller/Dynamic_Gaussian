@@ -34,7 +34,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config.stereo_human_config import ConfigStereoHuman
-from lib.human_loader import StereoHumanDataset
 from lib.pag_multi_loader import build_pag_dataset
 from lib.train_recoder import Logger
 from lib.GaussianRender import pts2render
@@ -44,6 +43,116 @@ from pag_splat.model import build_pag_splat
 from pag_splat.render import move_data_to_cuda
 
 warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# ──────────────────────────────────────────────────────────
+#  Wavelet / Split / Child losses
+# ──────────────────────────────────────────────────────────
+
+def haar_dwt2d(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x.shape[-2] % 2 != 0:
+        x = F.pad(x, (0, 0, 0, 1), mode="replicate")
+    if x.shape[-1] % 2 != 0:
+        x = F.pad(x, (0, 1, 0, 0), mode="replicate")
+
+    x00 = x[:, :, 0::2, 0::2]
+    x01 = x[:, :, 0::2, 1::2]
+    x10 = x[:, :, 1::2, 0::2]
+    x11 = x[:, :, 1::2, 1::2]
+
+    ll = 0.5 * (x00 + x01 + x10 + x11)
+    lh = 0.5 * (x00 - x01 + x10 - x11)
+    hl = 0.5 * (x00 + x01 - x10 - x11)
+    hh = 0.5 * (x00 - x01 - x10 + x11)
+    return ll, lh, hl, hh
+
+
+def wavelet_render_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    high_weight: float = 1.0,
+    low_weight: float = 0.25,
+) -> torch.Tensor:
+    ll_p, lh_p, hl_p, hh_p = haar_dwt2d(pred)
+    ll_t, lh_t, hl_t, hh_t = haar_dwt2d(target)
+    low = F.l1_loss(ll_p, ll_t)
+    high = (
+        F.l1_loss(lh_p, lh_t)
+        + F.l1_loss(hl_p, hl_t)
+        + F.l1_loss(hh_p, hh_t)
+    ) / 3.0
+    return low_weight * low + high_weight * high
+
+
+def split_sparsity_loss(
+    split_score: torch.Tensor,
+    child_weight: torch.Tensor,
+    valid_map: torch.Tensor,
+) -> torch.Tensor:
+    valid = valid_map.float()
+    score = split_score * valid
+    score_l1 = score.sum() / (valid.sum() + 1e-6)
+
+    weight = child_weight.clamp_min(1e-6)
+    entropy = -(weight * weight.log()).sum(dim=1, keepdim=True)
+    entropy = (entropy * valid).sum() / (valid.sum() + 1e-6)
+    return score_l1 + 0.1 * entropy
+
+
+def child_consistency_loss(view: dict) -> torch.Tensor:
+    uv = view["child_delta_uv_maps"].abs().mean()
+    depth = view["child_depth_res_maps"].abs().mean()
+    scale_ratio = (view["child_scale_ratio_maps"] - 1.0).abs().mean()
+    color = view["child_color_res_maps"].abs().mean()
+    return uv + depth + scale_ratio + color
+
+
+def da3_split_prior_loss(
+    split_score: torch.Tensor,
+    prior: torch.Tensor,
+) -> torch.Tensor:
+    return F.l1_loss(split_score, prior.detach())
+
+
+def compute_refine_schedule(
+    total_steps: int,
+    refine_warmup_steps: int,
+    prior_warmup_steps: int,
+) -> tuple[float, float]:
+    refine_warmup = max(int(refine_warmup_steps), 1)
+    prior_warmup = max(int(prior_warmup_steps), 1)
+    warmup_alpha = min(float(total_steps) / refine_warmup, 1.0)
+    prior_alpha = max(1.0 - float(total_steps) / prior_warmup, 0.0)
+    return warmup_alpha, prior_alpha
+
+
+def build_split_debug_maps(view: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """
+    从单个 view 输出中整理 split 调试图。
+    - split_score:   分裂提案强度
+    - child_density: 每个父像素激活的 child 数量（未归一化）
+    - wavelet_high:  DA3 高频小波先验能量图
+    """
+    split_score = view["split_score_maps"]
+    wavelet_high = view.get("split_prior_maps", torch.zeros_like(split_score))
+    coarse_h, coarse_w = split_score.shape[-2:]
+
+    child_valid = view.get("child_valid")
+    if child_valid is None:
+        child_density = torch.zeros_like(split_score)
+    else:
+        bsz = child_valid.shape[0]
+        pixels = coarse_h * coarse_w
+        if pixels <= 0 or child_valid.shape[1] % pixels != 0:
+            raise ValueError("child_valid shape 与 coarse split map 不匹配")
+        k_max = child_valid.shape[1] // pixels
+        child_density = child_valid.view(bsz, k_max, coarse_h, coarse_w).float().sum(dim=1, keepdim=True)
+
+    return {
+        "split_score": split_score,
+        "child_density": child_density,
+        "wavelet_high": wavelet_high,
+    }
 
 
 # ──────────────────────────────────────────────────────────
@@ -169,6 +278,10 @@ class PAGSplatTrainer:
             device="cuda",
             ckpt_path=_ckpt_for_detect,
             raft_encoder_dims=list(cfg.raft.encoder_dims),
+            split_k_max=pag_cfg.split_k_max,
+            split_score_thresh=pag_cfg.split_score_thresh,
+            child_weight_thresh=pag_cfg.child_weight_thresh,
+            split_topk_ratio=pag_cfg.split_topk_ratio,
         )
         logging.info("模型构建完成")
 
@@ -177,20 +290,11 @@ class PAGSplatTrainer:
             logging.info(f"  {name:<40s}: {cnt:,}")
 
         # ── 数据集 ──
-        # 若 cfg.dataset.multi_train_roots 非空则走多数据集模式，否则退回旧 StereoHumanDataset
-        _use_multi = bool(getattr(cfg.dataset, "multi_train_roots", None))
-
-        if _use_multi:
-            logging.info("使用 PAGMultiDataset（多数据集混合训练）")
-            self.train_set = build_pag_dataset(cfg.dataset, phase="train")
-            self.val_set   = build_pag_dataset(cfg.dataset, phase="val")
-            # val_boost 供计算 len_val 用
-            _val_boost = getattr(cfg.dataset, "val_boost", 200)
-        else:
-            logging.info("使用 StereoHumanDataset（GPS+ legacy 模式）")
-            self.train_set = StereoHumanDataset(cfg.dataset, phase="train")
-            self.val_set   = StereoHumanDataset(cfg.dataset, phase="val")
-            _val_boost = self.val_set.val_boost
+        # 统一使用 build_pag_dataset；当 multi_train_roots 为空时，它会自动退回 legacy root。
+        logging.info("使用 PAGDataset 构建训练/验证集")
+        self.train_set = build_pag_dataset(cfg.dataset, phase="train")
+        self.val_set   = build_pag_dataset(cfg.dataset, phase="val")
+        _val_boost = getattr(cfg.dataset, "val_boost", 200)
 
         self.train_loader = DataLoader(
             self.train_set, batch_size=self.bs,
@@ -248,7 +352,10 @@ class PAGSplatTrainer:
         bg = self.cfg.dataset.bg_color
 
         # 累积日志变量
-        log = dict(l1=0.0, ssim=0.0, scale=0.0, chamfer=0.0)
+        log = dict(
+            l1=0.0, ssim=0.0, scale=0.0, chamfer=0.0,
+            wavelet=0.0, split=0.0, child=0.0, prior=0.0,
+        )
         LOG_PERIOD = 100
 
         for itr in tqdm(range(self.total_steps, self.cfg.num_steps)):
@@ -256,6 +363,12 @@ class PAGSplatTrainer:
 
             # ── 取数据 ──
             data = self.fetch_data("train")
+            warmup_alpha, prior_alpha = compute_refine_schedule(
+                total_steps=self.total_steps,
+                refine_warmup_steps=pag_cfg.refine_warmup_steps,
+                prior_warmup_steps=pag_cfg.da3_wavelet_prior_warmup_steps,
+            )
+            data["_refine_warmup_alpha"] = warmup_alpha
 
             # ── 前向传播 ──
             with torch.autocast(device_type="cuda", enabled=pag_cfg.mixed_precision):
@@ -271,6 +384,13 @@ class PAGSplatTrainer:
                 Ll1 = l1_loss(render_novel, gt_novel)
                 Lssim = 1.0 - ssim(render_novel, gt_novel)
                 loss  = 0.8 * Ll1 + 0.2 * Lssim
+                Lwavelet = wavelet_render_loss(
+                    render_novel,
+                    gt_novel,
+                    high_weight=pag_cfg.wavelet_high_weight,
+                    low_weight=pag_cfg.wavelet_low_weight,
+                )
+                loss = loss + pag_cfg.loss_wavelet * warmup_alpha * Lwavelet
 
                 # ── 轻量几何正则：scale_regular + 3D chamfer ──
                 Lscale = data["novel_view"]["scale_regular"]
@@ -284,6 +404,45 @@ class PAGSplatTrainer:
                     n_samples=pag_cfg.chamfer_samples,
                 )
                 loss = loss + pag_cfg.loss_chamfer * Lchamfer
+
+                Lsplit = 0.5 * (
+                    split_sparsity_loss(
+                        data["lmain"]["split_score_maps"],
+                        data["lmain"]["child_weight_maps"],
+                        data["lmain"]["pts_valid"].view(
+                            data["lmain"]["split_score_maps"].shape[0],
+                            1,
+                            *data["lmain"]["opacity_maps"].shape[-2:],
+                        ),
+                    )
+                    + split_sparsity_loss(
+                        data["rmain"]["split_score_maps"],
+                        data["rmain"]["child_weight_maps"],
+                        data["rmain"]["pts_valid"].view(
+                            data["rmain"]["split_score_maps"].shape[0],
+                            1,
+                            *data["rmain"]["opacity_maps"].shape[-2:],
+                        ),
+                    )
+                )
+                loss = loss + pag_cfg.loss_split_sparse * warmup_alpha * Lsplit
+
+                Lchild = 0.5 * (
+                    child_consistency_loss(data["lmain"]) + child_consistency_loss(data["rmain"])
+                )
+                loss = loss + pag_cfg.loss_child_consistency * warmup_alpha * Lchild
+
+                Lprior = 0.5 * (
+                    da3_split_prior_loss(
+                        data["lmain"]["split_score_maps"],
+                        data["lmain"]["split_prior_maps"],
+                    )
+                    + da3_split_prior_loss(
+                        data["rmain"]["split_score_maps"],
+                        data["rmain"]["split_prior_maps"],
+                    )
+                )
+                loss = loss + pag_cfg.loss_da3_prior * prior_alpha * Lprior
 
             # ── 反向传播 ──
             self.scaler.scale(loss).backward()
@@ -302,12 +461,20 @@ class PAGSplatTrainer:
             log["ssim"]    += 0.2 * Lssim.item()
             log["scale"]   += pag_cfg.loss_scale   * Lscale.item()
             log["chamfer"] += pag_cfg.loss_chamfer * Lchamfer.item()
+            log["wavelet"] += pag_cfg.loss_wavelet * warmup_alpha * Lwavelet.item()
+            log["split"]   += pag_cfg.loss_split_sparse * warmup_alpha * Lsplit.item()
+            log["child"]   += pag_cfg.loss_child_consistency * warmup_alpha * Lchild.item()
+            log["prior"]   += pag_cfg.loss_da3_prior * prior_alpha * Lprior.item()
 
             metrics = {
                 "l1":      Ll1.item(),
                 "ssim":    Lssim.item(),
                 "scale":   Lscale.item(),
                 "chamfer": Lchamfer.item(),
+                "wavelet": Lwavelet.item(),
+                "split":   Lsplit.item(),
+                "child":   Lchild.item(),
+                "prior":   Lprior.item(),
             }
             self.logger.push(metrics)
 
@@ -373,6 +540,13 @@ class PAGSplatTrainer:
 
         for idx in range(self.len_val):
             data = self.fetch_data("val")
+            warmup_alpha, _ = compute_refine_schedule(
+                total_steps=self.total_steps,
+                refine_warmup_steps=self.cfg.pagsplat.refine_warmup_steps,
+                prior_warmup_steps=self.cfg.pagsplat.da3_wavelet_prior_warmup_steps,
+            )
+            data["_refine_warmup_alpha"] = warmup_alpha
+            data["_force_topk_split_eval"] = warmup_alpha < 1.0
             with torch.no_grad():
                 data = self.model(data, is_train=False)
                 data = pts2render(data, bg_color=bg)
@@ -625,6 +799,8 @@ class PAGSplatTrainer:
           cmp_depth_lr.jpg     — d_metric_l | d_metric_r（双视图尺度一致性）
           cmp_pts.jpg          — pts_lmain | pts_rmain | pts_merged
           cmp_geom.jpg         — pts_valid | opacity_l
+          cmp_split_l.jpg      — split_score | child_density | wavelet_high
+          cmp_split_r.jpg      — split_score | child_density | wavelet_high
         """
         step   = self.total_steps
         # 目录结构: show/{step:06d}/{dataset_tag}/
@@ -792,13 +968,43 @@ class PAGSplatTrainer:
         save_cmp("cmp_depth_lr.jpg", d_metric_l, d_metric_r)
 
         # ── 几何覆盖 ──
-        pts_valid_map = lm["pts_valid"][0].view(H, W)
+        coarse_h, coarse_w = lm["opacity_maps"].shape[-2:]
+        pts_valid_map = lm["pts_valid"][0].view(coarse_h, coarse_w)
         mask_np = self._mask_to_color(pts_valid_map)
-        opacity_np = self._opacity_to_color(lm["opacity_maps"], H, W)
+        opacity_np = self._opacity_to_color(lm["opacity_maps"], coarse_h, coarse_w)
+        debug_l = build_split_debug_maps(lm)
+        debug_r = build_split_debug_maps(rm)
+        split_np = self._opacity_to_color(debug_l["split_score"], coarse_h, coarse_w)
         save_cmp("cmp_geom.jpg",
             labeled(mask_np,    "PtsValid"),
             labeled(opacity_np, "Opacity_L"),
+            labeled(split_np,   "SplitScore_L"),
         )
+
+        def _split_panel(debug_view: dict[str, torch.Tensor], side: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            split_score = debug_view["split_score"]
+            child_density = debug_view["child_density"]
+            wavelet_high = debug_view["wavelet_high"]
+
+            child_pixels = max(child_density.shape[-2] * child_density.shape[-1], 1)
+            k_max = max(
+                int(lm["child_valid"].shape[1] // child_pixels) if side == "L" else int(rm["child_valid"].shape[1] // child_pixels),
+                1,
+            )
+            child_density_norm = (child_density / float(k_max)).clamp(0.0, 1.0)
+
+            split_img = self._opacity_to_color(split_score, coarse_h, coarse_w)
+            density_img = self._opacity_to_color(child_density_norm, coarse_h, coarse_w)
+            wavelet_img = self._opacity_to_color(wavelet_high, coarse_h, coarse_w)
+            density_max = float(child_density.max().item()) if child_density.numel() > 0 else 0.0
+            return (
+                labeled(split_img, f"SplitScore_{side}"),
+                labeled(density_img, f"ChildDensity_{side} max={density_max:.1f}"),
+                labeled(wavelet_img, f"WaveletHigh_{side}"),
+            )
+
+        save_cmp("cmp_split_l.jpg", *_split_panel(debug_l, "L"))
+        save_cmp("cmp_split_r.jpg", *_split_panel(debug_r, "R"))
 
         # ── 点云散点图（世界坐标 XY 平面，turbo 深度着色，白色背景）──
         xyz_merged = torch.cat([lm["xyz"], rm["xyz"]], dim=1)

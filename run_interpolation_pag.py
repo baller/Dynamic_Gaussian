@@ -198,6 +198,7 @@ class PAGSplatModel(nn.Module):
         self.novel_intrs = novel_intrs
         self.img_path = os.path.join(cfg.dataset.local_data_root, 'test', tar_n + '_process', 'img')
         self.msk_path = os.path.join(cfg.dataset.local_data_root, 'test', tar_n + '_process', 'mask')
+        self.render_hw = tuple(getattr(cfg.dataset, 'render_hw', None) or (1024, 1024))
 
         # 读取立体对相机内外参（与 run_interpolation.py 完全一致的方式）
         parm_name = os.path.join(
@@ -259,7 +260,10 @@ class PAGSplatModel(nn.Module):
         novel_intr = self.novel_intrs[0][view_id]
         novel_extr = self.novel_extrs[0][view_id]
 
-        width, height = 1024, 1024
+        height, width = self.render_hw
+        novel_intr = novel_intr.copy()
+        novel_intr[0] *= width / 1024.0
+        novel_intr[1] *= height / 1024.0
         R = np.array(novel_extr[:3, :3], np.float32).reshape(3, 3).transpose(1, 0)
         T = np.array(novel_extr[:3, 3], np.float32)
 
@@ -371,6 +375,7 @@ class PAGSplatModelMini(nn.Module):
         self.novel_intrs = novel_intrs
         self.data_root   = data_root
         self.split       = split
+        self.render_hw   = tuple(getattr(cfg.dataset, 'render_hw', None) or (1024, 1024))
 
         # 排序后的帧目录列表
         img_root = os.path.join(data_root, split, 'img')
@@ -420,8 +425,12 @@ class PAGSplatModelMini(nn.Module):
         novel_intr = self.novel_intrs[0][view_id]
         novel_extr = self.novel_extrs[0][view_id]
 
-        # 使用图像原始尺寸
-        _, _, H, W = img0.shape
+        # 渲染尺寸可大于输入图尺寸
+        _, _, H_src, W_src = img0.shape
+        H, W = self.render_hw
+        novel_intr = novel_intr.copy()
+        novel_intr[0] *= W / max(W_src, 1)
+        novel_intr[1] *= H / max(H_src, 1)
 
         R = np.array(novel_extr[:3, :3], np.float32).reshape(3, 3).transpose(1, 0)
         T = np.array(novel_extr[:3, 3],  np.float32)
@@ -549,6 +558,10 @@ if __name__ == '__main__':
         device='cuda',
         ckpt_path=arg.ckpt,   # 自动检测旧/新 checkpoint 的 t12_mode
         raft_encoder_dims=list(cfg.raft.encoder_dims),
+        split_k_max=pag_cfg.split_k_max,
+        split_score_thresh=pag_cfg.split_score_thresh,
+        child_weight_thresh=pag_cfg.child_weight_thresh,
+        split_topk_ratio=pag_cfg.split_topk_ratio,
     )
     assert os.path.exists(arg.ckpt), f'Checkpoint 不存在: {arg.ckpt}'
     try:

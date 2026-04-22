@@ -19,10 +19,11 @@ dataset:
   use_hr_img: False
   use_depth_init: False
   use_local_data: True
-  inverse_depth_init: 0.3
-  local_data_root: '/data/sifang/GPS_plus_data/processed_data'
-  train_data_root: '/data/sifang/GPS_plus_data/processed_data/train'
-  val_data_root:   '/data/sifang/GPS_plus_data/processed_data/val'
+  inverse_depth_init: 0.535
+  local_data_root: '/data/sifang/GPS_plus_data/colmap2.0_processed'
+  train_data_root: '/data/sifang/GPS_plus_data/colmap2.0_processed/train'
+  val_data_root:   '/data/sifang/GPS_plus_data/colmap2.0_processed/val'
+  raw_data_root: '/data/sifang/GPS_plus_data/colmap2.0'
   bg_color: [0, 0, 0]
   znear: 0.01
   zfar: 100.0
@@ -46,7 +47,7 @@ dataset:
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0008_01/train'
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0012_01/train'
     # ── processed_data 原始数据集（0_1.json + npy，固定 source=0,1）──
-    - '/data/sifang/GPS_plus_data/processed_data/train'
+    # - '/data/sifang/GPS_plus_data/colmap2.0_processed/train'
   multi_val_roots:
     # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor1_4/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor2_3/val'
@@ -57,7 +58,7 @@ dataset:
     # - '/data/sifang/GPS_plus_data/processed_mini/NHR/sport_1_easymocap/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0008_01/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0012_01/val'
-    - '/data/sifang/GPS_plus_data/processed_data/val'
+    # - '/data/sifang/GPS_plus_data/colmap2.0_processed/val'
   # 对应格式，与 multi_train_roots 等长
   multi_formats:
     # - 'mini'
@@ -65,11 +66,12 @@ dataset:
     # - 'mini'
     # - 'mini'
     # - 'mini'
-    - 'legacy'
+    # - 'legacy'
 
   # 目标分辨率 (H, W)；null = 不 resize，保持原始尺寸
   # processed_mini 图片已经是 1024×1024，可设为 null 或调小加速训练
   target_hw: [512, 512]
+  render_hw: [512, 512]
 
   # __len__ 放大倍数
   train_boost: 5
@@ -178,7 +180,7 @@ pagsplat:
   # Chamfer Distance: 防止左右视图点云空间不一致引发的视角欺骗浮块
   loss_chamfer: 0.50
   # Chamfer 每次随机采样点数 (越大越准确但显存/速度代价越高)
-  chamfer_samples: 5000
+  chamfer_samples: 10000
 
   # 渲染时不透明度裁剪阈值 (低于此值的点不参与渲染)
   min_opacity: 0.01
@@ -189,10 +191,25 @@ pagsplat:
   # GRU 隐藏状态通道数: 越大越强但显存更多
   gru_hidden_ch: 64
 
+  # ── DA3 小波引导的分层高斯分裂 ──
+  wavelet_levels: 1
+  split_k_max: 4
+  loss_wavelet: 0.10
+  loss_split_sparse: 0.01
+  loss_child_consistency: 0.01
+  loss_da3_prior: 0.02
+  wavelet_high_weight: 1.0
+  wavelet_low_weight: 0.25
+  split_score_thresh: 0.20
+  child_weight_thresh: 0.10
+  split_topk_ratio: 0.01
+  refine_warmup_steps: 100000
+  da3_wavelet_prior_warmup_steps: 100000
+
 # ───────────────────────────────────────────────
 # 训练记录配置
 # ───────────────────────────────────────────────
 record:
   loss_freq: 50      # 每 100 步打印一次 loss
-  eval_freq: 50     # 每 3000 步做一次验证
-  save_iter: 10000    # 每 10000 步保存一次 checkpoint
+  eval_freq: 500     # 每 3000 步做一次验证
+  save_iter: 50000    # 每 10000 步保存一次 checkpoint

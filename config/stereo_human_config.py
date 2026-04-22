@@ -41,6 +41,10 @@ class ConfigStereoHuman:
         self.cfg.dataset.multi_formats       = ()   # tuple[str]，默认全为 "mini"
         # 目标输出分辨率 (H, W)；None 表示不 resize
         self.cfg.dataset.target_hw           = None
+        # 渲染/监督分辨率 (H, W)；None 表示与 target_hw 一致
+        self.cfg.dataset.render_hw           = None
+        # 原始高分辨率数据根目录（可选）
+        self.cfg.dataset.raw_data_root       = ''
         # __len__ 放大倍数
         self.cfg.dataset.train_boost         = 50
         self.cfg.dataset.val_boost           = 200
@@ -119,6 +123,20 @@ class ConfigStereoHuman:
         # 迭代深度精化 (DepthGRUCell，参考 Splat-SAP Translation)
         self.cfg.pagsplat.gru_iters     = 3    # GRU 迭代次数 (0=不使用 GRU)
         self.cfg.pagsplat.gru_hidden_ch = 64   # GRU 隐藏状态通道数
+        # DA3 小波细化与分层高斯分裂
+        self.cfg.pagsplat.wavelet_levels = 1
+        self.cfg.pagsplat.split_k_max = 4
+        self.cfg.pagsplat.loss_wavelet = 0.10
+        self.cfg.pagsplat.loss_split_sparse = 0.01
+        self.cfg.pagsplat.loss_child_consistency = 0.01
+        self.cfg.pagsplat.loss_da3_prior = 0.02
+        self.cfg.pagsplat.wavelet_high_weight = 1.0
+        self.cfg.pagsplat.wavelet_low_weight = 0.25
+        self.cfg.pagsplat.split_score_thresh = 0.20
+        self.cfg.pagsplat.child_weight_thresh = 0.10
+        self.cfg.pagsplat.split_topk_ratio = 0.01
+        self.cfg.pagsplat.refine_warmup_steps = 5000
+        self.cfg.pagsplat.da3_wavelet_prior_warmup_steps = 5000
 
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
