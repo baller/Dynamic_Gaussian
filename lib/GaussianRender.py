@@ -156,7 +156,8 @@ def pts2render_cags_per_level(data, bg_color, level: str = "all"):
             new_pts_valid = original_pts_valid
         elif level.startswith('drop_'):
             j = int(level.split('_', 1)[1])
-            assert 1 <= j <= per_level
+            if not (1 <= j <= per_level):
+                raise ValueError(f"level={level!r}: j={j} out of range 1..{per_level}")
             new_sub_valid = original_sub_valid & (sub_levels != j)
             new_pts_valid = original_pts_valid
         else:
