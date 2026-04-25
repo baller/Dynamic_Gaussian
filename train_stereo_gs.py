@@ -389,6 +389,32 @@ class StereoGSTrainer:
             data['novel_view']['img_pred'] = original_pred
             return None
 
+    def _log_wcvct_diagnostics(self, data):
+        """记录 ω 直方图与子高斯激活率（W-CVCT-GS 诊断指标）。"""
+        if not self.wcvct_enabled:
+            return
+        extras = data.get('_stereo_gs_extras', {})
+
+        # ω 直方图（左右两侧）
+        for view_key, prefix in (('cvct_left', 'L'), ('cvct_right', 'R')):
+            cvct_out = extras.get(view_key)
+            if cvct_out is not None:
+                omega = cvct_out['omega'].detach().flatten()
+                self.logger.writer.add_histogram(
+                    f'wcvct/omega_{prefix}', omega, self.total_steps)
+                self.logger.writer.add_scalar(
+                    f'wcvct/omega_{prefix}_mean', omega.mean().item(), self.total_steps)
+
+        # 各层级子高斯激活率
+        for view_key, prefix in (('split_weights_left', 'L'), ('split_weights_right', 'R')):
+            w = extras.get(view_key)
+            if w is None:
+                continue
+            for j in range(w.shape[1]):
+                rate = (w[:, j] > 0.1).float().mean().item()
+                self.logger.writer.add_scalar(
+                    f'wcvct/active_rate_{prefix}_k{j+1}', rate, self.total_steps)
+
     @staticmethod
     def _val_group_of(sample_name: str) -> str:
         """Classify a val sample into a dataset group for per-group visualization.
@@ -460,6 +486,11 @@ class StereoGSTrainer:
             log_dict[f'val_psnr_{g}'] = mean_g
             logging.info(f"  └ {g}: PSNR={mean_g:.4f}  (n={len(vs)})")
         self.logger.write_dict(log_dict, write_step=self.total_steps)
+        # ── W-CVCT-GS 诊断: 使用最后一次验证迭代的 data 记录 ω 直方图与激活率 ──
+        try:
+            self._log_wcvct_diagnostics(data)
+        except Exception as e:
+            logging.warning(f"[W-CVCT-GS] diagnostic log failed: {e}")
         torch.cuda.empty_cache()
 
     @staticmethod
