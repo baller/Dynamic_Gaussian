@@ -361,6 +361,12 @@ class StereoGSTrainer:
     def _compute_per_level_deltas(self, data):
         """通过 4 次渲染获取各子高斯层级的贡献图 ΔI_j（用于 L_disentangle）。
 
+        设计说明: 这 4 次渲染**不**经过 PostRefinement (后精化网络)，仅使用光栅化器
+        原始输出。原因: L_disentangle 作用于差值 ΔI_j = I_full - I_drop_j，
+        如果 refine_rendered 是非线性 UNet，差值上的 refine 偏置不会精确抵消，
+        会引入与频带无关的失真。保持 raw render 让 L_disentangle 仅约束高斯
+        参数本身的频域分工，与 refine 解耦。
+
         Phase A naive: 每步 4 次渲染。返回 [ΔI_1, ΔI_2, ΔI_3] 或 None（若失败）。
         """
         bg = self.cfg.dataset.bg_color
@@ -376,7 +382,9 @@ class StereoGSTrainer:
                 deltas.append(I_full - I_drop)
             data['novel_view']['img_pred'] = original_pred  # 恢复
             return deltas
-        except Exception as e:
+        except RuntimeError as e:
+            # 仅捕获 RuntimeError（涵盖 torch.cuda.OutOfMemoryError 等可恢复的运行时错误）
+            # KeyError / AttributeError / AssertionError 等编程错误应当让其传播
             logging.warning(f"[W-CVCT-GS] L_disentangle render failed: {e}; skipping")
             data['novel_view']['img_pred'] = original_pred
             return None
