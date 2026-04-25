@@ -26,7 +26,7 @@ from tqdm import tqdm
 from config.stereo_human_config import ConfigStereoHuman
 from lib.human_loader import StereoHumanDataset
 from lib.network import RtStereoHumanModel
-from lib.GaussianRender import pts2render
+from lib.GaussianRender import pts2render, pts2render_cags
 from lib.gs_utils.loss_utils import ssim
 from lib.gs_utils.image_utils import psnr
 
@@ -82,6 +82,8 @@ def main():
     cfg_obj = ConfigStereoHuman()
     cfg_obj.load(args.config)
     cfg = cfg_obj.get_cfg()
+    use_cags = getattr(cfg.stereo_gs, 'use_cags', False)
+    render_fn = pts2render_cags if use_cags else pts2render
 
     model = load_model(cfg, args.ckpt)
     use_post_refine = getattr(cfg.stereo_gs, 'use_post_refine', False)
@@ -103,13 +105,17 @@ def main():
             val_iter = iter(val_loader)
             data = next(val_iter)
 
-        for view in ['lmain', 'rmain']:
+        for view in ['lmain', 'rmain', 'novel_view']:
+            if view not in data:
+                continue
             for item in data[view]:
-                data[view][item] = data[view][item].cuda()
+                v = data[view][item]
+                if isinstance(v, torch.Tensor):
+                    data[view][item] = v.cuda()
 
         with torch.no_grad():
             data, _, _ = model(data, is_train=False)
-            data = pts2render(data, bg_color=cfg.dataset.bg_color)
+            data = render_fn(data, bg_color=cfg.dataset.bg_color)
             if use_post_refine:
                 data = model.stereo_gs_model.refine_rendered(data)
 

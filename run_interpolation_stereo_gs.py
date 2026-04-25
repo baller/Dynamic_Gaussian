@@ -43,7 +43,7 @@ from tqdm import tqdm
 from lib.human_loader import load_json_to_np
 from lib.network import RtStereoHumanModel
 from config.stereo_human_config import ConfigStereoHuman as config
-from lib.GaussianRender import pts2render
+from lib.GaussianRender import pts2render, pts2render_cags
 from lib.gs_utils.graphics_utils import getWorld2View2, getProjectionMatrix, focal2fov
 
 from scipy.spatial.transform import Rotation as Rot
@@ -131,8 +131,11 @@ def read_calib(calib, RS=1024):
     extr[:3, 3:] = T
     intr = np.zeros((3, 3))
     intr[:3, :3] = np.array(calib['K']).reshape((3, 3))
-    H = 2048
-    W = 1500
+    img_size = calib.get('imgSize', None)
+    if img_size is not None and tuple(img_size) != (RS, RS):
+        W, H = int(img_size[0]), int(img_size[1])
+    else:
+        W, H = 1500, 2048
     if W > H:
         intr[0, 2] -= (W - H) / 2
         intr[:2] *= RS / H
@@ -408,6 +411,9 @@ if __name__ == '__main__':
     signal.signal(signal.SIGTERM, _signal_handler)
 
     use_post_refine = getattr(cfg.stereo_gs, 'use_post_refine', False)
+    use_cags = getattr(cfg.stereo_gs, 'use_cags', False)
+    render_fn = pts2render_cags if use_cags else pts2render
+    logging.info(f'  渲染函数:     {"pts2render_cags (CAGS)" if use_cags else "pts2render"}')
 
     print('=' * 55)
     print('StereoGS 自由视角插值渲染')
@@ -463,7 +469,7 @@ if __name__ == '__main__':
                 logging.warning(f'帧 {fr_i} 文件缺失，跳过: {e}')
                 continue
 
-            data = pts2render(data, bg_color=cfg.dataset.bg_color)
+            data = render_fn(data, bg_color=cfg.dataset.bg_color)
 
             if use_post_refine:
                 data = render.model.stereo_gs_model.refine_rendered(data)

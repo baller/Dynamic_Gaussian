@@ -226,6 +226,21 @@ class StereoGSTrainer:
         self.save_ckpt(
             Path(f"{self.cfg.record.ckpt_path}/{self.cfg.name}_final.pth"))
 
+    @staticmethod
+    def _val_group_of(sample_name: str) -> str:
+        """Classify a val sample into a dataset group for per-group visualization.
+
+        - sample names like 's1a1_s1_0034' (head 's1aN' where N is digits) → 'official'
+        - sample names like 's1_0034'      (head 's1', i.e. no numeric letter) → 'hias'
+        - everything else falls back to 'other'.
+        """
+        head = sample_name.split('_')[0]
+        if head.startswith('s1a') and head[3:].isdigit():
+            return 'official'
+        if head == 's1':
+            return 'hias'
+        return 'other'
+
     def run_eval(self):
         use_post_refine = getattr(self.cfg.stereo_gs, 'use_post_refine', False)
         use_cags = getattr(self.cfg.stereo_gs, 'use_cags', False)
@@ -233,7 +248,19 @@ class StereoGSTrainer:
         logging.info(f"[step {self.total_steps}] 开始验证 ...")
         torch.cuda.empty_cache()
         psnr_list, ssim_list = [], []
-        show_idx = np.random.choice(list(range(self.len_val)), 1)
+        per_group_psnr: dict = {}
+
+        # Build groups → list of val-loader indices, one show idx per non-empty group
+        val_names = self.val_set.sample_list[:self.len_val]
+        groups: dict = {}
+        for i, n in enumerate(val_names):
+            groups.setdefault(self._val_group_of(n), []).append(i)
+        show_idx_per_group = {g: int(np.random.choice(idxs))
+                              for g, idxs in groups.items() if idxs}
+        idx_to_group = {sidx: g for g, sidx in show_idx_per_group.items()}
+        logging.info(f"[step {self.total_steps}] val groups = "
+                     f"{ {g: len(v) for g, v in groups.items()} };  "
+                     f"show idx per group = {show_idx_per_group}")
 
         for idx in range(self.len_val):
             data = self.fetch_data('val')
@@ -250,16 +277,26 @@ class StereoGSTrainer:
                 psnr_list.append(psnr_val.item())
                 ssim_list.append(ssim_val.item())
 
-                if idx == show_idx:
-                    self._save_eval_visuals(data)
+                this_name = data['novel_view'].get('sample_name', val_names[idx]) \
+                    if idx < len(val_names) else val_names[idx]
+                if isinstance(this_name, (list, tuple)):
+                    this_name = this_name[0]
+                this_group = self._val_group_of(this_name)
+                per_group_psnr.setdefault(this_group, []).append(psnr_val.item())
+
+                if idx in idx_to_group:
+                    self._save_eval_visuals(data, suffix=idx_to_group[idx])
 
         val_psnr = float(np.mean(psnr_list))
         val_ssim = float(np.mean(ssim_list))
         logging.info(
             f"[step {self.total_steps}] Val PSNR={val_psnr:.4f}  SSIM={val_ssim:.4f}")
-        self.logger.write_dict(
-            {'val_psnr': val_psnr, 'val_ssim': val_ssim},
-            write_step=self.total_steps)
+        log_dict = {'val_psnr': val_psnr, 'val_ssim': val_ssim}
+        for g, vs in per_group_psnr.items():
+            mean_g = float(np.mean(vs))
+            log_dict[f'val_psnr_{g}'] = mean_g
+            logging.info(f"  └ {g}: PSNR={mean_g:.4f}  (n={len(vs)})")
+        self.logger.write_dict(log_dict, write_step=self.total_steps)
         torch.cuda.empty_cache()
 
     @staticmethod
@@ -746,9 +783,12 @@ class StereoGSTrainer:
             cv2.imwrite(os.path.join(out_dir, "density.jpg"),
                         np.concatenate([dens_l, dens_r], axis=1)[:, :, ::-1])
 
-    def _save_eval_visuals(self, data):
+    def _save_eval_visuals(self, data, suffix: str = ''):
         step = self.total_steps
-        out_dir = os.path.join(self.cfg.record.show_path, str(step))
+        if suffix:
+            out_dir = os.path.join(self.cfg.record.show_path, str(step), suffix)
+        else:
+            out_dir = os.path.join(self.cfg.record.show_path, str(step))
         os.makedirs(out_dir, exist_ok=True)
 
         lm, rm, nv = data['lmain'], data['rmain'], data['novel_view']
@@ -822,7 +862,8 @@ class StereoGSTrainer:
         except Exception as e:
             logging.warning(f"[pcl_density] 可视化失败: {e}")
 
-        cv2.imwrite(os.path.join(self.cfg.record.show_path, f"{step}.jpg"),
+        snap_name = f"{step}_{suffix}.jpg" if suffix else f"{step}.jpg"
+        cv2.imwrite(os.path.join(self.cfg.record.show_path, snap_name),
                     np.concatenate([render_np, gt_np], axis=1)[:, :, ::-1])
 
     def fetch_data(self, phase):

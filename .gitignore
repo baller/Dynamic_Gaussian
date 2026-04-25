@@ -20,3 +20,4 @@ runs/
 *.log.json.gz.part.4
 *.log.json.gz.part.5
 *.engine
+experiments_old/

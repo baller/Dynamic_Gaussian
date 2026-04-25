@@ -42,8 +42,8 @@ class ConfigStereoHuman:
         # 目标输出分辨率 (H, W)；None 表示不 resize
         self.cfg.dataset.target_hw           = None
         # __len__ 放大倍数
-        self.cfg.dataset.train_boost         = 50
-        self.cfg.dataset.val_boost           = 200
+        self.cfg.dataset.train_boost         = 5
+        self.cfg.dataset.val_boost           = 2
         # 随机选输入视角的相机间隔约束（mini 格式）
         self.cfg.dataset.min_cam_gap         = 2
         self.cfg.dataset.max_cam_gap         = 12
