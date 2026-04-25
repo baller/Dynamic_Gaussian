@@ -1,11 +1,10 @@
 """Tests for per-level rendering wrapper used by L_disentangle.
 
-Marked CUDA-only because diff_gaussian_rasterization requires GPU.
+Some tests are CUDA-only (the helper exercises the rasterizer); the
+ValueError-on-bad-level test is pure-Python and runs on CPU.
 """
 import torch
 import pytest
-
-pytestmark = pytest.mark.cuda
 
 
 def _make_minimal_cags_data():
@@ -44,11 +43,13 @@ def _make_minimal_cags_data():
     return data
 
 
+@pytest.mark.cuda
 def test_pts2render_cags_per_level_signature():
     from lib.GaussianRender import pts2render_cags_per_level
     assert callable(pts2render_cags_per_level)
 
 
+@pytest.mark.cuda
 def test_pts2render_cags_per_level_levels_zero_through_three():
     """The 'level' argument must accept 0..3 and the values 'all' and 'no_level_j'."""
     from lib.GaussianRender import pts2render_cags_per_level
