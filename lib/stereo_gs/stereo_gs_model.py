@@ -103,6 +103,23 @@ class StereoGSModel(nn.Module):
             )
             logging.info("[StereoGS] Post-refinement enabled")
 
+        # ── W-CVCT-GS: CVCT color head ──
+        wcvct_cfg = getattr(cfg, 'wcvct', None)
+        self.wcvct_enabled = bool(getattr(wcvct_cfg, 'enable', False)) if wcvct_cfg else False
+        self.cvct = None
+        if self.wcvct_enabled and self.use_cags:
+            from lib.stereo_gs.cvct import CVCTModule
+            cvct_cfg = wcvct_cfg.cvct
+            self.cvct = CVCTModule(
+                fused_channels=adapt_dims[0],
+                shared_channels=stereo_gs_cfg.head_dim,
+                visibility_hidden=cvct_cfg.visibility_hidden,
+                residual_hidden=cvct_cfg.residual_hidden,
+                residual_bound=cvct_cfg.residual_bound,
+            )
+            self.cvct.set_identity(True)  # default to identity until trainer flips
+            logging.info(f"[W-CVCT-GS] CVCT enabled (residual_bound={cvct_cfg.residual_bound})")
+
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logging.info(f"[StereoGS] params total={total:,} trainable={trainable:,}")
@@ -170,6 +187,11 @@ class StereoGSModel(nn.Module):
 
     def freeze_bn(self):
         self.ffs_extractor.freeze_bn()
+
+    def set_cvct_identity(self, on: bool) -> None:
+        """切换 CVCT 的 identity 模式（由训练器按阶段调用）。"""
+        if self.cvct is not None:
+            self.cvct.set_identity(on)
 
     # ──────────────────────────────────────────────────────
     #  Legacy 管线
@@ -302,6 +324,23 @@ class StereoGSModel(nn.Module):
             image_or_feat=split_feat,
         )
 
+        # ── W-CVCT-GS: CVCT 颜色三角化 ──
+        if self.cvct is not None:
+            c_self = (view_data['img'] * 0.5 + 0.5).clamp(0, 1)
+            other_view_data = view_data['_cvct_other_view']  # 由 _forward_cags 注入
+            c_other = (other_view_data['img'] * 0.5 + 0.5).clamp(0, 1)
+            disp_self = ffs_feat.disparity  # 全分辨率视差
+            cvct_out = self.cvct(
+                fused_feat=fused_fullres, shared_feat=shared_feat,
+                confidence=conf_fullres,
+                c_self=c_self, c_other=c_other,
+                disparity=disp_self,
+            )
+            cvct_color_self = cvct_out['c_final']
+        else:
+            cvct_color_self = None
+            cvct_out = None
+
         return {
             'depth': depth,
             'rot_maps': head_out['rot'],
@@ -317,6 +356,8 @@ class StereoGSModel(nn.Module):
             'sub_rgb': split_out['sub_rgb'],
             'sub_valid': split_out['sub_valid'],
             'split_weights': split_out['split_weights'],
+            'cvct_color': cvct_color_self,        # (B, 3, H, W) or None
+            'cvct_out': cvct_out,                 # full dict for losses, or None
         }
 
     # ──────────────────────────────────────────────────────
@@ -371,10 +412,18 @@ class StereoGSModel(nn.Module):
         return data, None, {}
 
     def _forward_cags(self, data, ffs_left, ffs_right, Tf_x_abs, bs):
+        # 注入对侧视图引用 (供 CVCT 取 c_other 使用)
+        data['lmain']['_cvct_other_view'] = data['rmain']
+        data['rmain']['_cvct_other_view'] = data['lmain']
+
         left_result = self._process_single_view_cags(
             ffs_left, ffs_right, data['lmain'], Tf_x_abs, is_right_view=False)
         right_result = self._process_single_view_cags(
             ffs_right, ffs_left, data['rmain'], Tf_x_abs, is_right_view=True)
+
+        # 清理临时键
+        del data['lmain']['_cvct_other_view']
+        del data['rmain']['_cvct_other_view']
 
         for view_key, result in [('lmain', left_result), ('rmain', right_result)]:
             data[view_key]['depth_init'] = result['depth'].detach().clone()
@@ -392,6 +441,11 @@ class StereoGSModel(nn.Module):
             data[view_key]['sub_rgb'] = result['sub_rgb']
             data[view_key]['sub_valid'] = result['sub_valid']
 
+            if result.get('cvct_color') is not None:
+                # pts2render_cags expects img in [-1, 1] (它会用 *0.5+0.5 缩放)
+                data[view_key]['img'] = (result['cvct_color'] * 2.0 - 1.0).clamp(-1, 1)
+            # 子高斯 RGB 不变（继承父级颜色，由 splitter 已经填好）
+
         data['novel_view']['scale_regular'] = torch.mean(
             torch.stack([left_result['scale_maps'].mean(), right_result['scale_maps'].mean()])
         )
@@ -403,6 +457,9 @@ class StereoGSModel(nn.Module):
             'split_weights_left': left_result['split_weights'],
             'split_weights_right': right_result['split_weights'],
         }
+        if self.cvct is not None and left_result.get('cvct_out') is not None:
+            data['_stereo_gs_extras']['cvct_left']  = left_result['cvct_out']
+            data['_stereo_gs_extras']['cvct_right'] = right_result['cvct_out']
         return data, None, {}
 
     def refine_rendered(self, data: dict) -> dict:
