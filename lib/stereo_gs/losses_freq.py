@@ -61,3 +61,37 @@ def l_band(
             sg = log_compress(sub_gt, k=log_compress_k)
             loss = loss + w * F.l1_loss(sp, sg)
     return loss
+
+
+def l_active(
+    split_weights: torch.Tensor,
+    gt_image: torch.Tensor,
+    gt_levels: int = 3,
+) -> torch.Tensor:
+    """基于 GT 小波能量的子高斯分裂权重稀疏正则。
+
+    对每一层级 j，第 j 个子高斯只允许在 GT 含有 D_j 子带能量的位置激活。
+    L_active = Σ_j ‖ weights[:, j-1] · (1 − E_j_GT) ‖_1。
+
+    Args:
+        split_weights: (B, k_sub, H, W)，取值范围 [0, 1]，来自 LearnedSplitCriterion 的输出。
+            k_sub 必须等于 `gt_levels`。
+        gt_image: (B, 3, H, W)，GT 图像。
+        gt_levels: 使用的小波层级数 (默认 3)。
+
+    Returns:
+        标量张量。
+    """
+    B, k_sub, H, W = split_weights.shape
+    assert k_sub == gt_levels, f"k_sub={k_sub} must match gt_levels={gt_levels}"
+
+    gt_dwt, _ = _dwt3_padded(gt_image)
+    loss = split_weights.new_zeros(())
+    for j in range(1, gt_levels + 1):
+        e_j = band_energy(gt_dwt[f"D{j}"])  # (B, 1, h_j, w_j)
+        e_j_full = F.interpolate(e_j, size=(H, W), mode="bilinear", align_corners=False)
+        e_max = e_j_full.amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+        e_norm = (e_j_full / e_max).clamp(0, 1)
+        w_j = split_weights[:, j - 1 : j]
+        loss = loss + (w_j * (1.0 - e_norm)).abs().mean()
+    return loss
