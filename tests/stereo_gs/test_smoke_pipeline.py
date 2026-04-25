@@ -70,3 +70,39 @@ def test_loss_finite_in_each_phase():
         for k, v in m.items():
             if isinstance(v, (int, float)):
                 assert torch.isfinite(torch.tensor(float(v))), f'{k}={v} non-finite'
+
+
+def test_img_orig_is_preserved_when_cvct_overwrites_img():
+    """Regression for C1: when StereoGSModel.forward overwrites data[view]['img'] with CVCT
+    color, the original is preserved at data[view]['img_orig'].
+
+    This is verified by running one CVCT-enabled forward and asserting both keys exist.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    try:
+        tr = _build_trainer(num_steps=2, phase1_end=0, phase2_end=1)
+    except Exception as e:
+        pytest.skip(f'Cannot build trainer in test env: {e}')
+
+    # Force CVCT active mode on first step (phase 3 immediately)
+    tr.cfg.defrost()
+    tr.cfg.wcvct.schedule.phase1_end = 0
+    tr.cfg.wcvct.schedule.phase2_end = 0
+    tr.cfg.wcvct.fdsg.lambda_disentangle_warmup_steps = 0
+    tr.cfg.num_steps = 1
+    tr.cfg.freeze()
+
+    # Run one step
+    tr.train()
+
+    # After the step, fetch data and run forward to inspect the dict
+    data = tr.fetch_data('val')
+    with torch.no_grad():
+        data, _, _ = tr.model(data, is_train=False)
+    # img_orig should exist and differ from img (CVCT overwrites)
+    assert 'img_orig' in data['lmain'], "C1 regression: img_orig must be preserved before CVCT overwrite"
+    assert 'img_orig' in data['rmain']
+    # img should now be CVCT-overwritten (different from img_orig — at least via the clamp(-1,1) rebinding)
+    # A weaker check: shapes match
+    assert data['lmain']['img'].shape == data['lmain']['img_orig'].shape

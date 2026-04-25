@@ -284,6 +284,11 @@ class StereoGSTrainer:
                 and phase_state.lambda_omega == 0.0:
             return loss, logs
 
+        def _src_img(view_key):
+            """读取该视图的原始输入图像 (CVCT 启用时为 img_orig，否则为 img)。"""
+            v = data[view_key]
+            return v.get('img_orig', v['img'])
+
         gt = data['novel_view']['img'].cuda()
         pred = data['novel_view']['img_pred']
 
@@ -304,8 +309,8 @@ class StereoGSTrainer:
             wl = extras.get('split_weights_left')
             wr = extras.get('split_weights_right')
             if wl is not None and wr is not None:
-                gt_l = (data['lmain']['img'] * 0.5 + 0.5).clamp(0, 1)
-                gt_r = (data['rmain']['img'] * 0.5 + 0.5).clamp(0, 1)
+                gt_l = (_src_img('lmain') * 0.5 + 0.5).clamp(0, 1)
+                gt_r = (_src_img('rmain') * 0.5 + 0.5).clamp(0, 1)
                 La = 0.5 * (l_active(wl, gt_l) + l_active(wr, gt_r))
                 loss = loss + phase_state.lambda_active * La
                 logs['active'] = phase_state.lambda_active * La.item()
@@ -329,7 +334,7 @@ class StereoGSTrainer:
                 src_view = 'lmain' if prefix == 'l' else 'rmain'
                 if phase_state.lambda_cycle > 0:
                     Lc = l_cycle(
-                        c_self=(data[src_view]['img'] * 0.5 + 0.5).clamp(0, 1),
+                        c_self=(_src_img(src_view) * 0.5 + 0.5).clamp(0, 1),
                         c_other_warped=cvct_out['c_other_warped'],
                         omega=cvct_out['omega'],
                     )
@@ -343,7 +348,7 @@ class StereoGSTrainer:
                         if conf.shape[-1] != W:
                             conf = F.interpolate(conf, size=(H, W),
                                                  mode='bilinear', align_corners=False)
-                        c_self = (data[src_view]['img'] * 0.5 + 0.5).clamp(0, 1)
+                        c_self = (_src_img(src_view) * 0.5 + 0.5).clamp(0, 1)
                         target = build_omega_target(c_self, cvct_out['c_other_warped'], conf)
                         Lo = l_omega_align(
                             cvct_out['omega'], target,

@@ -442,6 +442,8 @@ class StereoGSModel(nn.Module):
             data[view_key]['sub_valid'] = result['sub_valid']
 
             if result.get('cvct_color') is not None:
+                # 在用 CVCT 颜色覆写 img 之前保留原图，供 L_active/L_cycle/L_omega 用作 GT
+                data[view_key]['img_orig'] = data[view_key]['img']
                 # pts2render_cags expects img in [-1, 1] (它会用 *0.5+0.5 缩放)
                 data[view_key]['img'] = (result['cvct_color'] * 2.0 - 1.0).clamp(-1, 1)
             # 子高斯 RGB 不变（继承父级颜色，由 splitter 已经填好）
