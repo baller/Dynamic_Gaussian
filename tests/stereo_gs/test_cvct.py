@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from lib.stereo_gs.cvct import VisibilityGate
+from lib.stereo_gs.cvct import VisibilityGate, ResidualHead
 
 
 def test_visibility_gate_output_shape_and_range():
@@ -26,3 +26,24 @@ def test_visibility_gate_gradient_flows():
     out = gate(fused, conf)
     out.sum().backward()
     assert fused.grad is not None and fused.grad.abs().sum() > 0
+
+
+def test_residual_head_output_within_bound():
+    head = ResidualHead(in_channels=64, hidden=16, bound=0.05)
+    feat = torch.randn(1, 64, 16, 16) * 100  # large input
+    delta = head(feat)
+    assert delta.shape == (1, 3, 16, 16)
+    assert delta.abs().max().item() <= 0.05 + 1e-6
+
+
+def test_residual_head_param_count_under_5k():
+    head = ResidualHead(in_channels=64, hidden=16, bound=0.05)
+    n = sum(p.numel() for p in head.parameters())
+    assert n < 5000
+
+
+def test_residual_head_zero_bound_returns_zero():
+    head = ResidualHead(in_channels=32, hidden=8, bound=0.0)
+    feat = torch.randn(1, 32, 4, 4)
+    delta = head(feat)
+    assert delta.abs().max().item() == 0.0

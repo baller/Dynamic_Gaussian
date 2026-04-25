@@ -45,3 +45,25 @@ class VisibilityGate(nn.Module):
         """
         x = torch.cat([fused_feat, confidence], dim=1)
         return torch.sigmoid(self.net(x))
+
+
+class ResidualHead(nn.Module):
+    """有界 RGB 残差 Δrgb ∈ [-ε, ε]。"""
+
+    def __init__(self, in_channels: int, hidden: int = 16, bound: float = 0.05):
+        super().__init__()
+        self.bound = float(bound)
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 3, kernel_size=1),
+        )
+
+    def forward(self, shared_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            shared_feat: (B, in_channels, H, W) — 来自 FullResGaussianHead 的共享特征。
+        Returns:
+            delta_rgb: (B, 3, H, W) ∈ [-bound, +bound]。
+        """
+        return torch.tanh(self.net(shared_feat)) * self.bound
