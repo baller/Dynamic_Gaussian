@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import warnings
 from torch.cuda.amp import GradScaler
@@ -37,6 +38,10 @@ from lib.human_loader import StereoHumanDataset
 from lib.network import RtStereoHumanModel
 from lib.train_recoder import Logger
 from lib.GaussianRender import pts2render, pts2render_cags
+from lib.GaussianRender import pts2render_cags_per_level
+from lib.stereo_gs.wcvct_schedule import WCVCTSchedule
+from lib.stereo_gs.losses_freq import l_band, l_active, l_disentangle
+from lib.stereo_gs.losses_cvct import l_cycle, l_omega_align, build_omega_target
 from lib.gs_utils.loss_utils import l1_loss, ssim
 from lib.gs_utils.image_utils import psnr
 from pytorch3d.loss import chamfer_distance
@@ -67,6 +72,26 @@ def stereo_gs_file_backup(exp_path: str, cfg, train_script: str) -> None:
 class StereoGSTrainer:
     def __init__(self, cfg):
         self.cfg = cfg
+        # ── W-CVCT-GS: 调度器与损失开关 ──
+        wcvct_cfg = getattr(cfg, 'wcvct', None)
+        self.wcvct_enabled = bool(getattr(wcvct_cfg, 'enable', False)) if wcvct_cfg else False
+        if self.wcvct_enabled:
+            self.wcvct_cfg = wcvct_cfg
+            self.wcvct_schedule = WCVCTSchedule(
+                phase1_end=wcvct_cfg.schedule.phase1_end,
+                phase2_end=wcvct_cfg.schedule.phase2_end,
+                lambda_band=wcvct_cfg.fdsg.lambda_band,
+                lambda_active=wcvct_cfg.fdsg.lambda_active,
+                lambda_disentangle=wcvct_cfg.fdsg.lambda_disentangle,
+                lambda_disentangle_warmup=wcvct_cfg.fdsg.lambda_disentangle_warmup,
+                lambda_disentangle_warmup_steps=wcvct_cfg.fdsg.lambda_disentangle_warmup_steps,
+                lambda_cycle=wcvct_cfg.cvct.lambda_cycle,
+                lambda_omega=wcvct_cfg.cvct.lambda_omega_align,
+            )
+            if wcvct_cfg.override_cags_sparsity:
+                logging.info('[W-CVCT-GS] overriding cags_sparsity_weight to 0 (replaced by L_active)')
+        else:
+            self.wcvct_schedule = None
         self.bs = cfg.batch_size
 
         logging.info("=== StereoGS Trainer 初始化 ===")
@@ -141,6 +166,14 @@ class StereoGSTrainer:
             self.optimizer.zero_grad()
             data = self.fetch_data('train')
 
+            phase_state = (
+                self.wcvct_schedule.state(self.total_steps)
+                if self.wcvct_schedule is not None else None
+            )
+            if phase_state is not None and hasattr(self.model, 'stereo_gs_model') \
+                    and hasattr(self.model.stereo_gs_model, 'set_cvct_identity'):
+                self.model.stereo_gs_model.set_cvct_identity(phase_state.cvct_identity_mode)
+
             data, _, metrics = self.model(data, is_train=True)
             data = render_fn(data, bg_color=self.cfg.dataset.bg_color)
 
@@ -154,7 +187,10 @@ class StereoGSTrainer:
             Lssim = 1.0 - ssim(render_novel, gt_novel)
             loss = 0.8 * Ll1 + 0.2 * Lssim
 
-            if use_cags:
+            # ── 原有 CAGS 稀疏正则（如启用 W-CVCT-GS 的 override_cags_sparsity 则跳过）──
+            sparsity_active = use_cags and not (
+                self.wcvct_enabled and self.wcvct_cfg.override_cags_sparsity)
+            if sparsity_active:
                 extras = data.get('_stereo_gs_extras', {})
                 wl = extras.get('split_weights_left')
                 wr = extras.get('split_weights_right')
@@ -163,6 +199,7 @@ class StereoGSTrainer:
                     loss = loss + sparsity_weight * L_sparse
                     log['sparse'] += sparsity_weight * L_sparse.item()
 
+            # ── 原有 Chamfer 距离损失 ──
             Lcd = torch.tensor(0.0, device='cuda')
             if chamfer_weight > 0:
                 for b_i in range(self.bs):
@@ -181,6 +218,16 @@ class StereoGSTrainer:
                 loss = loss + chamfer_weight * Lcd
                 log['chamfer'] += chamfer_weight * Lcd.item()
 
+            # ── W-CVCT-GS 新增损失 ──
+            wcvct_logs = {}
+            if phase_state is not None:
+                loss, wcvct_logs = self._add_wcvct_losses(loss, data, phase_state)
+            log.setdefault('band', 0.0); log['band'] += wcvct_logs.get('band', 0.0)
+            log.setdefault('active', 0.0); log['active'] += wcvct_logs.get('active', 0.0)
+            log.setdefault('dis', 0.0); log['dis'] += wcvct_logs.get('disentangle', 0.0)
+            log.setdefault('cycle', 0.0); log['cycle'] += wcvct_logs.get('cycle', 0.0)
+            log.setdefault('omega', 0.0); log['omega'] += wcvct_logs.get('omega', 0.0)
+
             log['l1'] += 0.8 * Ll1.item()
             log['ssim'] += 0.2 * Lssim.item()
 
@@ -188,6 +235,7 @@ class StereoGSTrainer:
                 metrics = {}
             metrics.update({'l1': Ll1.item(), 'ssim': Lssim.item(),
                             'chamfer': Lcd.item()})
+            metrics.update({f'wcvct_{k}': v for k, v in wcvct_logs.items()})
             self.logger.push(metrics)
 
             self.scaler.scale(loss).backward()
@@ -202,6 +250,8 @@ class StereoGSTrainer:
             if self.total_steps and self.total_steps % self.cfg.record.loss_freq == 0:
                 self.logger.writer.add_scalar(
                     'lr', self.optimizer.param_groups[0]['lr'], self.total_steps)
+                if phase_state is not None:
+                    self.logger.writer.add_scalar('wcvct/phase', phase_state.phase, self.total_steps)
 
             if self.total_steps and self.total_steps % LOG_PERIOD == 0:
                 msg = "  ".join(f"{k}={v / LOG_PERIOD:.4f}" for k, v in log.items())
@@ -225,6 +275,111 @@ class StereoGSTrainer:
         self.logger.close()
         self.save_ckpt(
             Path(f"{self.cfg.record.ckpt_path}/{self.cfg.name}_final.pth"))
+
+    def _add_wcvct_losses(self, loss, data, phase_state):
+        """计算并加上 W-CVCT-GS 各项损失；返回 (新 loss, 日志字典)。"""
+        logs = {}
+        if phase_state.lambda_band == 0.0 and phase_state.lambda_disentangle == 0.0 \
+                and phase_state.lambda_active == 0.0 and phase_state.lambda_cycle == 0.0 \
+                and phase_state.lambda_omega == 0.0:
+            return loss, logs
+
+        gt = data['novel_view']['img'].cuda()
+        pred = data['novel_view']['img_pred']
+
+        # L_band: 多带重建损失
+        if phase_state.lambda_band > 0:
+            Lb = l_band(
+                pred, gt,
+                ll_weight=self.wcvct_cfg.fdsg.ll_weight,
+                band_weights=tuple(self.wcvct_cfg.fdsg.band_weights),
+                log_compress_k=self.wcvct_cfg.fdsg.log_compress_k,
+            )
+            loss = loss + phase_state.lambda_band * Lb
+            logs['band'] = phase_state.lambda_band * Lb.item()
+
+        # L_active: GT 小波引导稀疏（替代原 cags_sparsity）
+        if phase_state.lambda_active > 0:
+            extras = data.get('_stereo_gs_extras', {})
+            wl = extras.get('split_weights_left')
+            wr = extras.get('split_weights_right')
+            if wl is not None and wr is not None:
+                gt_l = (data['lmain']['img'] * 0.5 + 0.5).clamp(0, 1)
+                gt_r = (data['rmain']['img'] * 0.5 + 0.5).clamp(0, 1)
+                La = 0.5 * (l_active(wl, gt_l) + l_active(wr, gt_r))
+                loss = loss + phase_state.lambda_active * La
+                logs['active'] = phase_state.lambda_active * La.item()
+
+        # L_disentangle: 子高斯频带特化损失（需要逐级渲染）
+        if phase_state.lambda_disentangle > 0:
+            deltas = self._compute_per_level_deltas(data)
+            if deltas is not None:
+                Ld = l_disentangle(
+                    deltas, log_compress_k=self.wcvct_cfg.fdsg.log_compress_k)
+                loss = loss + phase_state.lambda_disentangle * Ld
+                logs['disentangle'] = phase_state.lambda_disentangle * Ld.item()
+
+        # L_cycle 和 L_omega_align: 跨视图一致性 + 视见度软对齐
+        if phase_state.lambda_cycle > 0 or phase_state.lambda_omega > 0:
+            extras = data.get('_stereo_gs_extras', {})
+            for view_key, prefix in (('cvct_left', 'l'), ('cvct_right', 'r')):
+                cvct_out = extras.get(view_key)
+                if cvct_out is None:
+                    continue
+                src_view = 'lmain' if prefix == 'l' else 'rmain'
+                if phase_state.lambda_cycle > 0:
+                    Lc = l_cycle(
+                        c_self=(data[src_view]['img'] * 0.5 + 0.5).clamp(0, 1),
+                        c_other_warped=cvct_out['c_other_warped'],
+                        omega=cvct_out['omega'],
+                    )
+                    loss = loss + phase_state.lambda_cycle * Lc
+                    logs[f'cycle_{prefix}'] = phase_state.lambda_cycle * Lc.item()
+                if phase_state.lambda_omega > 0:
+                    conf_key = 'confidence_left' if prefix == 'l' else 'confidence_right'
+                    conf = extras.get(conf_key)
+                    if conf is not None:
+                        H, W = cvct_out['omega'].shape[-2:]
+                        if conf.shape[-1] != W:
+                            conf = F.interpolate(conf, size=(H, W),
+                                                 mode='bilinear', align_corners=False)
+                        c_self = (data[src_view]['img'] * 0.5 + 0.5).clamp(0, 1)
+                        target = build_omega_target(c_self, cvct_out['c_other_warped'], conf)
+                        Lo = l_omega_align(
+                            cvct_out['omega'], target,
+                            entropy_weight=self.wcvct_cfg.cvct.lambda_omega_entropy,
+                        )
+                        loss = loss + phase_state.lambda_omega * Lo
+                        logs[f'omega_{prefix}'] = phase_state.lambda_omega * Lo.item()
+        # 聚合左右视图各自的 cycle / omega 日志
+        for agg_key in ('cycle', 'omega'):
+            keys = [k for k in logs if k.startswith(agg_key + '_')]
+            if keys:
+                logs[agg_key] = sum(logs[k] for k in keys) / len(keys)
+        return loss, logs
+
+    def _compute_per_level_deltas(self, data):
+        """通过 4 次渲染获取各子高斯层级的贡献图 ΔI_j（用于 L_disentangle）。
+
+        Phase A naive: 每步 4 次渲染。返回 [ΔI_1, ΔI_2, ΔI_3] 或 None（若失败）。
+        """
+        bg = self.cfg.dataset.bg_color
+        # 暂存原渲染结果，避免被 4-render 流程覆盖
+        original_pred = data['novel_view']['img_pred']
+        try:
+            data = pts2render_cags_per_level(data, bg, level='all')
+            I_full = data['novel_view']['img_pred']
+            deltas = []
+            for j in (1, 2, 3):
+                data = pts2render_cags_per_level(data, bg, level=f'drop_{j}')
+                I_drop = data['novel_view']['img_pred']
+                deltas.append(I_full - I_drop)
+            data['novel_view']['img_pred'] = original_pred  # 恢复
+            return deltas
+        except Exception as e:
+            logging.warning(f"[W-CVCT-GS] L_disentangle render failed: {e}; skipping")
+            data['novel_view']['img_pred'] = original_pred
+            return None
 
     @staticmethod
     def _val_group_of(sample_name: str) -> str:
