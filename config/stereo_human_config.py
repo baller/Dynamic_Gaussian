@@ -156,6 +156,33 @@ class ConfigStereoHuman:
         self.cfg.stereo_gs.chamfer_n_samples = 10000
         self.cfg.stereo_gs.warp_padding_mode = 'zeros'
 
+        # ── W-CVCT-GS 配置项 ──
+        self.cfg.wcvct = CN()
+        self.cfg.wcvct.enable = False
+        self.cfg.wcvct.fdsg = CN()
+        self.cfg.wcvct.fdsg.wavelet_levels = 3
+        self.cfg.wcvct.fdsg.wavelet_type = 'haar'
+        self.cfg.wcvct.fdsg.band_weights = [0.3, 0.2, 0.1]
+        self.cfg.wcvct.fdsg.ll_weight = 0.4
+        self.cfg.wcvct.fdsg.lambda_band = 0.3
+        self.cfg.wcvct.fdsg.lambda_disentangle = 0.5
+        self.cfg.wcvct.fdsg.lambda_disentangle_warmup = 0.1
+        self.cfg.wcvct.fdsg.lambda_disentangle_warmup_steps = 5000
+        self.cfg.wcvct.fdsg.lambda_active = 0.05
+        self.cfg.wcvct.fdsg.log_compress_k = 10.0
+        self.cfg.wcvct.fdsg.use_per_level_render = False
+        self.cfg.wcvct.cvct = CN()
+        self.cfg.wcvct.cvct.residual_bound = 0.05
+        self.cfg.wcvct.cvct.visibility_hidden = 32
+        self.cfg.wcvct.cvct.residual_hidden = 16
+        self.cfg.wcvct.cvct.lambda_cycle = 0.2
+        self.cfg.wcvct.cvct.lambda_omega_align = 0.1
+        self.cfg.wcvct.cvct.lambda_omega_entropy = 0.01
+        self.cfg.wcvct.schedule = CN()
+        self.cfg.wcvct.schedule.phase1_end = 5000
+        self.cfg.wcvct.schedule.phase2_end = 30000
+        self.cfg.wcvct.override_cags_sparsity = True
+
         self.cfg.record = CN()
         self.cfg.record.ckpt_path = None
         self.cfg.record.show_path = None

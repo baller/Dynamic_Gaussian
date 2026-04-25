@@ -102,3 +102,29 @@ record:
   loss_freq: 100
   eval_freq: 500
   save_iter: 20000
+
+wcvct:
+  enable: true
+  fdsg:
+    wavelet_levels: 3
+    wavelet_type: 'haar'
+    band_weights: [0.3, 0.2, 0.1]
+    ll_weight: 0.4
+    lambda_band: 0.3
+    lambda_disentangle: 0.5
+    lambda_disentangle_warmup: 0.1
+    lambda_disentangle_warmup_steps: 5000
+    lambda_active: 0.05
+    log_compress_k: 10.0
+    use_per_level_render: false
+  cvct:
+    residual_bound: 0.05
+    visibility_hidden: 32
+    residual_hidden: 16
+    lambda_cycle: 0.2
+    lambda_omega_align: 0.1
+    lambda_omega_entropy: 0.01
+  schedule:
+    phase1_end: 5000
+    phase2_end: 30000
+  override_cags_sparsity: true
