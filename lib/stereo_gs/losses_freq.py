@@ -95,3 +95,34 @@ def l_active(
         w_j = split_weights[:, j - 1 : j]
         loss = loss + (w_j * (1.0 - e_norm)).abs().mean()
     return loss
+
+
+def l_disentangle(
+    delta_images: Sequence[torch.Tensor],
+    log_compress_k: float = 10.0,
+) -> torch.Tensor:
+    """逐层级子高斯频带特化损失。
+
+    对每个 j ∈ {1, 2, 3}，第 j 层级子高斯的贡献图 ΔI_j 应当完全集中在
+    细节子带 D_j 上；若其能量出现在 LL 或 D_{i≠j} 中则会被惩罚。
+
+    L_disentangle = Σ_j  (‖LL_Δ_j‖₁ + Σ_{i≠j} ‖D_i_Δ_j‖₁)   (在对数压缩空间中计算)
+
+    Args:
+        delta_images: 长度为 3 的列表，每个元素形状为 (B, 3, H, W)，依次为 [ΔI_1, ΔI_2, ΔI_3]。
+        log_compress_k: 对数压缩强度系数。
+
+    Returns:
+        标量张量。
+    """
+    assert len(delta_images) == 3
+    loss = delta_images[0].new_zeros(())
+    for j_idx, delta in enumerate(delta_images, start=1):
+        dwt, _ = _dwt3_padded(delta)
+        loss = loss + log_compress(dwt["LL"], k=log_compress_k).abs().mean()
+        for i in (1, 2, 3):
+            if i == j_idx:
+                continue
+            for sub in dwt[f"D{i}"]:
+                loss = loss + log_compress(sub, k=log_compress_k).abs().mean()
+    return loss
