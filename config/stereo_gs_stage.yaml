@@ -3,7 +3,7 @@ name: 'stereo_gs'
 lr: 0.0001
 wdecay: 1e-5
 batch_size: 1
-num_steps: 200000
+num_steps: 100000
 
 depth_mode: 'stereo_gs'
 
@@ -99,9 +99,9 @@ gsnet:
 
 # 记录配置
 record:
-  loss_freq: 100
+  loss_freq: 50
   eval_freq: 500
-  save_iter: 20000
+  save_iter: 10000
 
 wcvct:
   enable: true
@@ -125,6 +125,6 @@ wcvct:
     lambda_omega_align: 0.1
     lambda_omega_entropy: 0.01
   schedule:
-    phase1_end: 5000
-    phase2_end: 30000
+    phase1_end: 10000
+    phase2_end: 50000
   override_cags_sparsity: true

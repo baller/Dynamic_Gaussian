@@ -74,14 +74,22 @@ def warp_with_disparity(
     disp: torch.Tensor,
     padding_mode: str = "border",
 ) -> torch.Tensor:
-    """利用视差将*对侧视图*的图像 warp 到当前视图。
+    """利用有符号视差将*对侧视图*的图像 warp 到当前视图。
 
     与 lib.stereo_gs.cross_view_fusion.disparity_warp 行为一致，但作用于
-    原始 RGB 图像。假设已校正立体对，对应关系为 x_other = x_self - disp。
+    原始 RGB 图像。内部公式: src_x = grid_x - disp。
+
+    ⚠ 视差符号约定（必读）：
+        - 当 self=左视图、other=右视图时，传入的 disp 应为 +左视图视差（正值），
+          因为 x_right = x_left - disp_left。
+        - 当 self=右视图、other=左视图时，传入的 disp 应为 -右视图视差（负值），
+          因为 x_left = x_right + disp_right ⟹ src_x = grid_x - (-disp)。
+        调用方必须根据 is_right_view 自行翻转符号；本函数不会替你判断。
+        参见 stereo_gs_model._process_single_view_cags 中的 `disp_self = -... if is_right_view else ...`。
 
     Args:
         img:  (B, 3, H, W) 对侧视图的 RGB。
-        disp: (B, 1, H, W) 当前视图处的视差 (像素单位)。
+        disp: (B, 1, H, W) 当前视图处的有符号视差 (像素单位)。
         padding_mode: 'zeros' | 'border' | 'reflection'。
 
     Returns:
@@ -101,8 +109,12 @@ def warp_with_disparity(
 class CVCTModule(nn.Module):
     """跨视图颜色三角化: c_final = ω·c_self + (1-ω)·c_other_warp + Δrgb。
 
-    `set_identity(True)` 将 ω 钳制为 0.5 且 Δrgb 置零 (用于训练计划的 Phase 1
-    与 Phase 2，此时 CVCT 不应干扰 FDSG 的学习)。
+    `set_identity(True)` 将 ω 钳制为 1.0 且 Δrgb 置零，使 c_final ≡ c_self
+    (用于训练计划的 Phase 1 与 Phase 2，此时 CVCT 不应干扰 FDSG 的学习)。
+
+    历史教训：曾用 ω=0.5 表示 identity，但这会让 c_final 始终是
+    0.5·c_self + 0.5·c_other_warped，下游 `data[view]['img']` 一旦被覆写就
+    永远是混合图（即便 warp 完美也是半透明叠加），训练时无法获得清晰输入。
     """
 
     def __init__(
@@ -141,7 +153,8 @@ class CVCTModule(nn.Module):
             confidence:  (B, 1, H, W).
             c_self:      (B, 3, H, W) 本视图 RGB，∈ [0, 1]。
             c_other:     (B, 3, H, W) 对侧视图 RGB，∈ [0, 1]。
-            disparity:   (B, 1, H, W) 本视图视差 (正值)。
+            disparity:   (B, 1, H, W) 有符号视差 (左视图传 +disp，右视图传 -disp)。
+                         详见 `warp_with_disparity` 文档字符串中的视差符号约定。
 
         Returns 字典，包含:
             'c_final':         (B, 3, H, W) ∈ [0, 1]
@@ -152,7 +165,8 @@ class CVCTModule(nn.Module):
         c_other_warped = warp_with_disparity(c_other, disparity, padding_mode="border")
 
         if self._identity_mode:
-            omega = torch.full_like(confidence, 0.5)
+            # ω=1.0 → c_final = c_self（不引入混合污染）
+            omega = torch.ones_like(confidence)
             delta_rgb = torch.zeros_like(c_self)
         else:
             omega = self.gate(fused_feat, confidence)

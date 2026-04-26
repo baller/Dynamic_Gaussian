@@ -329,7 +329,12 @@ class StereoGSModel(nn.Module):
             c_self = (view_data['img'] * 0.5 + 0.5).clamp(0, 1)
             other_view_data = view_data['_cvct_other_view']  # 由 _forward_cags 注入
             c_other = (other_view_data['img'] * 0.5 + 0.5).clamp(0, 1)
-            disp_self = ffs_feat.disparity  # 全分辨率视差
+            # 视差符号约定与 cross_view_fusion 完全一致：
+            #   - 左视图 (self=L, other=R)，warp R→L 用 +disp（x_R = x_L - disp）
+            #   - 右视图 (self=R, other=L)，warp L→R 需要 -disp（x_L = x_R + disp）
+            # 旧代码 disp_self = ffs_feat.disparity 没翻转符号，导致右视图 c_other_warped
+            # 朝错误方向位移，c_final = ω·c_self + (1-ω)·c_other_warped 出现重影。
+            disp_self = -ffs_feat.disparity if is_right_view else ffs_feat.disparity
             cvct_out = self.cvct(
                 fused_feat=fused_fullres, shared_feat=shared_feat,
                 confidence=conf_fullres,

@@ -800,8 +800,10 @@ class StereoGSTrainer:
 
         # ── 4. 保存点云 PLY 文件 ──
         def _get_rgb(view_key):
-            img = data[view_key]['img'][idx]           # (3, H, W) in [-1, 1]
-            valid = data[view_key]['pts_valid'][idx]   # (H*W,)
+            # 取原始输入颜色（CVCT 启用时 img 被覆写，img_orig 保留输入）
+            v = data[view_key]
+            img = v.get('img_orig', v['img'])[idx]     # (3, H, W) in [-1, 1]
+            valid = v['pts_valid'][idx]                # (H*W,)
             rgb = (img * 0.5 + 0.5).clamp(0, 1).permute(1, 2, 0).reshape(-1, 3)
             return rgb[valid]
 
@@ -1008,8 +1010,11 @@ class StereoGSTrainer:
             return np.pad(row, ((0, 0), (left, pad - left), (0, 0)),
                           mode='constant', constant_values=255)
 
-        img_l = self._t2np(lm['img'] * 0.5 + 0.5)
-        img_r = self._t2np(rm['img'] * 0.5 + 0.5)
+        # 使用 img_orig（若 CVCT 覆写过 img）保证显示真正的输入而不是 CVCT 输出
+        lm_input = lm.get('img_orig', lm['img'])
+        rm_input = rm.get('img_orig', rm['img'])
+        img_l = self._t2np(lm_input * 0.5 + 0.5)
+        img_r = self._t2np(rm_input * 0.5 + 0.5)
         render_np = self._t2np(render_novel)
         gt_np = self._t2np(gt_novel)
 
