@@ -67,6 +67,7 @@ stereo_gs:
   confidence_alpha: 0.3
   confidence_beta: 0.3
   max_scale: 0.003
+  cags_depth_residual_bound: 0.5
 
   # Stage 5: 高斯超分 (Legacy 模式)
   # 可选: 'convex' | 'split'

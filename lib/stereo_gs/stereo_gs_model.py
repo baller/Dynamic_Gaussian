@@ -16,7 +16,7 @@ CAGS (use_cags=True):
   Stage 1: FFS 前向 (冻结) → 骨干特征 + 视差 + 代价体
   Stage 2: 特征适配 (1x1 conv)
   Stage 3: 跨视图融合
-  Stage 4: 全分辨率高斯属性预测 (FullResGaussianHead)
+  Stage 4: 全分辨率高斯属性预测 (FullResGaussianHead + depth residual)
   Stage 5: 自适应高斯分裂 (AdaptiveSplitter)
   Stage 6: 高斯光栅化 (pts2render_cags)
   Stage 7: 渲染后精化
@@ -136,6 +136,7 @@ class StereoGSModel(nn.Module):
             confidence_alpha=stereo_gs_cfg.confidence_alpha,
             confidence_beta=stereo_gs_cfg.confidence_beta,
             max_scale=stereo_gs_cfg.max_scale,
+            max_depth_residual=getattr(stereo_gs_cfg, 'cags_depth_residual_bound', 0.5),
         )
         sr_mode = stereo_gs_cfg.sr_mode
         self.upsampler = build_upsampler(
@@ -297,8 +298,9 @@ class StereoGSModel(nn.Module):
         head_out = self.fullres_head(head_input, conf_fullres)
         shared_feat = head_out.pop('_shared_feat')
 
-        # 深度直接来自 FFS 全分辨率视差
+        # FFS 输出 inverse depth；残差也在 inverse-depth 空间中学习。
         depth = ffs_feat.disparity / Tf_x_abs
+        depth = (depth + head_out['depth_residual']).clamp(min=1e-6)
 
         # Stage 5: 自适应高斯分裂
         bs = B
@@ -351,6 +353,7 @@ class StereoGSModel(nn.Module):
             'rot_maps': head_out['rot'],
             'scale_maps': head_out['scale'],
             'opacity_maps': head_out['opacity'],
+            'depth_residual': head_out['depth_residual'],
             'confidence': confidence_1_4,
             'xyz': xyz,
             'pts_valid': pts_valid,
@@ -436,6 +439,7 @@ class StereoGSModel(nn.Module):
             data[view_key]['rot_maps'] = result['rot_maps']
             data[view_key]['scale_maps'] = result['scale_maps']
             data[view_key]['opacity_maps'] = result['opacity_maps']
+            data[view_key]['depth_residual'] = result['depth_residual']
             data[view_key]['xyz'] = result['xyz']
             data[view_key]['pts_valid'] = result['pts_valid']
 
