@@ -66,8 +66,8 @@ stereo_gs:
   head_dim: 64
   confidence_alpha: 0.6
   confidence_beta: 0.6
-  max_scale: 0.02
-  cags_depth_residual_bound: 0.1
+  max_scale: 0.003
+  cags_depth_residual_bound: 0.0
   # 深度残差正则化
   depth_regularization:
     enable: true

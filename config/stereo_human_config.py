@@ -142,6 +142,11 @@ class ConfigStereoHuman:
         self.cfg.stereo_gs.confidence_beta = 0.3
         self.cfg.stereo_gs.max_scale = 0.003
         self.cfg.stereo_gs.cags_depth_residual_bound = 0.5
+        self.cfg.stereo_gs.depth_regularization = CN()
+        self.cfg.stereo_gs.depth_regularization.enable = False
+        self.cfg.stereo_gs.depth_regularization.lambda_smooth = 0.01
+        self.cfg.stereo_gs.depth_regularization.lambda_anchor = 0.05
+        self.cfg.stereo_gs.novel_loss_ignore_border = 0
         self.cfg.stereo_gs.sr_mode = 'convex'
         self.cfg.stereo_gs.use_post_refine = True
         self.cfg.stereo_gs.refine_hidden = 32
@@ -170,6 +175,8 @@ class ConfigStereoHuman:
         self.cfg.wcvct.fdsg.lambda_disentangle_warmup = 0.1
         self.cfg.wcvct.fdsg.lambda_disentangle_warmup_steps = 5000
         self.cfg.wcvct.fdsg.lambda_active = 0.05
+        self.cfg.wcvct.fdsg.active_mode = 'symmetric'
+        self.cfg.wcvct.fdsg.active_min_activation = 0.0
         self.cfg.wcvct.fdsg.log_compress_k = 10.0
         self.cfg.wcvct.fdsg.use_per_level_render = False
         self.cfg.wcvct.cvct = CN()
@@ -182,6 +189,7 @@ class ConfigStereoHuman:
         self.cfg.wcvct.schedule = CN()
         self.cfg.wcvct.schedule.phase1_end = 5000
         self.cfg.wcvct.schedule.phase2_end = 30000
+        self.cfg.wcvct.schedule.cvct_warmup_steps = 2000
         self.cfg.wcvct.override_cags_sparsity = True
 
         self.cfg.record = CN()

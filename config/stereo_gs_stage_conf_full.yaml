@@ -64,9 +64,9 @@ stereo_gs:
   # 可选: 'peak' | 'entropy' | 'learned'
   confidence_mode: 'learned'
   head_dim: 64
-  confidence_alpha: 0.6
-  confidence_beta: 0.6
-  max_scale: 0.02
+  confidence_alpha: 1.0
+  confidence_beta: 1.0
+  max_scale: 0.003
   cags_depth_residual_bound: 0.1
   # 深度残差正则化
   depth_regularization:

@@ -194,6 +194,11 @@ class StereoGSModel(nn.Module):
         if self.cvct is not None:
             self.cvct.set_identity(on)
 
+    def set_cvct_blend(self, blend: float) -> None:
+        """设置 CVCT warmup 插值系数（由训练器按步调用）。"""
+        if self.cvct is not None:
+            self.cvct.set_blend(blend)
+
     # ──────────────────────────────────────────────────────
     #  Legacy 管线
     # ──────────────────────────────────────────────────────

@@ -129,12 +129,17 @@ class CVCTModule(nn.Module):
         self.gate = VisibilityGate(in_channels=fused_channels, hidden=visibility_hidden)
         self.residual = ResidualHead(in_channels=shared_channels, hidden=residual_hidden, bound=residual_bound)
         self._identity_mode = False
+        self._blend = 0.0         # 0.0=full CVCT, 1.0=identity (warmup 插值)
 
     def set_identity(self, on: bool) -> None:
         self._identity_mode = bool(on)
 
     def is_identity(self) -> bool:
         return self._identity_mode
+
+    def set_blend(self, blend: float) -> None:
+        """Set CVCT warmup blend factor. 1.0 = identity, 0.0 = full CVCT."""
+        self._blend = float(blend)
 
     def forward(
         self,
@@ -169,8 +174,14 @@ class CVCTModule(nn.Module):
             omega = torch.ones_like(confidence)
             delta_rgb = torch.zeros_like(c_self)
         else:
-            omega = self.gate(fused_feat, confidence)
-            delta_rgb = self.residual(shared_feat)
+            omega_learned = self.gate(fused_feat, confidence)
+            delta_learned = self.residual(shared_feat)
+            if self._blend > 0:
+                omega = self._blend * torch.ones_like(confidence) + (1.0 - self._blend) * omega_learned
+                delta_rgb = (1.0 - self._blend) * delta_learned
+            else:
+                omega = omega_learned
+                delta_rgb = delta_learned
 
         c_final = omega * c_self + (1.0 - omega) * c_other_warped + delta_rgb
         c_final = c_final.clamp(0.0, 1.0)

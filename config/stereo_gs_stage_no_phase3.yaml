@@ -66,7 +66,7 @@ stereo_gs:
   head_dim: 64
   confidence_alpha: 0.6
   confidence_beta: 0.6
-  max_scale: 0.02
+  max_scale: 0.003
   cags_depth_residual_bound: 0.1
   # 深度残差正则化
   depth_regularization:
@@ -136,6 +136,6 @@ wcvct:
     lambda_omega_entropy: 0.01
   schedule:
     phase1_end: 10000
-    phase2_end: 50000
+    phase2_end: 110000
     cvct_warmup_steps: 2000
   override_cags_sparsity: true

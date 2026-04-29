@@ -67,17 +67,25 @@ def l_active(
     split_weights: torch.Tensor,
     gt_image: torch.Tensor,
     gt_levels: int = 3,
+    mode: str = "symmetric",
+    min_activation: float = 0.0,
 ) -> torch.Tensor:
-    """基于 GT 小波能量的子高斯分裂权重稀疏正则。
+    """基于 GT 小波能量的子高斯分裂权重正则。
 
-    对每一层级 j，第 j 个子高斯只允许在 GT 含有 D_j 子带能量的位置激活。
-    L_active = Σ_j ‖ weights[:, j-1] · (1 − E_j_GT) ‖_1。
+    支持两种模式:
+      - "symmetric":    L_active = Σ_j ‖ w_j − E_j_norm ‖₁（对称对齐，推荐）
+      - "penalty_only": L_active = Σ_j ‖ w_j · (1 − E_j_norm) ‖₁（legacy 单向惩罚）
+
+    对称模式鼓励 w_j 跟踪 GT 频带能量分布：高频区激活、平坦区稀疏。
+    min_activation > 0 时追加 hinge loss 防止权重全零塌缩。
 
     Args:
-        split_weights: (B, k_sub, H, W)，取值范围 [0, 1]，来自 LearnedSplitCriterion 的输出。
+        split_weights: (B, k_sub, H, W)，取值范围 [0, 1]。
             k_sub 必须等于 `gt_levels`。
         gt_image: (B, 3, H, W)，GT 图像。
         gt_levels: 使用的小波层级数 (默认 3)。
+        mode: "symmetric" | "penalty_only"
+        min_activation: 全局最低平均激活率，0 表示不生效。
 
     Returns:
         标量张量。
@@ -93,7 +101,13 @@ def l_active(
         e_max = e_j_full.amax(dim=(2, 3), keepdim=True).clamp(min=1e-6)
         e_norm = (e_j_full / e_max).clamp(0, 1)
         w_j = split_weights[:, j - 1 : j]
-        loss = loss + (w_j * (1.0 - e_norm)).abs().mean()
+        if mode == "penalty_only":
+            loss = loss + (w_j * (1.0 - e_norm)).abs().mean()
+        else:  # symmetric
+            loss = loss + (w_j - e_norm).abs().mean()
+    if min_activation > 0:
+        loss = loss + min_activation * F.relu(
+            min_activation - split_weights.mean())
     return loss
 
 
@@ -126,3 +140,38 @@ def l_disentangle(
             for sub in dwt[f"D{i}"]:
                 loss = loss + log_compress(sub, k=log_compress_k).abs().mean()
     return loss
+
+
+def l_depth_smooth(depth_residual: torch.Tensor, image: torch.Tensor) -> torch.Tensor:
+    """Edge-aware TV smoothness on inverse-depth residual.
+
+    Penalizes spatial variation in flat regions more heavily than at edges.
+
+    Args:
+        depth_residual: (B, 1, H, W) inverse-depth residual.
+        image: (B, 3, H, W) RGB in [0, 1].
+
+    Returns:
+        scalar tensor.
+    """
+    dx = (depth_residual[..., :-1] - depth_residual[..., 1:]).abs().mean()
+    dy = (depth_residual[..., :-1, :] - depth_residual[..., 1:, :]).abs().mean()
+    img_gray = image.mean(dim=1, keepdim=True)
+    img_dx = (img_gray[..., :-1] - img_gray[..., 1:]).abs()
+    img_dy = (img_gray[..., :-1, :] - img_gray[..., 1:, :]).abs()
+    wx = torch.exp(-img_dx * 5.0).detach()
+    wy = torch.exp(-img_dy * 5.0).detach()
+    return (dx * wx.mean() + dy * wy.mean()) * 0.5
+
+
+def l_depth_anchor(depth: torch.Tensor, depth_ffs: torch.Tensor) -> torch.Tensor:
+    """L2 anchor: keep refined depth close to FFS initial depth.
+
+    Args:
+        depth: (B, 1, H, W) refined inverse depth.
+        depth_ffs: (B, 1, H, W) FFS initial inverse depth.
+
+    Returns:
+        scalar tensor.
+    """
+    return F.mse_loss(depth, depth_ffs)

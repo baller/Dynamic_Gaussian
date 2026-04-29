@@ -41,8 +41,14 @@ from lib.GaussianRender import pts2render, pts2render_cags
 from lib.GaussianRender import pts2render_cags_per_level
 from lib.stereo_gs.wcvct_schedule import WCVCTSchedule
 from lib.stereo_gs.losses_freq import l_band, l_active, l_disentangle
+from lib.stereo_gs.losses_freq import l_depth_smooth, l_depth_anchor
 from lib.stereo_gs.losses_cvct import l_cycle, l_omega_align, build_omega_target
-from lib.gs_utils.loss_utils import l1_loss, ssim
+from lib.stereo_gs.loss_masks import (
+    apply_loss_mask,
+    build_border_ignore_mask,
+    masked_l1_loss,
+)
+from lib.gs_utils.loss_utils import ssim
 from lib.gs_utils.image_utils import psnr
 from pytorch3d.loss import chamfer_distance
 
@@ -87,6 +93,7 @@ class StereoGSTrainer:
                 lambda_disentangle_warmup_steps=wcvct_cfg.fdsg.lambda_disentangle_warmup_steps,
                 lambda_cycle=wcvct_cfg.cvct.lambda_cycle,
                 lambda_omega=wcvct_cfg.cvct.lambda_omega_align,
+                cvct_warmup_steps=getattr(wcvct_cfg.schedule, 'cvct_warmup_steps', 2000),
             )
             if wcvct_cfg.override_cags_sparsity:
                 logging.info('[W-CVCT-GS] overriding cags_sparsity_weight to 0 (replaced by L_active)')
@@ -154,6 +161,7 @@ class StereoGSTrainer:
         sparsity_weight = getattr(self.cfg.stereo_gs, 'cags_sparsity_weight', 0.01)
         chamfer_weight = getattr(self.cfg.stereo_gs, 'chamfer_weight', 0.0)
         n_chamfer = getattr(self.cfg.stereo_gs, 'chamfer_n_samples', 10000)
+        novel_loss_ignore_border = getattr(self.cfg.stereo_gs, 'novel_loss_ignore_border', 0)
         render_fn = pts2render_cags if use_cags else pts2render
         log = dict(l1=0.0, ssim=0.0)
         if use_cags:
@@ -170,9 +178,12 @@ class StereoGSTrainer:
                 self.wcvct_schedule.state(self.total_steps)
                 if self.wcvct_schedule is not None else None
             )
-            if phase_state is not None and hasattr(self.model, 'stereo_gs_model') \
-                    and hasattr(self.model.stereo_gs_model, 'set_cvct_identity'):
-                self.model.stereo_gs_model.set_cvct_identity(phase_state.cvct_identity_mode)
+            if phase_state is not None and hasattr(self.model, 'stereo_gs_model'):
+                gs_model = self.model.stereo_gs_model
+                if hasattr(gs_model, 'set_cvct_identity'):
+                    gs_model.set_cvct_identity(phase_state.cvct_identity_mode)
+                if hasattr(gs_model, 'set_cvct_blend'):
+                    gs_model.set_cvct_blend(phase_state.cvct_blend)
 
             data, _, metrics = self.model(data, is_train=True)
             data = render_fn(data, bg_color=self.cfg.dataset.bg_color)
@@ -182,9 +193,12 @@ class StereoGSTrainer:
 
             render_novel = data['novel_view']['img_pred']
             gt_novel = data['novel_view']['img'].cuda()
+            novel_loss_mask = build_border_ignore_mask(
+                render_novel, novel_loss_ignore_border)
+            render_novel_loss = apply_loss_mask(render_novel, gt_novel, novel_loss_mask)
 
-            Ll1 = l1_loss(render_novel, gt_novel)
-            Lssim = 1.0 - ssim(render_novel, gt_novel)
+            Ll1 = masked_l1_loss(render_novel, gt_novel, novel_loss_mask)
+            Lssim = 1.0 - ssim(render_novel_loss, gt_novel)
             loss = 0.8 * Ll1 + 0.2 * Lssim
 
             # ── 原有 CAGS 稀疏正则（如启用 W-CVCT-GS 的 override_cags_sparsity 则跳过）──
@@ -221,12 +235,34 @@ class StereoGSTrainer:
             # ── W-CVCT-GS 新增损失 ──
             wcvct_logs = {}
             if phase_state is not None:
-                loss, wcvct_logs = self._add_wcvct_losses(loss, data, phase_state)
+                loss, wcvct_logs = self._add_wcvct_losses(
+                    loss, data, phase_state, novel_loss_mask=novel_loss_mask)
             log.setdefault('band', 0.0); log['band'] += wcvct_logs.get('band', 0.0)
             log.setdefault('active', 0.0); log['active'] += wcvct_logs.get('active', 0.0)
             log.setdefault('dis', 0.0); log['dis'] += wcvct_logs.get('disentangle', 0.0)
             log.setdefault('cycle', 0.0); log['cycle'] += wcvct_logs.get('cycle', 0.0)
             log.setdefault('omega', 0.0); log['omega'] += wcvct_logs.get('omega', 0.0)
+
+            # ── 深度残差正则（全阶段生效，独立于 W-CVCT 阶段调度）──
+            depth_reg_cfg = getattr(self.cfg.stereo_gs, 'depth_regularization', None)
+            if depth_reg_cfg is not None and getattr(depth_reg_cfg, 'enable', False):
+                log.setdefault('depth_reg', 0.0)
+                for view_key in ('lmain', 'rmain'):
+                    if 'depth_residual' not in data[view_key]:
+                        continue
+                    d_res = data[view_key]['depth_residual']
+                    d_full = data[view_key]['depth']
+                    d_init = data[view_key].get('depth_init')
+                    img_src = data[view_key].get('img_orig', data[view_key]['img'])
+                    img_01 = img_src * 0.5 + 0.5
+                    if getattr(depth_reg_cfg, 'lambda_smooth', 0.0) > 0:
+                        L_ds = l_depth_smooth(d_res, img_01.clamp(0, 1))
+                        loss = loss + depth_reg_cfg.lambda_smooth * L_ds
+                        log['depth_reg'] += depth_reg_cfg.lambda_smooth * L_ds.item()
+                    if d_init is not None and getattr(depth_reg_cfg, 'lambda_anchor', 0.0) > 0:
+                        L_da = l_depth_anchor(d_full, d_init)
+                        loss = loss + depth_reg_cfg.lambda_anchor * L_da
+                        log['depth_reg'] += depth_reg_cfg.lambda_anchor * L_da.item()
 
             log['l1'] += 0.8 * Ll1.item()
             log['ssim'] += 0.2 * Lssim.item()
@@ -234,7 +270,8 @@ class StereoGSTrainer:
             if metrics is None:
                 metrics = {}
             metrics.update({'l1': Ll1.item(), 'ssim': Lssim.item(),
-                            'chamfer': Lcd.item()})
+                            'chamfer': Lcd.item(),
+                            'novel_loss_valid_ratio': novel_loss_mask.mean().item()})
             metrics.update({f'wcvct_{k}': v for k, v in wcvct_logs.items()})
             self.logger.push(metrics)
 
@@ -276,7 +313,7 @@ class StereoGSTrainer:
         self.save_ckpt(
             Path(f"{self.cfg.record.ckpt_path}/{self.cfg.name}_final.pth"))
 
-    def _add_wcvct_losses(self, loss, data, phase_state):
+    def _add_wcvct_losses(self, loss, data, phase_state, novel_loss_mask=None):
         """计算并加上 W-CVCT-GS 各项损失；返回 (新 loss, 日志字典)。"""
         logs = {}
         if phase_state.lambda_band == 0.0 and phase_state.lambda_disentangle == 0.0 \
@@ -291,11 +328,15 @@ class StereoGSTrainer:
 
         gt = data['novel_view']['img'].cuda()
         pred = data['novel_view']['img_pred']
+        if novel_loss_mask is None:
+            novel_loss_mask = build_border_ignore_mask(
+                pred, getattr(self.cfg.stereo_gs, 'novel_loss_ignore_border', 0))
+        pred_recon = apply_loss_mask(pred, gt, novel_loss_mask)
 
         # L_band: 多带重建损失
         if phase_state.lambda_band > 0:
             Lb = l_band(
-                pred, gt,
+                pred_recon, gt,
                 ll_weight=self.wcvct_cfg.fdsg.ll_weight,
                 band_weights=tuple(self.wcvct_cfg.fdsg.band_weights),
                 log_compress_k=self.wcvct_cfg.fdsg.log_compress_k,
@@ -311,7 +352,11 @@ class StereoGSTrainer:
             if wl is not None and wr is not None:
                 gt_l = (_src_img('lmain') * 0.5 + 0.5).clamp(0, 1)
                 gt_r = (_src_img('rmain') * 0.5 + 0.5).clamp(0, 1)
-                La = 0.5 * (l_active(wl, gt_l) + l_active(wr, gt_r))
+                active_mode = getattr(self.wcvct_cfg.fdsg, 'active_mode', 'symmetric')
+                active_min = getattr(self.wcvct_cfg.fdsg, 'active_min_activation', 0.0)
+                La = 0.5 * (
+                    l_active(wl, gt_l, mode=active_mode, min_activation=active_min) +
+                    l_active(wr, gt_r, mode=active_mode, min_activation=active_min))
                 loss = loss + phase_state.lambda_active * La
                 logs['active'] = phase_state.lambda_active * La.item()
 
@@ -419,6 +464,17 @@ class StereoGSTrainer:
                 rate = (w[:, j] > 0.1).float().mean().item()
                 self.logger.writer.add_scalar(
                     f'wcvct/active_rate_{prefix}_k{j+1}', rate, self.total_steps)
+
+        # 深度残差统计
+        for view_key, prefix in (('lmain', 'L'), ('rmain', 'R')):
+            d_res = data[view_key].get('depth_residual')
+            if d_res is not None:
+                vals = d_res.detach().flatten()
+                self.logger.writer.add_histogram(
+                    f'depth_residual/dist_{prefix}', vals, self.total_steps)
+                self.logger.writer.add_scalar(
+                    f'depth_residual/abs_mean_{prefix}',
+                    vals.abs().mean().item(), self.total_steps)
 
     @staticmethod
     def _val_group_of(sample_name: str) -> str:
