@@ -24,6 +24,7 @@ class FullResGaussianHead(nn.Module):
         confidence_beta: float = 0.3,
         max_scale: float = 0.003,
         max_depth_residual: float = 0.5,
+        use_depth_residual: bool = True,
     ):
         """
         Args:
@@ -32,12 +33,14 @@ class FullResGaussianHead(nn.Module):
             confidence_alpha / beta:  scale / opacity 的置信度调制下限
             max_scale:    scale 最大值
             max_depth_residual: inverse-depth residual 的绝对值上限
+            use_depth_residual: 是否启用深度残差预测
         """
         super().__init__()
         self.confidence_alpha = confidence_alpha
         self.confidence_beta = confidence_beta
         self.max_scale = max_scale
         self.max_depth_residual = max_depth_residual
+        self.use_depth_residual = use_depth_residual
 
         self.shared = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim, 3, padding=1, bias=False),
@@ -100,7 +103,10 @@ class FullResGaussianHead(nn.Module):
         beta = self.confidence_beta
         opacity = opacity_base * (beta + (1 - beta) * confidence)
 
-        depth_residual = self.depth_head(shared) * self.max_depth_residual
+        if self.use_depth_residual:
+            depth_residual = self.depth_head(shared) * self.max_depth_residual
+        else:
+            depth_residual = torch.zeros_like(opacity)
 
         return {
             'rot': rot,

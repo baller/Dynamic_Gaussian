@@ -161,6 +161,8 @@ class StereoGSModel(nn.Module):
             confidence_alpha=stereo_gs_cfg.confidence_alpha,
             confidence_beta=stereo_gs_cfg.confidence_beta,
             max_scale=stereo_gs_cfg.max_scale,
+            max_depth_residual=getattr(stereo_gs_cfg, 'cags_depth_residual_bound', 0.5),
+            use_depth_residual=getattr(stereo_gs_cfg, 'use_depth_residual', True),
         )
 
         split_mode = getattr(stereo_gs_cfg, 'cags_split_mode', 'learned')

@@ -142,6 +142,7 @@ class ConfigStereoHuman:
         self.cfg.stereo_gs.confidence_beta = 0.3
         self.cfg.stereo_gs.max_scale = 0.003
         self.cfg.stereo_gs.cags_depth_residual_bound = 0.5
+        self.cfg.stereo_gs.use_depth_residual = True
         self.cfg.stereo_gs.depth_regularization = CN()
         self.cfg.stereo_gs.depth_regularization.enable = False
         self.cfg.stereo_gs.depth_regularization.lambda_smooth = 0.01
