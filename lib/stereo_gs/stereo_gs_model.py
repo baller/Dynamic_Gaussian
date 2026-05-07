@@ -32,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lib.utils import depth2pc
+from lib.ffs_depth import smooth_ffs_depth_edges
 from lib.stereo_gs.ffs_feature_extractor import FFSFeatureExtractor, FFSFeatures
 from lib.stereo_gs.feature_adapter import FeatureAdapter
 from lib.stereo_gs.cross_view_fusion import build_fusion_module
@@ -54,7 +55,15 @@ class StereoGSModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         stereo_gs_cfg = cfg.stereo_gs
+        ffs_cfg = cfg.ffs
         self.use_cags = getattr(stereo_gs_cfg, 'use_cags', False)
+        self.edge_smooth_enable = getattr(ffs_cfg, 'edge_smooth_enable', False)
+        self.edge_smooth_kernel = getattr(ffs_cfg, 'edge_smooth_kernel', 7)
+        self.edge_smooth_band = getattr(ffs_cfg, 'edge_smooth_band', 5)
+        self.edge_smooth_strength = getattr(ffs_cfg, 'edge_smooth_strength', 0.35)
+        self.edge_smooth_quantile = getattr(ffs_cfg, 'edge_smooth_quantile', 0.95)
+        self.edge_smooth_min_gradient = getattr(ffs_cfg, 'edge_smooth_min_gradient', 1e-4)
+        self.edge_smooth_iterations = getattr(ffs_cfg, 'edge_smooth_iterations', 1)
 
         # ── Stage 1: FFS 特征提取 (冻结) ──
         self.ffs_extractor = FFSFeatureExtractor(cfg)
@@ -65,6 +74,11 @@ class StereoGSModel(nn.Module):
         logging.info(
             f"[StereoGS] FFS feat dims: {ffs_dims}, hidden: {ffs_hidden}, "
             f"context_net: {ctx_net_dim}, context_inp: {ctx_inp_dim}"
+        )
+        logging.info(
+            f"[StereoGS] FFS depth smoothing: enable={self.edge_smooth_enable}, "
+            f"kernel={self.edge_smooth_kernel}, band={self.edge_smooth_band}, "
+            f"strength={self.edge_smooth_strength}, iterations={self.edge_smooth_iterations}"
         )
 
         # ── Stage 2: 特征适配 ──
@@ -118,11 +132,25 @@ class StereoGSModel(nn.Module):
                 residual_bound=cvct_cfg.residual_bound,
             )
             self.cvct.set_identity(True)  # default to identity until trainer flips
+
             logging.info(f"[W-CVCT-GS] CVCT enabled (residual_bound={cvct_cfg.residual_bound})")
 
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logging.info(f"[StereoGS] params total={total:,} trainable={trainable:,}")
+
+    def _smooth_ffs_depth(self, depth: torch.Tensor, view_data: dict) -> torch.Tensor:
+        return smooth_ffs_depth_edges(
+            depth,
+            mask=view_data.get('mask'),
+            enable=self.edge_smooth_enable,
+            kernel_size=self.edge_smooth_kernel,
+            band_size=self.edge_smooth_band,
+            strength=self.edge_smooth_strength,
+            quantile=self.edge_smooth_quantile,
+            min_gradient=self.edge_smooth_min_gradient,
+            iterations=self.edge_smooth_iterations,
+        )
 
     # ── 初始化: Legacy (1/4 解码 + 上采样) ──
 
@@ -243,11 +271,14 @@ class StereoGSModel(nn.Module):
             backbone_feat_hr=ffs_feat.backbone_feats_left[0],
         )
 
-        depth = ffs_feat.disparity / Tf_x_abs
-        depth = depth + gaussian_hr['depth_residual']
+        depth_raw = ffs_feat.disparity / Tf_x_abs
+        depth_init = self._smooth_ffs_depth(depth_raw, view_data)
+        depth = depth_init + gaussian_hr['depth_residual']
 
         return {
             'depth': depth,
+            'depth_init': depth_init,
+            'depth_raw': depth_raw.detach().clone(),
             'rot_maps': gaussian_hr['rot'],
             'scale_maps': gaussian_hr['scale'],
             'opacity_maps': gaussian_hr['opacity'],
@@ -306,8 +337,9 @@ class StereoGSModel(nn.Module):
         shared_feat = head_out.pop('_shared_feat')
 
         # FFS 输出 inverse depth；残差也在 inverse-depth 空间中学习。
-        depth = ffs_feat.disparity / Tf_x_abs
-        depth = (depth + head_out['depth_residual']).clamp(min=1e-6)
+        depth_raw = ffs_feat.disparity / Tf_x_abs
+        depth_init = self._smooth_ffs_depth(depth_raw, view_data)
+        depth = (depth_init + head_out['depth_residual']).clamp(min=1e-6)
 
         # Stage 5: 自适应高斯分裂
         bs = B
@@ -357,6 +389,8 @@ class StereoGSModel(nn.Module):
 
         return {
             'depth': depth,
+            'depth_init': depth_init,
+            'depth_raw': depth_raw.detach().clone(),
             'rot_maps': head_out['rot'],
             'scale_maps': head_out['scale'],
             'opacity_maps': head_out['opacity'],
@@ -403,7 +437,8 @@ class StereoGSModel(nn.Module):
             ffs_right, ffs_left, data['rmain'], Tf_x_abs, is_right_view=True)
 
         for view_key, result in [('lmain', left_result), ('rmain', right_result)]:
-            data[view_key]['depth_init'] = result['depth'].detach().clone()
+            data[view_key]['depth_raw'] = result['depth_raw']
+            data[view_key]['depth_init'] = result['depth_init'].detach().clone()
             data[view_key]['depth'] = result['depth']
             data[view_key]['rot_maps'] = result['rot_maps']
             data[view_key]['scale_maps'] = result['scale_maps']
@@ -441,7 +476,8 @@ class StereoGSModel(nn.Module):
         del data['rmain']['_cvct_other_view']
 
         for view_key, result in [('lmain', left_result), ('rmain', right_result)]:
-            data[view_key]['depth_init'] = result['depth'].detach().clone()
+            data[view_key]['depth_raw'] = result['depth_raw']
+            data[view_key]['depth_init'] = result['depth_init'].detach().clone()
             data[view_key]['depth'] = result['depth']
             data[view_key]['rot_maps'] = result['rot_maps']
             data[view_key]['scale_maps'] = result['scale_maps']

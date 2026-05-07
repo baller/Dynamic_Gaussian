@@ -83,6 +83,13 @@ class ConfigStereoHuman:
         self.cfg.ffs.use_hiera = False       # 是否使用层级推理
         self.cfg.ffs.use_loftr = True        # 是否用 LoFTR 增强图像特征
         self.cfg.ffs.finetune = False        # 是否微调 FFS 模型
+        self.cfg.ffs.edge_smooth_enable = False
+        self.cfg.ffs.edge_smooth_kernel = 5
+        self.cfg.ffs.edge_smooth_band = 5
+        self.cfg.ffs.edge_smooth_strength = 0.45
+        self.cfg.ffs.edge_smooth_quantile = 0.99
+        self.cfg.ffs.edge_smooth_min_gradient = 0.02
+        self.cfg.ffs.edge_smooth_iterations = 2
 
         self.cfg.gsnet = CN()
         self.cfg.gsnet.use_pe = None

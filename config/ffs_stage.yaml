@@ -48,6 +48,13 @@ ffs:
   use_hiera: False
   use_loftr: True
   finetune: False
+  edge_smooth_enable: True
+  edge_smooth_kernel: 5
+  edge_smooth_band: 5
+  edge_smooth_strength: 0.45
+  edge_smooth_quantile: 0.99
+  edge_smooth_min_gradient: 0.02
+  edge_smooth_iterations: 2
 
 # 高斯网络配置
 gsnet:

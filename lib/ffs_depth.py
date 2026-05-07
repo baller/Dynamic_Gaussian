@@ -23,6 +23,98 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _make_odd(value):
+    value = int(value)
+    if value < 1:
+        return 1
+    return value if value % 2 == 1 else value + 1
+
+
+def _depth_gradient(depth):
+    grad = torch.zeros_like(depth)
+    grad[..., :, :-1] = grad[..., :, :-1] + (depth[..., :, 1:] - depth[..., :, :-1]).abs()
+    grad[..., :, 1:] = grad[..., :, 1:] + (depth[..., :, 1:] - depth[..., :, :-1]).abs()
+    grad[..., :-1, :] = grad[..., :-1, :] + (depth[..., 1:, :] - depth[..., :-1, :]).abs()
+    grad[..., 1:, :] = grad[..., 1:, :] + (depth[..., 1:, :] - depth[..., :-1, :]).abs()
+    return grad
+
+
+def _batch_quantile_threshold(gradient, valid, quantile, min_gradient):
+    flat_grad = gradient.flatten(1)
+    flat_valid = valid.flatten(1)
+    thresholds = []
+    for grad_i, valid_i in zip(flat_grad, flat_valid):
+        valid_grad = grad_i[valid_i]
+        if valid_grad.numel() == 0:
+            threshold = grad_i.new_tensor(float(min_gradient))
+        else:
+            threshold = torch.quantile(valid_grad.float(), float(quantile)).to(dtype=grad_i.dtype)
+            threshold = torch.maximum(threshold, grad_i.new_tensor(float(min_gradient)))
+        thresholds.append(threshold)
+    return torch.stack(thresholds).view(-1, 1, 1, 1).to(device=gradient.device, dtype=gradient.dtype)
+
+
+def smooth_ffs_depth_edges(
+    depth,
+    mask=None,
+    *,
+    enable=True,
+    kernel_size=7,
+    band_size=5,
+    strength=0.35,
+    quantile=0.95,
+    min_gradient=1e-4,
+    iterations=1,
+):
+    """Smooth only the narrow inverse-depth band around strong FFS edges."""
+    if not enable:
+        return depth
+
+    kernel_size = _make_odd(kernel_size)
+    band_size = _make_odd(band_size)
+    strength = float(strength)
+    quantile = min(max(float(quantile), 0.0), 1.0)
+    iterations = max(1, int(iterations))
+
+    valid = torch.isfinite(depth) & (depth > 1e-6)
+    write_valid = valid if mask is None else valid & (mask > 0.5)
+
+    safe_depth = torch.where(valid, depth, torch.zeros_like(depth))
+    gradient = _depth_gradient(safe_depth)
+    threshold = _batch_quantile_threshold(gradient, valid.flatten(1), quantile, min_gradient)
+    edge = (gradient >= threshold) & write_valid
+
+    edge_band = F.max_pool2d(
+        edge.to(dtype=depth.dtype),
+        kernel_size=band_size,
+        stride=1,
+        padding=band_size // 2,
+    ) > 0
+
+    smooth_den = F.avg_pool2d(
+        valid.to(dtype=depth.dtype),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+        count_include_pad=False,
+    ).clamp_min(1e-6)
+
+    out = depth
+    for _ in range(iterations):
+        safe_out = torch.where(valid, out, torch.zeros_like(out))
+        smooth_num = F.avg_pool2d(
+            safe_out,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            count_include_pad=False,
+        )
+        smooth_depth = smooth_num / smooth_den
+        out = torch.where(edge_band & write_valid, out.lerp(smooth_depth, strength), out)
+
+    return out.clamp_min(1e-6)
+
+
 class _InputPadder:
     """将图像填充到 divis_by 的整数倍（自包含版本，避免跨仓库导入）"""
 
@@ -111,6 +203,13 @@ class FFSDepthEstimator(nn.Module):
         self.max_disp = self.ffs_model.args.max_disp
         self.use_hiera = getattr(ffs_cfg, 'use_hiera', False)
         self.finetune = getattr(ffs_cfg, 'finetune', False)
+        self.edge_smooth_enable = getattr(ffs_cfg, 'edge_smooth_enable', False)
+        self.edge_smooth_kernel = getattr(ffs_cfg, 'edge_smooth_kernel', 7)
+        self.edge_smooth_band = getattr(ffs_cfg, 'edge_smooth_band', 5)
+        self.edge_smooth_strength = getattr(ffs_cfg, 'edge_smooth_strength', 0.35)
+        self.edge_smooth_quantile = getattr(ffs_cfg, 'edge_smooth_quantile', 0.95)
+        self.edge_smooth_min_gradient = getattr(ffs_cfg, 'edge_smooth_min_gradient', 1e-4)
+        self.edge_smooth_iterations = getattr(ffs_cfg, 'edge_smooth_iterations', 1)
 
         if not self.finetune:
             self.ffs_model.eval()
@@ -121,7 +220,8 @@ class FFSDepthEstimator(nn.Module):
         self.ffs_model.cuda()
         logging.info(
             f"[FFS] valid_iters={self.valid_iters}, max_disp={self.max_disp}, "
-            f"hiera={self.use_hiera}, finetune={self.finetune}"
+            f"hiera={self.use_hiera}, finetune={self.finetune}, "
+            f"edge_smooth={self.edge_smooth_enable}"
         )
 
     def freeze_bn(self):
@@ -241,7 +341,33 @@ class FFSDepthEstimator(nn.Module):
         while Tf_x_abs.dim() < 4:
             Tf_x_abs = Tf_x_abs.unsqueeze(-1)
 
-        data['lmain']['depth'] = disp_left / Tf_x_abs
-        data['rmain']['depth'] = disp_right / Tf_x_abs
+        raw_left_depth = disp_left / Tf_x_abs
+        raw_right_depth = disp_right / Tf_x_abs
+
+        data['lmain']['depth_raw'] = raw_left_depth.detach().clone()
+        data['rmain']['depth_raw'] = raw_right_depth.detach().clone()
+
+        data['lmain']['depth'] = smooth_ffs_depth_edges(
+            raw_left_depth,
+            mask=data['lmain'].get('mask'),
+            enable=self.edge_smooth_enable,
+            kernel_size=self.edge_smooth_kernel,
+            band_size=self.edge_smooth_band,
+            strength=self.edge_smooth_strength,
+            quantile=self.edge_smooth_quantile,
+            min_gradient=self.edge_smooth_min_gradient,
+            iterations=self.edge_smooth_iterations,
+        )
+        data['rmain']['depth'] = smooth_ffs_depth_edges(
+            raw_right_depth,
+            mask=data['rmain'].get('mask'),
+            enable=self.edge_smooth_enable,
+            kernel_size=self.edge_smooth_kernel,
+            band_size=self.edge_smooth_band,
+            strength=self.edge_smooth_strength,
+            quantile=self.edge_smooth_quantile,
+            min_gradient=self.edge_smooth_min_gradient,
+            iterations=self.edge_smooth_iterations,
+        )
 
         return data, None, {}

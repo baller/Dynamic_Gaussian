@@ -43,11 +43,18 @@ raft:
 ffs:
   ffs_root: '/data/sifang/Fast-FoundationStereo'
   model_path: '/data/sifang/Fast-FoundationStereo/weights/23-36-37/model_best_bp2_serialize.pth'
-  valid_iters: 8
+  valid_iters: 4
   max_disp: 320
   use_hiera: False
   use_loftr: False
   finetune: False
+  edge_smooth_enable: True
+  edge_smooth_kernel: 7
+  edge_smooth_band: 7
+  edge_smooth_strength: 0.55
+  edge_smooth_quantile: 0.99
+  edge_smooth_min_gradient: 0.03
+  edge_smooth_iterations: 2
 
 # StereoGS 特有配置
 stereo_gs:
@@ -68,7 +75,7 @@ stereo_gs:
   confidence_beta: 0.6
   max_scale: 0.003
   cags_depth_residual_bound: 0.1
-  use_depth_residual: false
+  use_depth_residual: True
   # 深度残差正则化
   depth_regularization:
     enable: true
