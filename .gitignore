@@ -10,3 +10,4 @@ runs/
 *.onnx
 *.pth
 *.trt
+experiments_old/
