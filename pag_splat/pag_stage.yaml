@@ -14,15 +14,15 @@ depth_mode: 'pagsplat'
 dataset:
   # ── 旧 GPS+ 兼容字段（保留供 StereoHumanDataset 使用，PAGMultiDataset 不依赖）──
   source_id: [0, 1]
-  train_novel_id: [2, 3]
+  train_novel_id: [2, 3, 4, 5]
   val_novel_id: [2, 3]
   use_hr_img: False
   use_depth_init: False
   use_local_data: True
-  inverse_depth_init: 0.535
-  local_data_root: '/data/sifang/GPS_plus_data/colmap2.0_processed'
-  train_data_root: '/data/sifang/GPS_plus_data/colmap2.0_processed/train'
-  val_data_root:   '/data/sifang/GPS_plus_data/colmap2.0_processed/val'
+  inverse_depth_init: 0.35
+  local_data_root: '/data/sifang/GPS_plus_data/hias_gps_plus_data'
+  train_data_root: '/data/sifang/GPS_plus_data/hias_gps_plus_data/train'
+  val_data_root:   '/data/sifang/GPS_plus_data/hias_gps_plus_data/val'
   raw_data_root: '/data/sifang/GPS_plus_data/colmap2.0'
   bg_color: [0, 0, 0]
   znear: 0.01
@@ -47,7 +47,7 @@ dataset:
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0008_01/train'
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0012_01/train'
     # ── processed_data 原始数据集（0_1.json + npy，固定 source=0,1）──
-    # - '/data/sifang/GPS_plus_data/colmap2.0_processed/train'
+    # - '/data/sifang/GPS_plus_data/hias_gps_plus_data/train'
   multi_val_roots:
     # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor1_4/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/enerf_outdoor/actor2_3/val'
@@ -58,7 +58,7 @@ dataset:
     # - '/data/sifang/GPS_plus_data/processed_mini/NHR/sport_1_easymocap/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0008_01/val'
     # - '/data/sifang/GPS_plus_data/processed_mini/renbody/0012_01/val'
-    # - '/data/sifang/GPS_plus_data/colmap2.0_processed/val'
+    # - '/data/sifang/GPS_plus_data/hias_gps_plus_data/val'
   # 对应格式，与 multi_train_roots 等长
   multi_formats:
     # - 'mini'
